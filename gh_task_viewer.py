@@ -614,6 +614,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     in_search = False
     search_buffer = ""
     current_index = 0
+    v_offset = 0  # top row index currently displayed
     h_offset = 0
     detail_mode = False
     status_line = ""
@@ -650,8 +651,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     def build_table_fragments() -> List[Tuple[str,str]]:
         rows = filtered_rows()
         nonlocal current_index
+        nonlocal v_offset
         if current_index >= len(rows):
             current_index = max(0, len(rows)-1)
+        # Determine available vertical space (rough estimate: terminal rows - status bar - maybe 0 extra)
+        try:
+            from prompt_toolkit.application.current import get_app
+            total_rows = get_app().output.get_size().rows
+        except Exception:
+            total_rows = 40
+        # Reserve 1 row for status bar. Header consumes 2 lines (header + blank after).
+        visible_rows = max(1, total_rows - 3)
+        # Adjust v_offset to ensure current_index visible
+        if current_index < v_offset:
+            v_offset = current_index
+        elif current_index >= v_offset + visible_rows:
+            v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
         header = "DATE        FIELD                STATUS      TITLE                                     REPO                 URL"
         frags.append(("bold", header[h_offset:]))
@@ -660,7 +675,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             frags.append(("italic", "(no tasks match filters)"))
             return frags
         today = today_date
-        for idx, t in enumerate(rows):
+        display_slice = rows[v_offset:v_offset+visible_rows]
+        for rel_idx, t in enumerate(display_slice):
+            idx = v_offset + rel_idx
             is_sel = (idx == current_index)
             style_row = "reverse" if is_sel else ""
             col = color_for_date(t.start_date, today)
@@ -807,12 +824,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         invalidate()
 
     def move(delta:int):
-        nonlocal current_index
+        nonlocal current_index, v_offset
         rows = filtered_rows()
         if not rows:
             current_index = 0
             return
         current_index = max(0, min(len(rows)-1, current_index+delta))
+        # Adjust vertical offset (reuse logic from build but simpler here)
+        try:
+            from prompt_toolkit.application.current import get_app
+            total_rows = get_app().output.get_size().rows
+        except Exception:
+            total_rows = 40
+        visible_rows = max(1, total_rows - 3)
+        if current_index < v_offset:
+            v_offset = current_index
+        elif current_index >= v_offset + visible_rows:
+            v_offset = current_index - visible_rows + 1
 
     @kb.add('j')
     @kb.add('down')
