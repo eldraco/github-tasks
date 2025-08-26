@@ -33,16 +33,20 @@ import os
 import re
 import sqlite3
 import sys
+import string
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Iterable
 
 import requests
 import yaml
 from prompt_toolkit import Application
+from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import HSplit, VSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.layout.controls import BufferControl
 
 
 # -----------------------------
@@ -109,12 +113,14 @@ class TaskRow:
     repo: Optional[str]
     url: str
     updated_at: str
+    status: Optional[str] = None  # textual status (eg. In Progress, Done)
+    is_done: int = 0              # 1 if done / completed
 
 
 class TaskDB:
     SCHEMA_COLUMNS = [
         "owner_type","owner","project_number","project_title","start_field",
-        "start_date","title","repo","url","updated_at"
+        "start_date","title","repo","url","updated_at","status","is_done"
     ]
     CREATE_TABLE_SQL = """      CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,6 +134,8 @@ class TaskDB:
         repo TEXT,
         url TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        status TEXT,
+        is_done INTEGER DEFAULT 0,
         UNIQUE(owner_type, owner, project_number, title, url, start_field, start_date)
       )
     """
@@ -164,7 +172,7 @@ class TaskDB:
         defaults = {
             "owner_type":"''","owner":"''","project_number":"0","project_title":"''",
             "start_field":"''","start_date":"''","title":"''","repo":"NULL","url":"''",
-            "updated_at":"datetime('now')",
+            "updated_at":"datetime('now')","status":"NULL","is_done":"0",
         }
         sel = ", ".join([c if c in cols else defaults[c] for c in self.SCHEMA_COLUMNS])
         cur.execute(
@@ -182,14 +190,32 @@ class TaskDB:
         cur.executemany(
             """            INSERT INTO tasks (
               owner_type, owner, project_number, project_title,
-              start_field, start_date, title, repo, url, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              start_field, start_date, title, repo, url, updated_at, status, is_done
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
-                          updated_at=excluded.updated_at
-            """,            [(r.owner_type,r.owner,r.project_number,r.project_title,r.start_field,
-              r.start_date,r.title,r.repo,r.url,r.updated_at) for r in rows]
+                          updated_at=excluded.updated_at,
+                          status=excluded.status,
+                          is_done=excluded.is_done
+            """,
+            [
+                (
+                    r.owner_type,
+                    r.owner,
+                    r.project_number,
+                    r.project_title,
+                    r.start_field,
+                    r.start_date,
+                    r.title,
+                    r.repo,
+                    r.url,
+                    r.updated_at,
+                    r.status,
+                    r.is_done,
+                )
+                for r in rows
+            ],
         )
         self.conn.commit()
 
@@ -199,15 +225,16 @@ class TaskDB:
             today = today or dt.date.today().isoformat()
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,title,repo,url,updated_at
+                       start_date,title,repo,url,updated_at,status,is_done
                 FROM tasks WHERE start_date = ?
                 ORDER BY project_title, start_date, repo, title
-                """, (today,)
+                """,
+                (today,),
             )
         else:
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,title,repo,url,updated_at
+                       start_date,title,repo,url,updated_at,status,is_done
                 FROM tasks
                 ORDER BY project_title, start_date, repo, title
                 """
@@ -252,19 +279,23 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
               assignees(first:50){ nodes{ login } }
             }
           }
-          fieldValues(first:50){
-            nodes{
-              __typename
-              ... on ProjectV2ItemFieldDateValue {
-                date
-                field { ... on ProjectV2FieldCommon { name } }
-              }
-              ... on ProjectV2ItemFieldUserValue {
-                users(first:50){ nodes{ login } }
-                field { ... on ProjectV2FieldCommon { name } }
-              }
-            }
-          }
+                    fieldValues(first:50){
+                        nodes{
+                            __typename
+                            ... on ProjectV2ItemFieldDateValue {
+                                date
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
+                            ... on ProjectV2ItemFieldUserValue {
+                                users(first:50){ nodes{ login } }
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
+                        }
+                    }
           project{ title url }
         }
       }
@@ -290,19 +321,23 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
               assignees(first:50){ nodes{ login } }
             }
           }
-          fieldValues(first:50){
-            nodes{
-              __typename
-              ... on ProjectV2ItemFieldDateValue {
-                date
-                field { ... on ProjectV2FieldCommon { name } }
-              }
-              ... on ProjectV2ItemFieldUserValue {
-                users(first:50){ nodes{ login } }
-                field { ... on ProjectV2FieldCommon { name } }
-              }
-            }
-          }
+                    fieldValues(first:50){
+                        nodes{
+                            __typename
+                            ... on ProjectV2ItemFieldDateValue {
+                                date
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
+                            ... on ProjectV2ItemFieldUserValue {
+                                users(first:50){ nodes{ login } }
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
+                        }
+                    }
           project{ title url }
         }
       }
@@ -359,7 +394,12 @@ def fetch_tasks_github(
         if spec.numbers is None:
             projs = discover_open_projects(session, spec.owner_type, spec.owner)
             for n in projs:
-                targets.append((spec.owner_type, spec.owner, int(n.get("number")), n.get("title") or ""))
+                num_val = n.get("number")
+                try:
+                    num_int = int(num_val) if num_val is not None else -1
+                except (TypeError, ValueError):
+                    continue
+                targets.append((spec.owner_type, spec.owner, num_int, n.get("title") or ""))
         else:
             for num in spec.numbers:
                 targets.append((spec.owner_type, spec.owner, int(num), ""))
@@ -414,9 +454,14 @@ def fetch_tasks_github(
                 if ctype in ("Issue","PullRequest"):
                     assignees = [n["login"] for n in (content.get("assignees") or {}).get("nodes") or [] if n and "login" in n]
                 people_logins: List[str] = []
+                status_text: Optional[str] = None
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldUserValue":
                         people_logins.extend([n["login"] for n in (fv.get("users") or {}).get("nodes") or [] if n and "login" in n])
+                    if fv and fv.get("__typename") == "ProjectV2ItemFieldSingleSelectValue":
+                        fname_sel = ((fv.get("field") or {}).get("name") or "").lower()
+                        if fname_sel in ("status","state","progress"):
+                            status_text = (fv.get("name") or "").strip()
                 if (me not in assignees) and (me not in people_logins):
                     continue
 
@@ -431,12 +476,18 @@ def fetch_tasks_github(
                         except ValueError:
                             continue
                         if d <= date_cutoff:
+                            done_flag = 0
+                            if status_text:
+                                low = status_text.lower()
+                                if any(k in low for k in ("done","complete","closed","merged","finished","✅","✔")):
+                                    done_flag = 1
                             out.append(
                                 TaskRow(
                                     owner_type=owner_type, owner=owner, project_number=number,
                                     project_title=(it.get("project") or {}).get("title") or "",
                                     start_field=fname, start_date=fdate,
-                                    title=title, repo=repo, url=url, updated_at=iso_now
+                                    title=title, repo=repo, url=url, updated_at=iso_now,
+                                    status=status_text, is_done=done_flag
                                 )
                             )
 
@@ -480,7 +531,7 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         return [("bold", "Nothing to show."), ("", " Press "), ("bold", "u"), ("", " to fetch.")]
 
     current: Optional[str] = None
-    header = "DATE         FIELD                TITLE                                     REPO                 URL"
+    header = "DATE         FIELD                STATUS      TITLE                                     REPO                 URL"
     for t in tasks:
         if t.project_title != current:
             current = t.project_title
@@ -496,9 +547,10 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         repo  = _truncate(t.repo or "-", 20)
         url   = _truncate(t.url, 40)
         field = _truncate(t.start_field, 20)
+        status = _truncate(t.status or "-", 10)
         frags.append((col, f"{t.start_date:<12}"))
         frags.append(("",  "  "))
-        frags.append(("", f"{field:<20}  {title:<41}  {repo:<20}  {url}"))
+        frags.append(("", f"{field:<20}  {status:<10}  {title:<41}  {repo:<20}  {url}"))
         frags.append(("", "\n"))
 
     if frags and frags[-1] == ("", "\n"):
@@ -510,90 +562,452 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
 # TUI
 # -----------------------------
 def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
+    """Full-screen, non-editable, vim-like browser with:
+    - j/k, arrows: move selection
+    - g g / G: top / bottom
+    - h/l, arrows: horizontal scroll
+    - Enter: toggle detail popup
+    - / start incremental search (inline); type to build query, Enter confirm, Esc cancel
+    - p cycle project filter; d toggle done-only; t today-only; a all dates; u update cache
+    - q quit (or close detail)
+    """
     today_date = dt.date.today()
     show_today_only = False
+    done_only = True
+    project_cycle: Optional[str] = None
+    search_term: Optional[str] = None
+    in_search = False
+    search_buffer = ""
+    current_index = 0
+    h_offset = 0
+    detail_mode = False
+    status_line = ""
 
-    def load_view() -> List[TaskRow]:
+    def load_all():
         return db.load(today_only=show_today_only, today=today_date.isoformat())
 
-    tasks = load_view()
-    text_control = FormattedTextControl(
-        text=build_fragments(tasks, today_date),
-        focusable=True,
-        show_cursor=False,
-    )
-    window = Window(content=text_control, wrap_lines=False)
+    all_rows = load_all()
 
-    status = FormattedTextControl(
-        text=lambda: [("reverse", f"  u:update  t:today  a:all  q:quit   • {cfg.user} • {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ")]
-    )
-    root = HSplit([window, Window(height=1, content=status)])
+    def apply_filters(rows: List[TaskRow]) -> List[TaskRow]:
+        out = rows
+        if done_only:
+            out = [r for r in out if r.is_done]
+        if project_cycle:
+            out = [r for r in out if r.project_title == project_cycle]
+        if search_term:
+            needle = search_term.lower()
+            out = [r for r in out if needle in (r.title or '').lower() or
+                                   needle in (r.repo or '').lower() or
+                                   needle in (r.status or '').lower() or
+                                   needle in (r.project_title or '').lower()]
+        return out
+
+    def projects_list(rows: Iterable[TaskRow]) -> List[str]:
+        seen = []
+        for r in rows:
+            if r.project_title not in seen:
+                seen.append(r.project_title)
+        return seen
+
+    def filtered_rows() -> List[TaskRow]:
+        return apply_filters(all_rows)
+
+    def build_table_fragments() -> List[Tuple[str,str]]:
+        rows = filtered_rows()
+        nonlocal current_index
+        if current_index >= len(rows):
+            current_index = max(0, len(rows)-1)
+        frags: List[Tuple[str,str]] = []
+        header = "DATE        FIELD                STATUS      TITLE                                     REPO                 URL"
+        frags.append(("bold", header[h_offset:]))
+        frags.append(("", "\n"))
+        if not rows:
+            frags.append(("italic", "(no tasks match filters)"))
+            return frags
+        today = today_date
+        for idx, t in enumerate(rows):
+            is_sel = (idx == current_index)
+            style_row = "reverse" if is_sel else ""
+            col = color_for_date(t.start_date, today)
+            base_style = (col + " bold") if is_sel else col
+            title = _truncate(t.title, 41)
+            repo = _truncate(t.repo or '-', 20)
+            url = _truncate(t.url, 40)
+            field = _truncate(t.start_field, 20)
+            status_txt = _truncate(t.status or '-', 10)
+            line = f"{t.start_date:<12}  {field:<20}  {status_txt:<10}  {title:<41}  {repo:<20}  {url}"
+            line = line[h_offset:]
+            # highlight search term occurrences
+            if search_term and not is_sel:
+                low = line.lower()
+                needle = search_term.lower()
+                start = 0
+                while True:
+                    i = low.find(needle, start)
+                    if i == -1:
+                        break
+                    if i>start:
+                        frags.append((base_style, line[start:i]))
+                    frags.append((base_style + ' underline', line[i:i+len(needle)]))
+                    start = i+len(needle)
+                if start < len(line):
+                    frags.append((base_style, line[start:]))
+            else:
+                frags.append((base_style if not is_sel else style_row, line))
+            frags.append(("", "\n"))
+        if frags and frags[-1][1] == "\n":
+            frags.pop()
+        return frags
+
+    def summarize() -> str:
+        rows = filtered_rows()
+        if not rows:
+            return "No tasks"
+        per_status: Dict[str,int] = {}
+        for r in rows:
+            per_status[r.status or '(none)'] = per_status.get(r.status or '(none)',0)+1
+        total = len(rows)
+        done_ct = sum(1 for r in rows if r.is_done)
+        lines = [f"User: {cfg.user}", f"Total: {total}", f"Done: {done_ct}"]
+        # projects
+        by_proj: Dict[str, Tuple[int,int]] = {}
+        for r in rows:
+            d,t = by_proj.get(r.project_title,(0,0))
+            by_proj[r.project_title]=(d+(1 if r.is_done else 0), t+1)
+        lines.append("")
+        lines.append("Proj:")
+        for p,(d,t) in sorted(by_proj.items()):
+            pct = 0 if t==0 else int(d*100/t)
+            lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}%")
+        lines.append("")
+        lines.append("Filters:")
+        lines.append(f"Done:{'Y' if done_only else 'N'} Proj:{_truncate(project_cycle or 'All',10)}")
+        lines.append(f"Today:{'Y' if show_today_only else 'N'}")
+        lines.append(f"Search:{_truncate(search_term or '-',12)}")
+        return "\n".join(lines)
+
+    table_control = FormattedTextControl(text=lambda: build_table_fragments())
+    table_window = Window(content=table_control, wrap_lines=False, always_hide_cursor=True)
+    stats_control = FormattedTextControl(text=lambda: summarize())
+    stats_window = Window(width=32, content=stats_control, wrap_lines=False, always_hide_cursor=True)
+
+    detail_control = FormattedTextControl(text=lambda: build_detail_text())
+    detail_window = Window(width=80, height=20, content=detail_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
+
+    def build_detail_text() -> List[Tuple[str,str]]:
+        if not detail_mode:
+            return []
+        rows = filtered_rows()
+        if not rows:
+            return [("", "No selection")] 
+        t = rows[current_index]
+        lines = [
+            f"Project: {t.project_title}",
+            f"Title:   {t.title}",
+            f"Repo:    {t.repo}",
+            f"URL:     {t.url}",
+            f"Date:    {t.start_date} ({t.start_field})",
+            f"Status:  {t.status}",
+            f"Done:    {'Yes' if t.is_done else 'No'}",
+            "",
+            "Press Enter / q / Esc to close"
+        ]
+        return [("bold", "Task Detail"), ("", "\n"+"\n".join(lines))]
+
+    status_control = FormattedTextControl(text=lambda: [("reverse", build_status_bar())])
+    status_window = Window(height=1, content=status_control)
+
+    def build_status_bar() -> str:
+        mode = "SEARCH" if in_search else ("DETAIL" if detail_mode else "BROWSE")
+        return f" {mode} u:update j/k:nav h/l:←/→ /:search Enter:detail p:dproj d:done t:today a:all q:quit {status_line} "
+
+    from prompt_toolkit.layout.containers import Float, FloatContainer
+    floats = []
+    root_body = VSplit([table_window, Window(width=1, char='│'), stats_window])
+    container = FloatContainer(content=HSplit([root_body, status_window]), floats=floats)
+
     kb = KeyBindings()
 
-    def refresh_view():
-        tks = load_view()
-        text_control.text = build_fragments(tks, today_date)
-
-    @kb.add("q")
-    def _(event):
-        event.app.exit()
-
-    @kb.add("a")
-    def _(event):
-        nonlocal show_today_only
-        show_today_only = False
-        refresh_view()
-
-    @kb.add("t")
-    def _(event):
-        nonlocal show_today_only
-        show_today_only = True
-        refresh_view()
-
-    @kb.add("u")
-    def _(event):
-        app = event.app
-        text_control.text = [("bold", "Updating cache…  "), ("", "[................................]   0%  Starting")]
+    def invalidate():
+        table_control.text = lambda: build_table_fragments()  # ensure recalculated
+        stats_control.text = lambda: summarize()
         app.invalidate()
 
-        def progress(done: int, total: int, line: str):
-            def _update():
-                text_control.text = [("bold", "Updating cache…  "), ("", line)]
-                app.invalidate()
-            app.call_from_executor(_update)
+    @kb.add('q')
+    def _(event):
+        nonlocal detail_mode, in_search, search_buffer
+        if detail_mode:
+            detail_mode = False
+            if floats:
+                floats.clear()
+            invalidate()
+            return
+        if in_search:
+            in_search = False
+            search_buffer = ""
+            invalidate()
+            return
+        event.app.exit()
+
+    @kb.add('enter')
+    def _(event):
+        nonlocal detail_mode
+        if in_search:
+            finalize_search()
+            return
+        detail_mode = not detail_mode
+        floats.clear()
+        if detail_mode:
+            floats.append(Float(content=detail_window, top=2, left=4))
+        invalidate()
+
+    def move(delta:int):
+        nonlocal current_index
+        rows = filtered_rows()
+        if not rows:
+            current_index = 0
+            return
+        current_index = max(0, min(len(rows)-1, current_index+delta))
+
+    @kb.add('j')
+    @kb.add('down')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        move(1); invalidate()
+
+    @kb.add('k')
+    @kb.add('up')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        move(-1); invalidate()
+
+    # horizontal scroll
+    @kb.add('h')
+    @kb.add('left')
+    def _(event):
+        nonlocal h_offset
+        if detail_mode or in_search:
+            return
+        h_offset = max(0, h_offset-4); invalidate()
+
+    @kb.add('l')
+    @kb.add('right')
+    def _(event):
+        nonlocal h_offset
+        if detail_mode or in_search:
+            return
+        h_offset += 4; invalidate()
+
+    # top/bottom
+    gg_state = {'g': False}
+    @kb.add('g')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        if gg_state['g']:
+            gg_state['g'] = False
+            nonlocal current_index
+            current_index = 0
+            invalidate()
+        else:
+            gg_state['g'] = True
+
+    @kb.add('G')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        rows = filtered_rows();
+        if rows:
+            nonlocal current_index
+            current_index = len(rows)-1
+            invalidate()
+
+    # filters
+    @kb.add('d')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal done_only
+        done_only = not done_only
+        invalidate()
+
+    @kb.add('t')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal show_today_only, all_rows, current_index
+        show_today_only = True
+        all_rows = load_all(); current_index = 0
+        invalidate()
+
+    @kb.add('a')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal show_today_only, all_rows, current_index
+        show_today_only = False
+        all_rows = load_all(); current_index = 0
+        invalidate()
+
+    @kb.add('p')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal project_cycle
+        projs = projects_list(load_all())
+        if not projs:
+            project_cycle = None
+        else:
+            if project_cycle is None:
+                project_cycle = projs[0]
+            else:
+                try:
+                    i = projs.index(project_cycle)
+                    project_cycle = projs[(i+1)%len(projs)]
+                except ValueError:
+                    project_cycle = projs[0]
+        invalidate()
+
+    # search mode
+    @kb.add('/')
+    def _(event):
+        if detail_mode:
+            return
+        nonlocal in_search, search_buffer
+        in_search = True
+        search_buffer = ""
+        invalidate()
+
+    def finalize_search():
+        nonlocal in_search, search_term, search_buffer, current_index
+        search_term = search_buffer or None
+        in_search = False
+        rows = filtered_rows()
+        current_index = 0 if rows else 0
+        invalidate()
+
+    @kb.add('escape')
+    def _(event):
+        nonlocal in_search, detail_mode, search_buffer
+        if in_search:
+            in_search = False; search_buffer = ""; invalidate(); return
+        if detail_mode:
+            detail_mode = False; floats.clear(); invalidate(); return
+
+    @kb.add('backspace')
+    def _(event):
+        nonlocal search_buffer
+        if in_search and search_buffer:
+            search_buffer = search_buffer[:-1]
+            invalidate()
+
+    # character input for search
+    for ch in string.ascii_letters + string.digits + " -_./":
+        @kb.add(ch)
+        def _(event, _ch=ch):  # default arg capture
+            nonlocal search_buffer, status_line
+            if in_search:
+                search_buffer += _ch
+                status_line = f"Search: {search_buffer}"
+                invalidate()
+
+    @kb.add('u')
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal status_line, all_rows, current_index
+        status_line = "Updating..."; invalidate()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        def progress(done:int,total:int,line:str):
+            nonlocal status_line
+            status_line = line
+            invalidate()
 
         async def worker():
             try:
-                loop = asyncio.get_running_loop()
-
-                def _do_fetch():
-                    if os.environ.get("MOCK_FETCH") == "1":
+                def do_fetch():
+                    if os.environ.get('MOCK_FETCH')=='1':
                         rows = generate_mock_tasks(cfg)
-                        progress(1, 1, "[########################################] 100%  Done")
+                        progress(1,1,'[########################################] 100% Done')
                         return rows
                     if not token:
-                        raise RuntimeError("GITHUB_TOKEN is not set")
+                        raise RuntimeError('TOKEN not set')
                     return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress)
-
-                rows = await loop.run_in_executor(None, _do_fetch)
-                db.upsert_many(rows)
-
-                def _finish():
-                    refresh_view()
-                    app.invalidate()
-                app.call_from_executor(_finish)
-
+                fut_rows = await asyncio.get_running_loop().run_in_executor(None, do_fetch)
+                db.upsert_many(fut_rows)
+                all_rows = load_all(); current_index = 0
+                progress(1,1,'Updated')
             except Exception as e:
-                def _error():
-                    text_control.text = [("ansired", "Error: "), ("", str(e))]
-                    app.invalidate()
-                app.call_from_executor(_error)
+                status_line = f"Error: {e}"; invalidate()
+        asyncio.create_task(worker())
 
-        app.create_background_task(worker())
+    def update_search_status():
+        nonlocal status_line
+        if in_search:
+            status_line = f"Search: {search_buffer}"
+        elif not detail_mode and not status_line:
+            status_line = ''
 
-    style = Style.from_dict({"statusbar": "reverse"})
-    app = Application(layout=Layout(root), key_bindings=kb, full_screen=True, mouse_support=True, style=style)
+    # refresh loop timer to update status bar (search typing etc.)
+    style = Style.from_dict({})
+    app = Application(layout=Layout(container), key_bindings=kb, full_screen=True, mouse_support=True, style=style, editing_mode=EditingMode.VI)
     app.run()
+    return
+
+
+# -----------------------------
+# Utilities / Mock
+# -----------------------------
+def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
+    """Generate synthetic tasks for offline demo & testing."""
+    today = dt.date.today()
+    rows: List[TaskRow] = []
+    iso_now = dt.datetime.now().isoformat(timespec="seconds")
+    projects = ["Alpha", "Beta", "Gamma"]
+    statuses = ["Todo", "In Progress", "Done", "Blocked"]
+    for i, proj in enumerate(projects, start=1):
+        for d_off in range(-2, 5):
+            date_str = (today + dt.timedelta(days=d_off)).isoformat()
+            status = statuses[(i + d_off) % len(statuses)]
+            rows.append(TaskRow(
+                owner_type="org", owner="example", project_number=i, project_title=proj,
+                start_field="Start date", start_date=date_str, title=f"Task {i}-{d_off}", repo="demo/repo",
+                url=f"https://example.com/{i}-{d_off}", updated_at=iso_now, status=status,
+                is_done=1 if status.lower()=="done" else 0
+            ))
+    return rows
+
+
+def load_dotenv_token() -> Optional[str]:
+    """Load TOKEN or GITHUB_TOKEN from a .env file (current dir or script dir) if present."""
+    candidates = [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
+    for base in candidates:
+        path = os.path.join(base, ".env")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    k,v = line.split('=',1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k in ("TOKEN","GITHUB_TOKEN") and v:
+                        # set env for child libs as well
+                        os.environ.setdefault("GITHUB_TOKEN", v)
+                        return v
+        except Exception:
+            continue
+    return None
 
 
 # -----------------------------
@@ -604,10 +1018,12 @@ def main() -> None:
     ap.add_argument("--config", required=True, help="Path to YAML config")
     ap.add_argument("--db", default=os.path.expanduser("~/.gh_tasks.db"), help="Path to sqlite DB")
     ap.add_argument("--discover", action="store_true", help="List open Projects v2 for each owner and exit")
+    ap.add_argument("--no-ui", action="store_true", help="Run a non-interactive summary (for testing)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    token = os.environ.get("GITHUB_TOKEN")
+    # Load token precedence: env var, .env TOKEN/GITHUB_TOKEN
+    token = os.environ.get("GITHUB_TOKEN") or load_dotenv_token()
 
     if args.discover:
         if not token:
@@ -631,9 +1047,17 @@ def main() -> None:
             db.upsert_many(generate_mock_tasks(cfg))
         else:
             if not token:
-                print("GITHUB_TOKEN is not set. Set it or run with MOCK_FETCH=1.", file=sys.stderr)
+                print("TOKEN/GITHUB_TOKEN not set. Create .env with TOKEN=... or export variable (or use MOCK_FETCH=1).", file=sys.stderr)
                 sys.exit(1)
             db.upsert_many(fetch_tasks_github(token, cfg, date_cutoff=dt.date.today()))
+
+    if args.no_ui:
+        rows = db.load()
+        done_ct = sum(1 for r in rows if r.is_done)
+        print(f"Tasks: {len(rows)} (done {done_ct})")
+        projects = sorted({r.project_title for r in rows})
+        print("Projects:", ", ".join(projects))
+        return
 
     run_ui(db, cfg, token)
 
