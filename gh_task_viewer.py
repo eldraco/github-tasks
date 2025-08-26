@@ -475,21 +475,21 @@ def fetch_tasks_github(
                             d = dt.date.fromisoformat(fdate)
                         except ValueError:
                             continue
-                        if d <= date_cutoff:
-                            done_flag = 0
-                            if status_text:
-                                low = status_text.lower()
-                                if any(k in low for k in ("done","complete","closed","merged","finished","✅","✔")):
-                                    done_flag = 1
-                            out.append(
-                                TaskRow(
-                                    owner_type=owner_type, owner=owner, project_number=number,
-                                    project_title=(it.get("project") or {}).get("title") or "",
-                                    start_field=fname, start_date=fdate,
-                                    title=title, repo=repo, url=url, updated_at=iso_now,
-                                    status=status_text, is_done=done_flag
-                                )
+                        # Store all tasks regardless of whether date is past/future so UI can filter.
+                        done_flag = 0
+                        if status_text:
+                            low = status_text.lower()
+                            if any(k in low for k in ("done","complete","closed","merged","finished","✅","✔")):
+                                done_flag = 1
+                        out.append(
+                            TaskRow(
+                                owner_type=owner_type, owner=owner, project_number=number,
+                                project_title=(it.get("project") or {}).get("title") or "",
+                                start_field=fname, start_date=fdate,
+                                title=title, repo=repo, url=url, updated_at=iso_now,
+                                status=status_text, is_done=done_flag
                             )
+                        )
 
             page = (proj_node.get("items") or {}).get("pageInfo") or {}
             if page.get("hasNextPage"):
@@ -573,7 +573,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     """
     today_date = dt.date.today()
     show_today_only = False
-    done_only = True
+    # Hide-done toggle: start showing everything; 'd' hides completed tasks.
+    hide_done = False
     project_cycle: Optional[str] = None
     search_term: Optional[str] = None
     in_search = False
@@ -590,8 +591,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
 
     def apply_filters(rows: List[TaskRow]) -> List[TaskRow]:
         out = rows
-        if done_only:
-            out = [r for r in out if r.is_done]
+        if hide_done:
+            out = [r for r in out if not r.is_done]
         if project_cycle:
             out = [r for r in out if r.project_title == project_cycle]
         if search_term:
@@ -681,7 +682,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}%")
         lines.append("")
         lines.append("Filters:")
-        lines.append(f"Done:{'Y' if done_only else 'N'} Proj:{_truncate(project_cycle or 'All',10)}")
+        lines.append(f"HideDone:{'Y' if hide_done else 'N'} Proj:{_truncate(project_cycle or 'All',10)}")
         lines.append(f"Today:{'Y' if show_today_only else 'N'}")
         lines.append(f"Search:{_truncate(search_term or '-',12)}")
         return "\n".join(lines)
@@ -717,9 +718,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     status_control = FormattedTextControl(text=lambda: [("reverse", build_status_bar())])
     status_window = Window(height=1, content=status_control)
 
+    show_help = False
+
     def build_status_bar() -> str:
-        mode = "SEARCH" if in_search else ("DETAIL" if detail_mode else "BROWSE")
-        return f" {mode} u:update j/k:nav h/l:←/→ /:search Enter:detail p:dproj d:done t:today a:all q:quit {status_line} "
+        mode = "SEARCH" if in_search else ("DETAIL" if detail_mode else ("HELP" if show_help else "BROWSE"))
+        base = f" {mode} u:update j/k:nav h/l:←/→ /:search Enter:detail p:project d:hide-done t:today a:all ?:help q:quit "
+        if search_term:
+            base += f"| filter='{search_term}' "
+        if hide_done:
+            base += "[HideDone] "
+        if project_cycle:
+            base += f"[Proj:{_truncate(project_cycle,10)}] "
+        return base + status_line
 
     from prompt_toolkit.layout.containers import Float, FloatContainer
     floats = []
@@ -829,8 +839,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     def _(event):
         if detail_mode or in_search:
             return
-        nonlocal done_only
-        done_only = not done_only
+        nonlocal hide_done, current_index
+        hide_done = not hide_done
+        current_index = 0
         invalidate()
 
     @kb.add('t')
@@ -903,10 +914,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             search_buffer = search_buffer[:-1]
             invalidate()
 
-    # character input for search
-    for ch in string.ascii_letters + string.digits + " -_./":
+    # character input for search (exclude reserved keys used for commands)
+    reserved = set("jkgGhHlLdDtTaApPuUqQ/?:")
+    search_chars = [c for c in (string.ascii_letters + string.digits + " -_./") if c not in reserved]
+    for ch in search_chars:
         @kb.add(ch)
-        def _(event, _ch=ch):  # default arg capture
+        def _(event, _ch=ch):
             nonlocal search_buffer, status_line
             if in_search:
                 search_buffer += _ch
@@ -954,6 +967,37 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             status_line = f"Search: {search_buffer}"
         elif not detail_mode and not status_line:
             status_line = ''
+
+    @kb.add('?')
+    def _(event):
+        nonlocal show_help, detail_mode, in_search
+        if in_search:
+            return
+        detail_mode = False
+        in_search = False
+        show_help = not show_help
+        floats.clear()
+        if show_help:
+            help_lines = [
+                "Hotkeys:",
+                "  j/k or arrows  Move selection",
+                "  gg / G         Top / Bottom",
+                "  h/l or arrows  Horizontal scroll",
+                "  Enter          Toggle detail pane",
+                "  /              Start search (type, Enter to apply, Esc cancel)",
+                "  p              Cycle project filter",
+                "  d              Toggle done-only filter",
+                "  t / a          Today-only / All dates",
+                "  u              Update (fetch GitHub)",
+                "  ?              Toggle help",
+                "  q / Esc        Quit / Close",
+                f"  Current tasks: {len(filtered_rows())}",
+                "",
+                "Press ? to close help."
+            ]
+            hl_control = FormattedTextControl(text="\n".join(help_lines))
+            floats.append(Float(content=Window(width=84, height=24, content=hl_control, style="bg:#202020 #ffffff", wrap_lines=True), top=1, left=2))
+        invalidate()
 
     # refresh loop timer to update status bar (search typing etc.)
     style = Style.from_dict({})
