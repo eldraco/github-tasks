@@ -465,6 +465,7 @@ def fetch_tasks_github(
                 if (me not in assignees) and (me not in people_logins):
                     continue
 
+                found_date = False
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
                         fname = ((fv.get("field") or {}).get("name")) or ""
@@ -472,7 +473,7 @@ def fetch_tasks_github(
                         if not fdate or not regex.search(fname):
                             continue
                         try:
-                            d = dt.date.fromisoformat(fdate)
+                            dt.date.fromisoformat(fdate)  # validate
                         except ValueError:
                             continue
                         # Store all tasks regardless of whether date is past/future so UI can filter.
@@ -490,6 +491,23 @@ def fetch_tasks_github(
                                 status=status_text, is_done=done_flag
                             )
                         )
+                        found_date = True
+                # If no matching date field was found, still include the item so the project shows up.
+                if not found_date:
+                    done_flag = 0
+                    if status_text:
+                        low = status_text.lower()
+                        if any(k in low for k in ("done","complete","closed","merged","finished","✅","✔")):
+                            done_flag = 1
+                    out.append(
+                        TaskRow(
+                            owner_type=owner_type, owner=owner, project_number=number,
+                            project_title=(it.get("project") or {}).get("title") or "",
+                            start_field="(no date)", start_date="",  # empty date -> neutral grey
+                            title=title, repo=repo, url=url, updated_at=iso_now,
+                            status=status_text, is_done=done_flag
+                        )
+                    )
 
             page = (proj_node.get("items") or {}).get("pageInfo") or {}
             if page.get("hasNextPage"):
