@@ -381,6 +381,7 @@ def fetch_tasks_github(
     token: str,
     cfg: Config,
     date_cutoff: dt.date,
+    include_unassigned: bool = False,
     progress: Optional[ProgressCB] = None,
 ) -> List[TaskRow]:
     session = _session(token)
@@ -462,7 +463,8 @@ def fetch_tasks_github(
                         fname_sel = ((fv.get("field") or {}).get("name") or "").lower()
                         if fname_sel in ("status","state","progress"):
                             status_text = (fv.get("name") or "").strip()
-                if (me not in assignees) and (me not in people_logins):
+                assigned_to_me = (me in assignees) or (me in people_logins)
+                if (not assigned_to_me) and (not include_unassigned):
                     continue
 
                 found_date = False
@@ -504,7 +506,7 @@ def fetch_tasks_github(
                             owner_type=owner_type, owner=owner, project_number=number,
                             project_title=(it.get("project") or {}).get("title") or "",
                             start_field="(no date)", start_date="",  # empty date -> neutral grey
-                            title=title, repo=repo, url=url, updated_at=iso_now,
+                            title=title + (" (unassigned)" if not assigned_to_me else ""), repo=repo, url=url, updated_at=iso_now,
                             status=status_text, is_done=done_flag
                         )
                     )
@@ -521,6 +523,19 @@ def fetch_tasks_github(
 
     if progress:
         progress(total, total, f"{_ascii_bar(total,total)}  Done")
+    # Ensure each project appears at least once
+    existing = {(r.owner_type, r.owner, r.project_number) for r in out}
+    for owner_type, owner, number, ptitle in targets:
+        key = (owner_type, owner, number)
+        if key not in existing:
+            out.append(
+                TaskRow(
+                    owner_type=owner_type, owner=owner, project_number=number,
+                    project_title=ptitle or "(project)", start_field="(none)", start_date="",
+                    title="(no assigned items) - press Shift+U to include unassigned", repo=None, url="", updated_at=iso_now,
+                    status=None, is_done=0
+                )
+            )
     return out
 
 
@@ -593,6 +608,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     show_today_only = False
     # Hide-done toggle: start showing everything; 'd' hides completed tasks.
     hide_done = False
+    show_unassigned = False
     project_cycle: Optional[str] = None
     search_term: Optional[str] = None
     in_search = False
@@ -700,7 +716,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}%")
         lines.append("")
         lines.append("Filters:")
-        lines.append(f"HideDone:{'Y' if hide_done else 'N'} Proj:{_truncate(project_cycle or 'All',10)}")
+        lines.append(f"HideDone:{'Y' if hide_done else 'N'} Unassigned:{'Y' if show_unassigned else 'N'}")
+        lines.append(f"Proj:{_truncate(project_cycle or 'All',10)}")
         lines.append(f"Today:{'Y' if show_today_only else 'N'}")
         lines.append(f"Search:{_truncate(search_term or '-',12)}")
         return "\n".join(lines)
@@ -740,7 +757,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
 
     def build_status_bar() -> str:
         mode = "SEARCH" if in_search else ("DETAIL" if detail_mode else ("HELP" if show_help else "BROWSE"))
-        base = f" {mode} u:update j/k:nav h/l:←/→ /:search Enter:detail p:project d:hide-done t:today a:all ?:help q:quit "
+        base = f" {mode} u:update U:unassigned j/k:nav h/l:←/→ /:search Enter:detail p:project d:hide-done t:today a:all ?:help q:quit "
         if search_term:
             base += f"| filter='{search_term}' "
         if hide_done:
@@ -970,7 +987,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
                         return rows
                     if not token:
                         raise RuntimeError('TOKEN not set')
-                    return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress)
+                    return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
                 fut_rows = await asyncio.get_running_loop().run_in_executor(None, do_fetch)
                 db.upsert_many(fut_rows)
                 all_rows = load_all(); current_index = 0
@@ -1004,6 +1021,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
                 "  Enter          Toggle detail pane",
                 "  /              Start search (type, Enter to apply, Esc cancel)",
                 "  p              Cycle project filter",
+                "  U              Toggle include unassigned (then press u to refetch)",
                 "  d              Toggle done-only filter",
                 "  t / a          Today-only / All dates",
                 "  u              Update (fetch GitHub)",
