@@ -1,0 +1,11 @@
+# Example configuration for gh_task_viewer
+# Specify the default user login to filter tasks by assignee or people fields.
+user: eldraco
+# Regex to match the date field name in your projects (case-insensitive).
+# For example, to match "Start date" or "Start" write ^Start( date)?$
+date_field_regex: "^Start( date)?$"
+# List of projects to monitor.  Each entry may specify either an organisation
+# (`org`) or a user (`user`) and a list of project numbers.
+projects:
+  - org: stratosphereips
+    numbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]

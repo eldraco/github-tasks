@@ -5,6 +5,9 @@
 #   u  refresh (runs in background and updates a progress bar)
 #   t  show tasks with date == today
 #   a  show all cached tasks
+#   P  clear project filter (show all projects again)
+#   N  toggle hide tasks with no date
+#   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
 #   q  quit
 #
 # Config highlights
@@ -34,6 +37,7 @@ import re
 import sqlite3
 import sys
 import string
+import json
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Iterable
 
@@ -47,6 +51,8 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.layout.controls import BufferControl
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.filters import Condition
 
 
 # -----------------------------
@@ -218,6 +224,13 @@ class TaskDB:
             ],
         )
         self.conn.commit()
+
+    def replace_all(self, rows: List[TaskRow]):
+        """Replace all existing tasks with new list (ensures deletions reflected)."""
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM tasks")
+        self.conn.commit()
+        self.upsert_many(rows)
 
     def load(self, today_only=False, today: Optional[str]=None) -> List[TaskRow]:
         cur = self.conn.cursor()
@@ -594,7 +607,7 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
 # -----------------------------
 # TUI
 # -----------------------------
-def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
+def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[str] = None) -> None:
     """Full-screen, non-editable, vim-like browser with:
     - j/k, arrows: move selection
     - g g / G: top / bottom
@@ -608,34 +621,118 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     show_today_only = False
     # Hide-done toggle: start showing everything; 'd' hides completed tasks.
     hide_done = False
+    hide_no_date = False  # new toggle to hide tasks without any date
     show_unassigned = False
     project_cycle: Optional[str] = None
     search_term: Optional[str] = None
     in_search = False
     search_buffer = ""
+    in_date_filter = False   # when True, we're typing a date filter (<= date_max)
+    date_buffer = ""         # buffer for date filter input
+    date_max: Optional[str] = None
+    # Sort mode: 'project' (default) or 'date'
+    sort_mode: str = 'project'
     current_index = 0
     v_offset = 0  # top row index currently displayed
     h_offset = 0
     detail_mode = False
     status_line = ""
 
+    if state_path is None:
+        state_path = os.path.expanduser("~/.gh_tasks.ui.json")
+
+    def _load_state() -> dict:
+        try:
+            with open(state_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_state():
+        data = {
+            'show_today_only': show_today_only,
+            'hide_done': hide_done,
+            'hide_no_date': hide_no_date,
+            'show_unassigned': show_unassigned,
+            'project_cycle': project_cycle,
+            'search_term': search_term,
+            'date_max': date_max,
+            'sort_mode': sort_mode,
+            'current_index': current_index,
+            'v_offset': v_offset,
+            'h_offset': h_offset,
+        }
+        try:
+            d = os.path.dirname(state_path)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(state_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    # apply any saved UI state before loading rows
+    _st = _load_state()
+    show_today_only = bool(_st.get('show_today_only', show_today_only))
+    hide_done = bool(_st.get('hide_done', hide_done))
+    hide_no_date = bool(_st.get('hide_no_date', hide_no_date))
+    show_unassigned = bool(_st.get('show_unassigned', show_unassigned))
+    project_cycle = _st.get('project_cycle', project_cycle)
+    search_term = _st.get('search_term', search_term)
+    date_max = _st.get('date_max', date_max)
+    sort_mode = _st.get('sort_mode', sort_mode) if _st.get('sort_mode') in ('project','date') else 'project'
+    current_index = int(_st.get('current_index', current_index) or 0)
+    v_offset = int(_st.get('v_offset', v_offset) or 0)
+    h_offset = int(_st.get('h_offset', h_offset) or 0)
+
     def load_all():
         return db.load(today_only=show_today_only, today=today_date.isoformat())
 
     all_rows = load_all()
 
+    def _safe_date(s: str) -> Optional[dt.date]:
+        try:
+            return dt.date.fromisoformat(s)
+        except Exception:
+            return None
+
     def apply_filters(rows: List[TaskRow]) -> List[TaskRow]:
         out = rows
         if hide_done:
             out = [r for r in out if not r.is_done]
+        if hide_no_date:
+            out = [r for r in out if r.start_date]
         if project_cycle:
             out = [r for r in out if r.project_title == project_cycle]
-        if search_term:
-            needle = search_term.lower()
+        active_search = search_buffer if in_search else search_term
+        if active_search:
+            needle = active_search.lower()
             out = [r for r in out if needle in (r.title or '').lower() or
                                    needle in (r.repo or '').lower() or
                                    needle in (r.status or '').lower() or
                                    needle in (r.project_title or '').lower()]
+        if date_max:
+            dm = _safe_date(date_max)
+            if dm:
+                tmp: List[TaskRow] = []
+                for r in out:
+                    if not r.start_date:
+                        continue
+                    rsd = _safe_date(r.start_date)
+                    if rsd and rsd <= dm:
+                        tmp.append(r)
+                out = tmp
+        # apply sorting last
+        if sort_mode == 'date':
+            def _date_key(r: TaskRow):
+                dd = _safe_date(r.start_date)
+                return (dd is None, dd or dt.date.max, r.project_title or '', r.title or '')
+            out = sorted(out, key=_date_key)
+        else:  # 'project'
+            def _proj_key(r: TaskRow):
+                dd = _safe_date(r.start_date) or dt.date.max
+                return (r.project_title or '', dd, r.repo or '', r.title or '')
+            out = sorted(out, key=_proj_key)
         return out
 
     def projects_list(rows: Iterable[TaskRow]) -> List[str]:
@@ -668,7 +765,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
-        header = "DATE        FIELD                STATUS      TITLE                                     REPO                 URL"
+        header = "DATE        FIELD                STATUS      TITLE                                             PROJECT"
         frags.append(("bold", header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
@@ -682,17 +779,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             style_row = "reverse" if is_sel else ""
             col = color_for_date(t.start_date, today)
             base_style = (col + " bold") if is_sel else col
-            title = _truncate(t.title, 41)
-            repo = _truncate(t.repo or '-', 20)
-            url = _truncate(t.url, 40)
+            title = _truncate(t.title, 49)
+            project = _truncate(t.project_title, 20)
             field = _truncate(t.start_field, 20)
             status_txt = _truncate(t.status or '-', 10)
-            line = f"{t.start_date:<12}  {field:<20}  {status_txt:<10}  {title:<41}  {repo:<20}  {url}"
+            line = f"{t.start_date:<12}  {field:<20}  {status_txt:<10}  {title:<49}  {project:<20}"
             line = line[h_offset:]
-            # highlight search term occurrences
-            if search_term and not is_sel:
+            # highlight search term occurrences (live search buffer if active)
+            active_search = search_buffer if in_search else search_term
+            if active_search and not is_sel:
                 low = line.lower()
-                needle = search_term.lower()
+                needle = active_search.lower()
                 start = 0
                 while True:
                     i = low.find(needle, start)
@@ -715,17 +812,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         rows = filtered_rows()
         if not rows:
             return "No tasks"
-        per_status: Dict[str,int] = {}
-        for r in rows:
-            per_status[r.status or '(none)'] = per_status.get(r.status or '(none)',0)+1
         total = len(rows)
         done_ct = sum(1 for r in rows if r.is_done)
-        lines = [f"User: {cfg.user}", f"Total: {total}", f"Done: {done_ct}"]
-        # projects
+        lines: List[str] = [f"User: {cfg.user}", f"Total: {total}", f"Done: {done_ct}"]
+        # per-project stats
         by_proj: Dict[str, Tuple[int,int]] = {}
         for r in rows:
-            d,t = by_proj.get(r.project_title,(0,0))
-            by_proj[r.project_title]=(d+(1 if r.is_done else 0), t+1)
+            d, t = by_proj.get(r.project_title, (0,0))
+            by_proj[r.project_title] = (d + (1 if r.is_done else 0), t + 1)
         lines.append("")
         lines.append("Proj:")
         for p,(d,t) in sorted(by_proj.items()):
@@ -733,10 +827,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}%")
         lines.append("")
         lines.append("Filters:")
-        lines.append(f"HideDone:{'Y' if hide_done else 'N'} Unassigned:{'Y' if show_unassigned else 'N'}")
+        active_search = search_buffer if in_search else search_term
+        lines.append(f"HideDone:{'Y' if hide_done else 'N'} HideNoDate:{'Y' if hide_no_date else 'N'} Unassigned:{'Y' if show_unassigned else 'N'}")
         lines.append(f"Proj:{_truncate(project_cycle or 'All',10)}")
         lines.append(f"Today:{'Y' if show_today_only else 'N'}")
-        lines.append(f"Search:{_truncate(search_term or '-',12)}")
+        lines.append(f"Date<=:{date_max or '-'}")
+        lines.append(f"Search:{_truncate(active_search or '-',12)}")
         return "\n".join(lines)
 
     table_control = FormattedTextControl(text=lambda: build_table_fragments())
@@ -773,14 +869,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     show_help = False
 
     def build_status_bar() -> str:
-        mode = "SEARCH" if in_search else ("DETAIL" if detail_mode else ("HELP" if show_help else "BROWSE"))
-        base = f" {mode} u:update U:unassigned j/k:nav h/l:←/→ /:search Enter:detail p:project d:hide-done t:today a:all ?:help q:quit "
-        if search_term:
+        mode = ("DATE" if in_date_filter else ("SEARCH" if in_search else ("DETAIL" if detail_mode else ("HELP" if show_help else "BROWSE"))))
+        base = f" {mode} u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
+        # Show live search buffer while typing, or the committed filter afterwards
+        if in_search:
+            base += f"| search:{search_buffer or ''} "
+        elif search_term:
             base += f"| filter='{search_term}' "
+        base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
             base += "[HideDone] "
+        if hide_no_date:
+            base += "[HideNoDate] "
         if project_cycle:
             base += f"[Proj:{_truncate(project_cycle,10)}] "
+        if date_max:
+            base += f"[<= {date_max}] "
         return base + status_line
 
     from prompt_toolkit.layout.containers import Float, FloatContainer
@@ -789,6 +893,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
     container = FloatContainer(content=HSplit([root_body, status_window]), floats=floats)
 
     kb = KeyBindings()
+    # Mode filters to enable/disable keybindings contextually
+    is_search = Condition(lambda: in_search)
+    is_date = Condition(lambda: in_date_filter)
+    is_detail = Condition(lambda: detail_mode)
+    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode)
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -809,14 +919,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             search_buffer = ""
             invalidate()
             return
+        # Save UI state before exiting
+        _save_state()
         event.app.exit()
 
     @kb.add('enter')
     def _(event):
         nonlocal detail_mode
         if in_search:
-            finalize_search()
-            return
+            finalize_search(); return
+        if in_date_filter:
+            finalize_date(); return
         detail_mode = not detail_mode
         floats.clear()
         if detail_mode:
@@ -842,31 +955,31 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
 
-    @kb.add('j')
-    @kb.add('down')
+    @kb.add('j', filter=is_normal)
+    @kb.add('down', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
         move(1); invalidate()
 
-    @kb.add('k')
-    @kb.add('up')
+    @kb.add('k', filter=is_normal)
+    @kb.add('up', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
         move(-1); invalidate()
 
     # horizontal scroll
-    @kb.add('h')
-    @kb.add('left')
+    @kb.add('h', filter=is_normal)
+    @kb.add('left', filter=is_normal)
     def _(event):
         nonlocal h_offset
         if detail_mode or in_search:
             return
         h_offset = max(0, h_offset-4); invalidate()
 
-    @kb.add('l')
-    @kb.add('right')
+    @kb.add('l', filter=is_normal)
+    @kb.add('right', filter=is_normal)
     def _(event):
         nonlocal h_offset
         if detail_mode or in_search:
@@ -875,7 +988,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
 
     # top/bottom
     gg_state = {'g': False}
-    @kb.add('g')
+    @kb.add('g', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
@@ -887,7 +1000,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         else:
             gg_state['g'] = True
 
-    @kb.add('G')
+    @kb.add('G', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
@@ -898,7 +1011,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
             invalidate()
 
     # filters
-    @kb.add('d')
+    @kb.add('d', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
@@ -907,7 +1020,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         current_index = 0
         invalidate()
 
-    @kb.add('t')
+    @kb.add('t', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
@@ -916,7 +1029,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         all_rows = load_all(); current_index = 0
         invalidate()
 
-    @kb.add('a')
+    @kb.add('a', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
@@ -925,7 +1038,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         all_rows = load_all(); current_index = 0
         invalidate()
 
-    @kb.add('p')
+    @kb.add('p', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
@@ -944,14 +1057,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
                     project_cycle = projs[0]
         invalidate()
 
+    @kb.add('P', filter=is_normal)
+    def _(event):
+        # Clear project filter
+        if detail_mode or in_search:
+            return
+        nonlocal project_cycle
+        project_cycle = None
+        invalidate()
+
+    @kb.add('N', filter=is_normal)
+    def _(event):
+        # Toggle hide no-date tasks
+        if detail_mode or in_search:
+            return
+        nonlocal hide_no_date, current_index
+        hide_no_date = not hide_no_date
+        current_index = 0
+        invalidate()
+
     # search mode
     @kb.add('/')
     def _(event):
         if detail_mode:
             return
-        nonlocal in_search, search_buffer
+        nonlocal in_search, search_buffer, in_date_filter, date_buffer, status_line
         in_search = True
+        in_date_filter = False
         search_buffer = ""
+        # show prompt immediately
+        status_line = "Search: "
         invalidate()
 
     def finalize_search():
@@ -964,34 +1099,47 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
 
     @kb.add('escape')
     def _(event):
-        nonlocal in_search, detail_mode, search_buffer
+        nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer
         if in_search:
             in_search = False; search_buffer = ""; invalidate(); return
+        if in_date_filter:
+            in_date_filter = False; date_buffer = ""; invalidate(); return
         if detail_mode:
             detail_mode = False; floats.clear(); invalidate(); return
 
     @kb.add('backspace')
     def _(event):
-        nonlocal search_buffer
+        nonlocal search_buffer, date_buffer, status_line
         if in_search and search_buffer:
             search_buffer = search_buffer[:-1]
+            status_line = f"Search: {search_buffer}"
+            invalidate()
+        elif in_date_filter and date_buffer:
+            date_buffer = date_buffer[:-1]
+            status_line = f"Date<= {date_buffer}"
             invalidate()
 
-    # character input for search (exclude reserved keys used for commands)
-    reserved = set("jkgGhHlLdDtTaApPuUqQ/?:")
-    search_chars = [c for c in (string.ascii_letters + string.digits + " -_./") if c not in reserved]
-    for ch in search_chars:
-        @kb.add(ch)
-        def _(event, _ch=ch):
-            nonlocal search_buffer, status_line
-            if in_search:
-                search_buffer += _ch
-                status_line = f"Search: {search_buffer}"
+    # Catch-all printable character input for live search and date filter typing
+    @kb.add(Keys.Any, filter=Condition(lambda: in_search or in_date_filter))
+    def _(event):
+        nonlocal search_buffer, status_line, date_buffer
+        ch = event.data or ""
+        if not ch:
+            return
+        if in_search:
+            # Accept any printable char; special keys (enter/esc/backspace) have empty event.data
+            search_buffer += ch
+            status_line = f"Search: {search_buffer}"
+            invalidate()
+        elif in_date_filter and ch in (string.digits + "-"):
+            if len(date_buffer) < 10:  # YYYY-MM-DD
+                date_buffer += ch
+                status_line = f"Date<= {date_buffer}"
                 invalidate()
 
-    @kb.add('u')
+    @kb.add('u', filter=is_normal)
     def _(event):
-        if detail_mode or in_search:
+        if detail_mode or in_search or in_date_filter:
             return
         nonlocal status_line, all_rows, current_index
         status_line = "Updating..."; invalidate()
@@ -1017,12 +1165,50 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
                         raise RuntimeError('TOKEN not set')
                     return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
                 fut_rows = await asyncio.get_running_loop().run_in_executor(None, do_fetch)
-                db.upsert_many(fut_rows)
+                db.replace_all(fut_rows)
                 all_rows = load_all(); current_index = 0
                 progress(1,1,'Updated')
             except Exception as e:
                 status_line = f"Error: {e}"; invalidate()
         asyncio.create_task(worker())
+    # Sort toggle
+    @kb.add('s', filter=is_normal)
+    def _(event):
+        nonlocal sort_mode, current_index, v_offset
+        sort_mode = 'date' if sort_mode == 'project' else 'project'
+        current_index = 0
+        v_offset = 0
+        invalidate()
+    # Date <= filter input
+    @kb.add('F')
+    def _(event):
+        if detail_mode:
+            return
+        nonlocal in_date_filter, in_search, date_buffer, status_line
+        in_search = False
+        in_date_filter = True
+        date_buffer = date_max or ""
+        status_line = f"Date<= {date_buffer or 'YYYY-MM-DD'}"
+        invalidate()
+
+    def finalize_date():
+        nonlocal in_date_filter, date_max, date_buffer, status_line
+        val = date_buffer.strip()
+        if not val:
+            date_max = None
+        else:
+            # basic validation
+            try:
+                dt.date.fromisoformat(val)
+                date_max = val
+            except Exception:
+                status_line = f"Bad date '{val}' (use YYYY-MM-DD)"; invalidate(); return
+        in_date_filter = False
+        date_buffer = ""
+        status_line = ""
+        invalidate()
+
+    # (Removed duplicate enter handler)
 
     def update_search_status():
         nonlocal status_line
@@ -1031,7 +1217,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
         elif not detail_mode and not status_line:
             status_line = ''
 
-    @kb.add('?')
+    @kb.add('?', filter=is_normal)
     def _(event):
         nonlocal show_help, detail_mode, in_search
         if in_search:
@@ -1048,9 +1234,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str]) -> None:
                 "  h/l or arrows  Horizontal scroll",
                 "  Enter          Toggle detail pane",
                 "  /              Start search (type, Enter to apply, Esc cancel)",
+                "  s              Toggle sort (Project/Date)",
                 "  p              Cycle project filter",
+                "  P              Clear project filter (show all)",
                 "  U              Toggle include unassigned (then press u to refetch)",
                 "  d              Toggle done-only filter",
+                "  N              Toggle hide tasks without a date",
                 "  t / a          Today-only / All dates",
                 "  u              Update (fetch GitHub)",
                 "  ?              Toggle help",
