@@ -49,10 +49,11 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, VSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
-from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.layout.controls import BufferControl
+# Buffer-based input removed; keep core controls only
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.filters import Condition
+import logging
+from logging.handlers import RotatingFileHandler
 
 
 # -----------------------------
@@ -637,9 +638,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     h_offset = 0
     detail_mode = False
     status_line = ""
+    # Inline search buffer (used when in_search == True)
 
     if state_path is None:
         state_path = os.path.expanduser("~/.gh_tasks.ui.json")
+
+    # Setup file logger for diagnostics
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gh_task_viewer.log')
+    logger = logging.getLogger('gh_task_viewer')
+    if not logger.handlers:
+        logger.setLevel(logging.DEBUG)
+        fh = RotatingFileHandler(log_path, maxBytes=2000000, backupCount=2, encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        logger.addHandler(fh)
 
     def _load_state() -> dict:
         try:
@@ -698,6 +709,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def apply_filters(rows: List[TaskRow]) -> List[TaskRow]:
         out = rows
+        try:
+            logger.debug("apply_filters start: hide_done=%s hide_no_date=%s project_cycle=%r in_search=%s search_term=%r search_buffer=%r", hide_done, hide_no_date, project_cycle, in_search, search_term, search_buffer)
+        except Exception:
+            pass
         if hide_done:
             out = [r for r in out if not r.is_done]
         if hide_no_date:
@@ -1081,27 +1096,34 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         if detail_mode:
             return
-        nonlocal in_search, search_buffer, in_date_filter, date_buffer, status_line
-        in_search = True
+        nonlocal in_search, search_buffer, in_date_filter, status_line
         in_date_filter = False
+        in_search = True
         search_buffer = ""
-        # show prompt immediately
         status_line = "Search: "
         invalidate()
 
     def finalize_search():
-        nonlocal in_search, search_term, search_buffer, current_index
+        nonlocal in_search, search_term, search_buffer, current_index, status_line
         search_term = search_buffer or None
         in_search = False
+        status_line = ''
+        try:
+            logger.debug("finalize_search committed='%s'", search_term)
+        except Exception:
+            pass
         rows = filtered_rows()
         current_index = 0 if rows else 0
         invalidate()
 
     @kb.add('escape')
     def _(event):
-        nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer
+        nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line
         if in_search:
-            in_search = False; search_buffer = ""; invalidate(); return
+            in_search = False
+            search_buffer = ""
+            status_line = ''
+            invalidate(); return
         if in_date_filter:
             in_date_filter = False; date_buffer = ""; invalidate(); return
         if detail_mode:
@@ -1156,6 +1178,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         async def worker():
             try:
+                nonlocal all_rows, current_index, status_line
                 def do_fetch():
                     if os.environ.get('MOCK_FETCH')=='1':
                         rows = generate_mock_tasks(cfg)
@@ -1346,7 +1369,25 @@ def main() -> None:
             if not token:
                 print("TOKEN/GITHUB_TOKEN not set. Create .env with TOKEN=... or export variable (or use MOCK_FETCH=1).", file=sys.stderr)
                 sys.exit(1)
-            db.upsert_many(fetch_tasks_github(token, cfg, date_cutoff=dt.date.today()))
+
+            # Initial fetch may take a while (network + many projects). Show progress to stderr so
+            # the user knows work is happening instead of seeing a long pause.
+            def _progress_print(done:int, total:int, line:str):
+                try:
+                    # Overwrite same line; print final newline in the end when completed
+                    sys.stderr.write('\r' + line)
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+
+            try:
+                sys.stderr.write('Fetching tasks from GitHub (this may take a while)...\n')
+                rows = fetch_tasks_github(token, cfg, date_cutoff=dt.date.today(), progress=_progress_print)
+                sys.stderr.write('\n')
+                db.upsert_many(rows)
+            except Exception as e:
+                sys.stderr.write('\nError fetching tasks: ' + str(e) + '\n')
+                raise
 
     if args.no_ui:
         rows = db.load()
