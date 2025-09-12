@@ -578,7 +578,7 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         return [("bold", "Nothing to show."), ("", " Press "), ("bold", "u"), ("", " to fetch.")]
 
     current: Optional[str] = None
-    header = "DATE         FIELD                STATUS      TITLE                                     REPO                 URL"
+    header = "Start Date   STATUS      TITLE                                     REPO                 URL"
     for t in tasks:
         if t.project_title != current:
             current = t.project_title
@@ -589,16 +589,15 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
             frags.append(("bold", header))
             frags.append(("", "\n"))
 
-        col = color_for_date(t.start_date, today)
-        title = _truncate(t.title, 61)
-        repo  = _truncate(t.repo or "-", 20)
-        url   = _truncate(t.url, 40)
-        field = _truncate(t.start_field, 20)
-        status = _truncate(t.status or "-", 10)
-        frags.append((col, f"{t.start_date:<12}"))
-        frags.append(("",  "  "))
-        frags.append(("", f"{field:<20}  {status:<10}  {title:<41}  {repo:<20}  {url}"))
-        frags.append(("", "\n"))
+    col = color_for_date(t.start_date, today)
+    title = _truncate(t.title, 45)
+    repo  = _truncate(t.repo or "-", 20)
+    url   = _truncate(t.url, 40)
+    status = _truncate(t.status or "-", 10)
+    frags.append((col, f"{t.start_date:<12}"))
+    frags.append(("",  "  "))
+    frags.append(("", f"{status:<10}  {title:<45}  {repo:<20}  {url}"))
+    frags.append(("", "\n"))
 
     if frags and frags[-1] == ("", "\n"):
         frags.pop()
@@ -780,7 +779,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
-        header = "DATE        FIELD                STATUS      TITLE                                             PROJECT"
+        header = "Start Date   STATUS      TITLE                                             PROJECT"
         frags.append(("bold", header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
@@ -794,11 +793,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             style_row = "reverse" if is_sel else ""
             col = color_for_date(t.start_date, today)
             base_style = (col + " bold") if is_sel else col
-            title = _truncate(t.title, 49)
+            title = _truncate(t.title, 60)
             project = _truncate(t.project_title, 20)
-            field = _truncate(t.start_field, 20)
             status_txt = _truncate(t.status or '-', 10)
-            line = f"{t.start_date:<12}  {field:<20}  {status_txt:<10}  {title:<49}  {project:<20}"
+            line = f"{t.start_date:<12}  {status_txt:<10}  {title:<60}  {project:<20}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -1178,7 +1176,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         async def worker():
             try:
-                nonlocal all_rows, current_index, status_line
+                nonlocal all_rows, current_index, status_line, today_date
+                # Refresh today's date at start of update so colors/filters use current day
+                try:
+                    today_date = dt.date.today()
+                    logger.debug("today_date refreshed at start of update: %s", today_date)
+                except Exception:
+                    pass
                 def do_fetch():
                     if os.environ.get('MOCK_FETCH')=='1':
                         rows = generate_mock_tasks(cfg)
@@ -1189,6 +1193,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
                 fut_rows = await asyncio.get_running_loop().run_in_executor(None, do_fetch)
                 db.replace_all(fut_rows)
+                # After replacing DB, re-evaluate today's date again (midnight rollovers)
+                try:
+                    today_date = dt.date.today()
+                    logger.debug("today_date refreshed after update: %s", today_date)
+                except Exception:
+                    pass
                 all_rows = load_all(); current_index = 0
                 progress(1,1,'Updated')
             except Exception as e:
