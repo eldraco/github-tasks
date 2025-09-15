@@ -116,6 +116,8 @@ class TaskRow:
     project_title: str
     start_field: str
     start_date: str
+    focus_field: str
+    focus_date: str
     title: str
     repo: Optional[str]
     url: str
@@ -126,8 +128,10 @@ class TaskRow:
 
 class TaskDB:
     SCHEMA_COLUMNS = [
-        "owner_type","owner","project_number","project_title","start_field",
-        "start_date","title","repo","url","updated_at","status","is_done"
+        "owner_type","owner","project_number","project_title",
+        "start_field","start_date",
+        "focus_field","focus_date",
+        "title","repo","url","updated_at","status","is_done"
     ]
     CREATE_TABLE_SQL = """      CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,6 +141,8 @@ class TaskDB:
         project_title TEXT NOT NULL,
         start_field TEXT NOT NULL,
         start_date TEXT NOT NULL,
+        focus_field TEXT NOT NULL,
+        focus_date TEXT NOT NULL,
         title TEXT NOT NULL,
         repo TEXT,
         url TEXT NOT NULL,
@@ -161,6 +167,7 @@ class TaskDB:
 
     def _idx(self):
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(start_date)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_focus_date ON tasks(focus_date)")
         self.conn.commit()
 
     def _migrate_if_needed(self):
@@ -178,7 +185,9 @@ class TaskDB:
         cur.execute(self.CREATE_TABLE_SQL)
         defaults = {
             "owner_type":"''","owner":"''","project_number":"0","project_title":"''",
-            "start_field":"''","start_date":"''","title":"''","repo":"NULL","url":"''",
+            "start_field":"''","start_date":"''",
+            "focus_field":"''","focus_date":"''",
+            "title":"''","repo":"NULL","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
         }
         sel = ", ".join([c if c in cols else defaults[c] for c in self.SCHEMA_COLUMNS])
@@ -197,8 +206,10 @@ class TaskDB:
         cur.executemany(
             """            INSERT INTO tasks (
               owner_type, owner, project_number, project_title,
-              start_field, start_date, title, repo, url, updated_at, status, is_done
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              start_field, start_date,
+              focus_field, focus_date,
+              title, repo, url, updated_at, status, is_done
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
@@ -214,6 +225,8 @@ class TaskDB:
                     r.project_title,
                     r.start_field,
                     r.start_date,
+                    r.focus_field,
+                    r.focus_date,
                     r.title,
                     r.repo,
                     r.url,
@@ -239,18 +252,18 @@ class TaskDB:
             today = today or dt.date.today().isoformat()
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,title,repo,url,updated_at,status,is_done
-                FROM tasks WHERE start_date = ?
-                ORDER BY project_title, start_date, repo, title
+                       start_date,focus_field,focus_date,title,repo,url,updated_at,status,is_done
+                FROM tasks WHERE focus_date = ?
+                ORDER BY project_title, focus_date, repo, title
                 """,
                 (today,),
             )
         else:
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,title,repo,url,updated_at,status,is_done
+                       start_date,focus_field,focus_date,title,repo,url,updated_at,status,is_done
                 FROM tasks
-                ORDER BY project_title, start_date, repo, title
+                ORDER BY project_title, focus_date, repo, title
                 """
             )
         return [TaskRow(*r) for r in cur.fetchall()]
@@ -367,9 +380,16 @@ def _session(token: str) -> requests.Session:
     return s
 
 def _graphql_raw(session: requests.Session, query: str, variables: Dict[str, object]) -> Dict:
-    r = session.post("https://api.github.com/graphql", json={"query": query, "variables": variables}, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = session.post("https://api.github.com/graphql", json={"query": query, "variables": variables}, timeout=60)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        try:
+            logging.getLogger('gh_task_viewer').exception("GraphQL request failed")
+        except Exception:
+            pass
+        raise
 
 def discover_open_projects(session: requests.Session, owner_type: str, owner: str) -> List[Dict]:
     if owner_type == "org":
@@ -420,6 +440,10 @@ def fetch_tasks_github(
                 targets.append((spec.owner_type, spec.owner, int(num), ""))
 
     total = len(targets)
+    try:
+        logging.getLogger('gh_task_viewer').info("Fetching from %d project targets", total)
+    except Exception:
+        pass
     done = 0
 
     def tick(msg: str):
@@ -443,7 +467,15 @@ def fetch_tasks_github(
             if errs:
                 nf = any((e.get("type") == "NOT_FOUND") and ("projectV2" in (e.get("path") or [])) for e in errs)
                 if nf:
+                    try:
+                        logging.getLogger('gh_task_viewer').warning("Project not found or inaccessible: %s:%s #%s", owner_type, owner, number)
+                    except Exception:
+                        pass
                     break  # skip invalid/inaccessible project number
+                try:
+                    logging.getLogger('gh_task_viewer').error("GraphQL errors: %s", errs)
+                except Exception:
+                    pass
                 raise RuntimeError(f"GraphQL errors: {errs}")
 
             proj_node = (
@@ -481,6 +513,21 @@ def fetch_tasks_github(
                 if (not assigned_to_me) and (not include_unassigned):
                     continue
 
+                # Extract optional Focus Day for coloring and Today filter
+                focus_fname: str = ""
+                focus_fdate: str = ""
+                for fv in (it.get("fieldValues") or {}).get("nodes") or []:
+                    if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
+                        fname_fd = ((fv.get("field") or {}).get("name") or "")
+                        if fname_fd.strip().lower() == "focus day":
+                            fdate_fd = fv.get("date")
+                            if fdate_fd:
+                                try:
+                                    dt.date.fromisoformat(fdate_fd)
+                                    focus_fname, focus_fdate = fname_fd, fdate_fd
+                                except ValueError:
+                                    pass
+
                 found_date = False
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
@@ -503,6 +550,8 @@ def fetch_tasks_github(
                                 owner_type=owner_type, owner=owner, project_number=number,
                                 project_title=(it.get("project") or {}).get("title") or "",
                                 start_field=fname, start_date=fdate,
+                                focus_field=focus_fname or "",
+                                focus_date=focus_fdate or "",
                                 title=title, repo=repo, url=url, updated_at=iso_now,
                                 status=status_text, is_done=done_flag
                             )
@@ -520,6 +569,8 @@ def fetch_tasks_github(
                             owner_type=owner_type, owner=owner, project_number=number,
                             project_title=(it.get("project") or {}).get("title") or "",
                             start_field="(no date)", start_date="",  # empty date -> neutral grey
+                            focus_field=focus_fname or "",
+                            focus_date=focus_fdate or "",
                             title=title + (" (unassigned)" if not assigned_to_me else ""), repo=repo, url=url, updated_at=iso_now,
                             status=status_text, is_done=done_flag
                         )
@@ -546,6 +597,7 @@ def fetch_tasks_github(
                 TaskRow(
                     owner_type=owner_type, owner=owner, project_number=number,
                     project_title=ptitle or "(project)", start_field="(none)", start_date="",
+                    focus_field="", focus_date="",
                     title="(no assigned items) - press Shift+U to include unassigned", repo=None, url="", updated_at=iso_now,
                     status=None, is_done=0
                 )
@@ -578,7 +630,7 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         return [("bold", "Nothing to show."), ("", " Press "), ("bold", "u"), ("", " to fetch.")]
 
     current: Optional[str] = None
-    header = "Start Date   STATUS      TITLE                                     REPO                 URL"
+    header = "Focus Day   Start Date   STATUS      TITLE                                     REPO                 URL"
     for t in tasks:
         if t.project_title != current:
             current = t.project_title
@@ -588,16 +640,15 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
             frags.append(("", "\n"))
             frags.append(("bold", header))
             frags.append(("", "\n"))
-
-    col = color_for_date(t.start_date, today)
-    title = _truncate(t.title, 45)
-    repo  = _truncate(t.repo or "-", 20)
-    url   = _truncate(t.url, 40)
-    status = _truncate(t.status or "-", 10)
-    frags.append((col, f"{t.start_date:<12}"))
-    frags.append(("",  "  "))
-    frags.append(("", f"{status:<10}  {title:<45}  {repo:<20}  {url}"))
-    frags.append(("", "\n"))
+        col = color_for_date(t.focus_date, today)
+        title = _truncate(t.title, 45)
+        repo  = _truncate(t.repo or "-", 20)
+        url   = _truncate(t.url, 40)
+        status = _truncate(t.status or "-", 10)
+        frags.append((col, f"{t.focus_date or '-':<11}  {t.start_date:<12}"))
+        frags.append(("",  "  "))
+        frags.append(("", f"{status:<10}  {title:<45}  {repo:<20}  {url}"))
+        frags.append(("", "\n"))
 
     if frags and frags[-1] == ("", "\n"):
         frags.pop()
@@ -607,7 +658,7 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
 # -----------------------------
 # TUI
 # -----------------------------
-def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[str] = None) -> None:
+def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[str] = None, log_level: str = 'ERROR') -> None:
     """Full-screen, non-editable, vim-like browser with:
     - j/k, arrows: move selection
     - g g / G: top / bottom
@@ -642,14 +693,26 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     if state_path is None:
         state_path = os.path.expanduser("~/.gh_tasks.ui.json")
 
-    # Setup file logger for diagnostics
+    # Setup file logger for diagnostics; default level is ERROR unless CLI overrides.
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gh_task_viewer.log')
     logger = logging.getLogger('gh_task_viewer')
-    if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
-        fh = RotatingFileHandler(log_path, maxBytes=2000000, backupCount=2, encoding='utf-8')
-        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-        logger.addHandler(fh)
+    # Always reset handlers so CLI --log-level reliably controls file output.
+    for h in list(logger.handlers):
+        try:
+            logger.removeHandler(h)
+        except Exception:
+            pass
+    # root logger: keep DEBUG level to allow verbose logs internally; handler filters by level
+    logger.setLevel(logging.DEBUG)
+    fh = RotatingFileHandler(log_path, maxBytes=2000000, backupCount=2, encoding='utf-8')
+    # handler level honors CLI option (default ERROR)
+    try:
+        lvl = getattr(logging, log_level.upper(), logging.ERROR)
+    except Exception:
+        lvl = logging.ERROR
+    fh.setLevel(lvl)
+    fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logger.addHandler(fh)
 
     def _load_state() -> dict:
         try:
@@ -715,7 +778,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if hide_done:
             out = [r for r in out if not r.is_done]
         if hide_no_date:
-            out = [r for r in out if r.start_date]
+            out = [r for r in out if r.focus_date]
         if project_cycle:
             out = [r for r in out if r.project_title == project_cycle]
         active_search = search_buffer if in_search else search_term
@@ -730,21 +793,21 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if dm:
                 tmp: List[TaskRow] = []
                 for r in out:
-                    if not r.start_date:
+                    if not r.focus_date:
                         continue
-                    rsd = _safe_date(r.start_date)
+                    rsd = _safe_date(r.focus_date)
                     if rsd and rsd <= dm:
                         tmp.append(r)
                 out = tmp
         # apply sorting last
         if sort_mode == 'date':
             def _date_key(r: TaskRow):
-                dd = _safe_date(r.start_date)
+                dd = _safe_date(r.focus_date)
                 return (dd is None, dd or dt.date.max, r.project_title or '', r.title or '')
             out = sorted(out, key=_date_key)
         else:  # 'project'
             def _proj_key(r: TaskRow):
-                dd = _safe_date(r.start_date) or dt.date.max
+                dd = _safe_date(r.focus_date) or dt.date.max
                 return (r.project_title or '', dd, r.repo or '', r.title or '')
             out = sorted(out, key=_proj_key)
         return out
@@ -779,7 +842,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
-        header = "Start Date   STATUS      TITLE                                             PROJECT"
+        header = "Focus Day   Start Date   STATUS      TITLE                                             PROJECT"
         frags.append(("bold", header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
@@ -791,12 +854,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             idx = v_offset + rel_idx
             is_sel = (idx == current_index)
             style_row = "reverse" if is_sel else ""
-            col = color_for_date(t.start_date, today)
+            col = color_for_date(t.focus_date, today)
             base_style = (col + " bold") if is_sel else col
             title = _truncate(t.title, 60)
             project = _truncate(t.project_title, 20)
             status_txt = _truncate(t.status or '-', 10)
-            line = f"{t.start_date:<12}  {status_txt:<10}  {title:<60}  {project:<20}"
+            line = f"{(t.focus_date or '-'):<11}  {t.start_date:<12}  {status_txt:<10}  {title:<60}  {project:<20}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -850,6 +913,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     table_control = FormattedTextControl(text=lambda: build_table_fragments())
     table_window = Window(content=table_control, wrap_lines=False, always_hide_cursor=True)
+    # Top status bar: shows date, current project, total tasks shown, and active search filter
+    def build_top_status() -> List[Tuple[str,str]]:
+        rows = filtered_rows()
+        total = len(rows)
+        active_proj = project_cycle or 'All'
+        active_search = search_buffer if in_search else search_term or '-'
+        txt = f" Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
+        return [("reverse", txt)]
+    top_status_control = FormattedTextControl(text=lambda: build_top_status())
+    top_status_window = Window(height=1, content=top_status_control)
     stats_control = FormattedTextControl(text=lambda: summarize())
     stats_window = Window(width=32, content=stats_control, wrap_lines=False, always_hide_cursor=True)
 
@@ -868,7 +941,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             f"Title:   {t.title}",
             f"Repo:    {t.repo}",
             f"URL:     {t.url}",
-            f"Date:    {t.start_date} ({t.start_field})",
+            f"Start:   {t.start_date} ({t.start_field})",
+            f"Focus:   {t.focus_date or '-'} ({t.focus_field or '-'})",
             f"Status:  {t.status}",
             f"Done:    {'Yes' if t.is_done else 'No'}",
             "",
@@ -884,18 +958,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def build_status_bar() -> str:
         mode = ("DATE" if in_date_filter else ("SEARCH" if in_search else ("DETAIL" if detail_mode else ("HELP" if show_help else "BROWSE"))))
         base = f" {mode} u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
-        # Show live search buffer while typing, or the committed filter afterwards
-        if in_search:
-            base += f"| search:{search_buffer or ''} "
-        elif search_term:
-            base += f"| filter='{search_term}' "
+    # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
         base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
             base += "[HideDone] "
         if hide_no_date:
             base += "[HideNoDate] "
-        if project_cycle:
-            base += f"[Proj:{_truncate(project_cycle,10)}] "
+    # project and search are shown on the top status bar
         if date_max:
             base += f"[<= {date_max}] "
         return base + status_line
@@ -903,7 +972,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     from prompt_toolkit.layout.containers import Float, FloatContainer
     floats = []
     root_body = VSplit([table_window, Window(width=1, char='│'), stats_window])
-    container = FloatContainer(content=HSplit([root_body, status_window]), floats=floats)
+    container = FloatContainer(content=HSplit([top_status_window, root_body, status_window]), floats=floats)
 
     kb = KeyBindings()
     # Mode filters to enable/disable keybindings contextually
@@ -1163,6 +1232,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return
         nonlocal status_line, all_rows, current_index
         status_line = "Updating..."; invalidate()
+        try:
+            logger.info("Update triggered via 'u' (include_unassigned=%s, show_today_only=%s)", show_unassigned, show_today_only)
+        except Exception:
+            pass
 
         try:
             loop = asyncio.get_running_loop()
@@ -1185,13 +1258,25 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     pass
                 def do_fetch():
                     if os.environ.get('MOCK_FETCH')=='1':
+                        try:
+                            logger.info("MOCK_FETCH enabled; generating mock tasks")
+                        except Exception:
+                            pass
                         rows = generate_mock_tasks(cfg)
                         progress(1,1,'[########################################] 100% Done')
                         return rows
                     if not token:
                         raise RuntimeError('TOKEN not set')
+                    try:
+                        logger.info("Fetching tasks from GitHub… (cutoff=%s, include_unassigned=%s)", today_date, show_unassigned)
+                    except Exception:
+                        pass
                     return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
                 fut_rows = await asyncio.get_running_loop().run_in_executor(None, do_fetch)
+                try:
+                    logger.info("Fetched %d tasks; replacing DB rows", len(fut_rows))
+                except Exception:
+                    pass
                 db.replace_all(fut_rows)
                 # After replacing DB, re-evaluate today's date again (midnight rollovers)
                 try:
@@ -1201,8 +1286,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     pass
                 all_rows = load_all(); current_index = 0
                 progress(1,1,'Updated')
+                try:
+                    logger.info("Update finished successfully. Cached rows: %d", len(all_rows))
+                except Exception:
+                    pass
             except Exception as e:
                 status_line = f"Error: {e}"; invalidate()
+                try:
+                    logger.exception("Update failed")
+                except Exception:
+                    pass
         asyncio.create_task(worker())
     # Sort toggle
     @kb.add('s', filter=is_normal)
@@ -1308,7 +1401,9 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
             status = statuses[(i + d_off) % len(statuses)]
             rows.append(TaskRow(
                 owner_type="org", owner="example", project_number=i, project_title=proj,
-                start_field="Start date", start_date=date_str, title=f"Task {i}-{d_off}", repo="demo/repo",
+                start_field="Start date", start_date=date_str,
+                focus_field="Focus Day", focus_date=date_str,
+                title=f"Task {i}-{d_off}", repo="demo/repo",
                 url=f"https://example.com/{i}-{d_off}", updated_at=iso_now, status=status,
                 is_done=1 if status.lower()=="done" else 0
             ))
@@ -1349,6 +1444,7 @@ def main() -> None:
     ap.add_argument("--db", default=os.path.expanduser("~/.gh_tasks.db"), help="Path to sqlite DB")
     ap.add_argument("--discover", action="store_true", help="List open Projects v2 for each owner and exit")
     ap.add_argument("--no-ui", action="store_true", help="Run a non-interactive summary (for testing)")
+    ap.add_argument("--log-level", default="ERROR", help="File log level (DEBUG, INFO, WARNING, ERROR)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -1372,32 +1468,14 @@ def main() -> None:
 
     db = TaskDB(args.db)
 
+    # Do not auto-update on start; leave DB empty unless MOCK_FETCH is requested.
+    # Users update manually with the 'u' hotkey in the UI.
     if not db.load():
         if os.environ.get("MOCK_FETCH") == "1":
             db.upsert_many(generate_mock_tasks(cfg))
         else:
-            if not token:
-                print("TOKEN/GITHUB_TOKEN not set. Create .env with TOKEN=... or export variable (or use MOCK_FETCH=1).", file=sys.stderr)
-                sys.exit(1)
-
-            # Initial fetch may take a while (network + many projects). Show progress to stderr so
-            # the user knows work is happening instead of seeing a long pause.
-            def _progress_print(done:int, total:int, line:str):
-                try:
-                    # Overwrite same line; print final newline in the end when completed
-                    sys.stderr.write('\r' + line)
-                    sys.stderr.flush()
-                except Exception:
-                    pass
-
-            try:
-                sys.stderr.write('Fetching tasks from GitHub (this may take a while)...\n')
-                rows = fetch_tasks_github(token, cfg, date_cutoff=dt.date.today(), progress=_progress_print)
-                sys.stderr.write('\n')
-                db.upsert_many(rows)
-            except Exception as e:
-                sys.stderr.write('\nError fetching tasks: ' + str(e) + '\n')
-                raise
+            # Start with empty cache. The UI will show a hint to press 'u' to fetch.
+            pass
 
     if args.no_ui:
         rows = db.load()
@@ -1407,7 +1485,7 @@ def main() -> None:
         print("Projects:", ", ".join(projects))
         return
 
-    run_ui(db, cfg, token)
+    run_ui(db, cfg, token, log_level=args.log_level)
 
 
 if __name__ == "__main__":
