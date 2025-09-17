@@ -313,6 +313,36 @@ class TaskDB:
         now = dt.datetime.now(dt.timezone.utc).astimezone()
         return max(0, int((now - st).total_seconds()))
 
+    def aggregate_task_totals(self, since_days: Optional[int] = None) -> Dict[str, int]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT task_url, started_at, ended_at FROM work_sessions")
+        rows = cur.fetchall()
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
+        out: Dict[str, int] = {}
+        for url, st_s, en_s in rows:
+            url = url or ''
+            st = self._parse_iso(st_s)
+            en = self._parse_iso(en_s) if en_s else None
+            if not st:
+                continue
+            if en is None:
+                en = now
+            st, en, keep = self._clip_range(st, en, since_dt)
+            if not keep or st >= en:
+                continue
+            out[url] = out.get(url, 0) + int((en - st).total_seconds())
+        return out
+
+    def task_titles(self) -> Dict[str, str]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute("SELECT url, MAX(updated_at) as u, title FROM tasks GROUP BY url")
+            rows = cur.fetchall()
+            return {url: (title or url) for url, _, title in rows if url}
+        except Exception:
+            return {}
+
     # ---- Aggregations for reports ----
     def _period_key(self, d: dt.datetime, granularity: str) -> str:
         if granularity == 'day':
@@ -1890,15 +1920,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         nonlocal status_line
         try:
-            from reportlab.lib.pagesizes import A4, landscape
-            from reportlab.pdfgen import canvas
-            from reportlab.lib import colors
-            from reportlab.lib.units import mm
-        except Exception:
-            status_line = "PDF export needs reportlab (pip install reportlab)"; invalidate(); return
-        try:
-            # Build payload (same as JSON quick export)
-            gran_opts = ['day','week','month']
+            # Build payload (same as JSON export) and render with portrait summary
             since_days = 90
             payload = {
                 'meta': {
@@ -1908,53 +1930,142 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     'granularity': 'all',
                     'scope': 'all',
                 },
-                'overall': {g: db.aggregate_period_totals(g, since_days=since_days) for g in gran_opts},
+                'overall': {g: db.aggregate_period_totals(g, since_days=since_days) for g in ['day','week','month']},
                 'projects_total_window': db.aggregate_project_totals(since_days=since_days),
+                'tasks_total_window': db.aggregate_task_totals(since_days=since_days),
+                'task_titles': db.task_titles(),
             }
-            # Render one-page PDF (reuse minimal renderer here)
+            # Try importing reportlab here to check availability
+            try:
+                from reportlab.lib.pagesizes import A4  # noqa: F401
+            except Exception:
+                status_line = "PDF export needs reportlab (pip install reportlab)"; invalidate(); return
             ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
             out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'report-{ts}.pdf')
-            c = canvas.Canvas(out_path, pagesize=landscape(A4))
-            width, height = landscape(A4)
-            # Heading
-            c.setFillColor(colors.HexColor('#222222'))
-            c.setFont('Helvetica-Bold', 18)
-            c.drawString(20*mm, 195*mm, 'Work Timers Report')
-            c.setFont('Helvetica', 10); c.setFillColor(colors.HexColor('#444444'))
-            c.drawString(20*mm, 188*mm, f"User: {cfg.user} • Window: last {since_days} days • Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            # Simple bars for overall day if present
-            pal = [colors.HexColor(h) for h in ['#5B8FF9','#61DDAA','#65789B','#F6BD16','#7262fd','#78D3F8','#9661BC','#F6903D','#E86452','#6DC8EC']]
-            series_all = payload['overall'].get('day') or payload['overall'].get('week') or {}
-            keys = sorted(series_all.keys(), reverse=True)[:14]
-            series = list(reversed([(k, series_all[k]) for k in keys]))
-            # Draw bars
-            x, y, w, h = 20*mm, 110*mm, 255*mm, 70*mm
-            if series:
-                maxv = max(v for _,v in series) or 1
-                n = len(series); bar_w = max(4, (w-20)/n)
-                for i,(lab,val) in enumerate(series):
-                    bx = x + 10 + i*bar_w; bh = (val/maxv)*(h-20)
-                    c.setFillColor(pal[i%len(pal)]); c.rect(bx, y, bar_w-2, bh, stroke=0, fill=True)
-                    if i % max(1,n//12) == 0:
-                        c.setFont('Helvetica', 6); c.setFillColor(colors.HexColor('#333333'))
-                        c.drawString(bx, y-8, lab)
+            # Use the same portrait renderer as CLI export
+            # Implemented within CLI block; re-implement minimal version here for consistency
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+            from reportlab.lib import colors
+            from reportlab.lib.units import mm
+            def fmt_hm(s:int)->str:
+                s = int(max(0, s))
+                h, r = divmod(s, 3600)
+                m, _ = divmod(r, 60)
+                return f"{h:d}:{m:02d}"
+            def draw_header(c):
+                generated = dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+                c.setFillColor(colors.HexColor('#111111'))
+                c.setFont('Helvetica-Bold', 16)
+                c.drawString(20*mm, 285*mm, 'Work Timers Summary')
+                c.setFont('Helvetica', 10)
+                c.setFillColor(colors.HexColor('#555555'))
+                c.drawString(20*mm, 278*mm, f"User: {cfg.user}  •  Generated: {generated}")
+            def table(c, x, y, cols, rows):
+                c.setFont('Helvetica', 9)
+                line_h = 9
+                c.setFillColor(colors.HexColor('#f0f3ff'))
+                c.rect(x, y, sum(w for _,w in cols), line_h+2, stroke=0, fill=True)
+                c.setFillColor(colors.HexColor('#222222'))
+                cx = x
+                for (name, w) in cols:
+                    c.setFont('Helvetica-Bold', 9)
+                    c.drawString(cx+2, y+2, name)
+                    cx += w
+                yy = y - line_h
+                for i, r in enumerate(rows):
+                    if i % 2 == 0:
+                        c.setFillColor(colors.HexColor('#fafafa'))
+                        c.rect(x, yy-1, sum(w for _,w in cols), line_h+1, stroke=0, fill=True)
+                    cx = x
+                    for j, val in enumerate(r):
+                        c.setFillColor(colors.HexColor('#000000'))
+                        c.setFont('Helvetica', 9)
+                        c.drawString(cx+2, yy+1, str(val))
+                        cx += cols[j][1]
+                    yy -= line_h
+                return yy
+            def pie_chart(c, cx, cy, r, items, palette, center_label):
+                total = sum(v for _,v in items) or 1
+                start = 90
+                for i,(lab,val) in enumerate(items):
+                    extent = 360.0 * (val/total)
+                    c.setFillColor(palette[i % len(palette)])
+                    c.wedge(cx-r, cy-r, cx+r, cy+r, start, extent, stroke=0, fill=1)
+                    start += extent
+                c.setFillColor(colors.white)
+                c.circle(cx, cy, r*0.4, stroke=0, fill=1)
+                c.setFillColor(colors.HexColor('#333333'))
+                c.setFont('Helvetica-Bold', 10)
+                c.drawCentredString(cx, cy-3, center_label)
+            def pie_legend(c, x, y, items, palette, max_lines=4):
+                total = sum(v for _,v in items) or 1
+                lines = items[:max_lines]
+                for i,(lab,val) in enumerate(lines):
+                    pct = int(round(100*val/total))
+                    c.setFillColor(palette[i % len(palette)])
+                    c.rect(x, y-4, 6, 6, stroke=0, fill=1)
+                    c.setFillColor(colors.HexColor('#333333'))
+                    c.setFont('Helvetica', 8)
+                    c.drawString(x+8, y-3, f"{_truncate(lab,12)} {pct}%")
+                    y -= 8
+            # Build rows using current DB
+            since_map = {'D':1, 'W':7, 'M':30, 'Y':365}
+            proj_totals = {k: db.aggregate_project_totals(v) for k,v in since_map.items()}
+            task_totals = {k: db.aggregate_task_totals(v) for k,v in since_map.items()}
+            task_titles = db.task_titles()
+            proj_names = set().union(*[set(d.keys()) for d in proj_totals.values()])
+            proj_rows_all = []
+            for name in proj_names:
+                d = proj_totals['D'].get(name,0); wv = proj_totals['W'].get(name,0); m = proj_totals['M'].get(name,0); yv = proj_totals['Y'].get(name,0)
+                proj_rows_all.append((name or '-', yv, [name or '-', fmt_hm(d), fmt_hm(wv), fmt_hm(m), fmt_hm(yv)]))
+            proj_rows_all.sort(key=lambda t: t[1], reverse=True)
+            task_urls = set().union(*[set(d.keys()) for d in task_totals.values()])
+            task_rows_all = []
+            for url in task_urls:
+                nm = task_titles.get(url, url)
+                d = task_totals['D'].get(url,0); wv = task_totals['W'].get(url,0); m = task_totals['M'].get(url,0); yv = task_totals['Y'].get(url,0)
+                task_rows_all.append((nm, yv, [nm[:48] + ('…' if len(nm)>48 else ''), fmt_hm(d), fmt_hm(wv), fmt_hm(m), fmt_hm(yv)]))
+            task_rows_all.sort(key=lambda t: t[1], reverse=True)
+            c = canvas.Canvas(out_path, pagesize=A4)
+            draw_header(c)
+            # pies row
+            pal = [colors.HexColor(h) for h in ['#5B8FF9','#61DDAA','#65789B','#F6BD16','#7262FD','#78D3F8','#9661BC','#F6903D','#E86452','#6DC8EC']]
+            def top_items(d):
+                items = sorted(d.items(), key=lambda kv: kv[1], reverse=True)
+                top = items[:5]
+                other = sum(v for _,v in items[5:])
+                if other>0:
+                    top.append(("Other", other))
+                return top
+            c.setFillColor(colors.HexColor('#222222')); c.setFont('Helvetica-Bold', 12)
+            c.drawString(20*mm, 266*mm, 'Distribution by Period (project share)')
+            pies_y = 260*mm
+            x_positions = [40*mm, 90*mm, 140*mm, 190*mm]
+            for i,key in enumerate(['D','W','M','Y']):
+                data = proj_totals.get(key,{}) or {}
+                items = top_items(data)
+                if items:
+                    cx = x_positions[i]
+                    pie_chart(c, cx, pies_y, 14*mm, items, pal, key)
+                    pie_legend(c, cx - 14*mm, pies_y - 14*mm - 6*mm, items, pal, max_lines=4)
+            cols_proj = [("Project", 70*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
+            cols_task = [("Task", 100*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
+            y = 224*mm
             c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-            c.drawString(x, 182*mm, 'Overall Activity')
-            # Top projects
-            tops = sorted(payload['projects_total_window'].items(), key=lambda kv: kv[1], reverse=True)[:8]
-            if tops:
-                x2, y2, w2, h2 = 20*mm, 30*mm, 255*mm, 60*mm
-                maxv = max(v for _,v in tops) or 1
-                row_h = h2/max(1,len(tops))
-                for i,(name,val) in enumerate(tops):
-                    yy = y2 + h2 - (i+1)*row_h + 2
-                    bw = (val/maxv)*(w2-80)
-                    c.setFillColor(pal[i%len(pal)]); c.roundRect(x2+80, yy, max(0,bw), row_h-6, 2, fill=True, stroke=0)
-                    c.setFont('Helvetica', 8); c.setFillColor(colors.black)
-                    nm = name or '-'
-                    c.drawRightString(x2+76, yy+(row_h-8)/2, nm[:30])
-                c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-                c.drawString(x2, 93*mm, 'Top Projects (Window)')
+            c.drawString(20*mm, y, 'Per Project')
+            y -= 6*mm
+            y = table(c, 20*mm, y, cols_proj, [r[2] for r in proj_rows_all[:16]]) - 4
+            c.setStrokeColor(colors.HexColor('#dddddd'))
+            c.line(20*mm, y, 190*mm, y)
+            y -= 6*mm
+            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+            c.drawString(20*mm, y, 'Per Task')
+            y -= 6*mm
+            max_rows_task = max(10, int((y - 20*mm)/9) - 2)
+            table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]])
+            c.setFont('Helvetica', 8); c.setFillColor(colors.HexColor('#888888'))
+            c.drawRightString(200*mm, 12*mm, 'Times are H:MM over last D=1/W=7/M=30/Y=365 days. Top rows shown.')
             c.showPage(); c.save()
             status_line = f"Exported {out_path}"
         except Exception as e:
@@ -2227,6 +2338,10 @@ def main() -> None:
         # Per-project totals and per-period totals
         proj_totals_window = db.aggregate_project_totals(since_days=since_days)
         payload["projects_total_window"] = proj_totals_window
+        # Per-task totals (window) + titles map for labeling
+        task_totals_window = db.aggregate_task_totals(since_days=since_days)
+        payload["tasks_total_window"] = task_totals_window
+        payload["task_titles"] = db.task_titles()
         projects_periods: Dict[str, Dict[str, Dict[str,int]]] = {}
         for g in gran_opts:
             projects_periods[g] = db.aggregate_project_period_totals(g, since_days=since_days)
@@ -2274,9 +2389,9 @@ def main() -> None:
         else:
             payload = _build_report_payload(db, cfg, args.export_since_days, args.export_granularity, args.export_scope, args.export_project, args.export_task_url)
 
-        # Render PDF via ReportLab (optional dependency)
+        # Render a portrait A4 summary table with D/W/M/Y totals per project and per task
         try:
-            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.pagesizes import A4
             from reportlab.pdfgen import canvas
             from reportlab.lib import colors
             from reportlab.lib.units import mm
@@ -2284,110 +2399,169 @@ def main() -> None:
             print("ReportLab not installed. Try: pip install reportlab", file=sys.stderr)
             sys.exit(2)
 
-        def _draw_heading(c, title, sub):
-            c.setFillColor(colors.HexColor('#222222'))
-            c.setFont('Helvetica-Bold', 18)
-            c.drawString(20*mm, 195*mm, title)
-            c.setFont('Helvetica', 10)
-            c.setFillColor(colors.HexColor('#444444'))
-            c.drawString(20*mm, 188*mm, sub)
-
-        def _fmt_hms(s:int)->str:
+        def fmt_hm(s:int)->str:
             s = int(max(0, s))
             h, r = divmod(s, 3600)
-            m, s = divmod(r, 60)
-            return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+            m, _ = divmod(r, 60)
+            return f"{h:d}:{m:02d}"
 
-        def _hbar_chart(c, x, y, w, h, data_pairs, palette):
-            # data_pairs: list[(label, seconds)] top-N already trimmed
-            if not data_pairs:
-                return
-            maxv = max(v for _, v in data_pairs) or 1
-            rows = len(data_pairs)
-            row_h = h / max(rows,1)
-            for i,(label,val) in enumerate(data_pairs):
-                yy = y + h - (i+1)*row_h + 2
-                bw = 0 if maxv<=0 else (val/maxv) * (w-60)
-                c.setFillColor(palette[i % len(palette)])
-                c.roundRect(x+60, yy, max(0,bw), row_h-6, 2, fill=True, stroke=0)
-                c.setFillColor(colors.HexColor('#000000'))
-                c.setFont('Helvetica', 8)
-                c.drawRightString(x+56, yy+ (row_h-8)/2, label[:22])
-                c.drawString(x+60 + max(0,bw) + 4, yy + (row_h-8)/2, _fmt_hms(int(val)))
+        def draw_header(c):
+            meta = payload.get('meta',{})
+            user = meta.get('user','')
+            generated = dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+            c.setFillColor(colors.HexColor('#111111'))
+            c.setFont('Helvetica-Bold', 16)
+            c.drawString(20*mm, 285*mm, 'Work Timers Summary')
+            c.setFont('Helvetica', 10)
+            c.setFillColor(colors.HexColor('#555555'))
+            c.drawString(20*mm, 278*mm, f"User: {user}  •  Generated: {generated}")
 
-        def _vbar_chart(c, x, y, w, h, series, palette):
-            # series: list[(period_label, seconds)] already trimmed/reversed to show chronological
-            if not series:
-                return
-            n = len(series)
-            maxv = max(v for _,v in series) or 1
-            bar_w = max(4, (w - 20) / n)
-            for i,(lab,val) in enumerate(series):
-                bx = x + 10 + i*bar_w
-                bh = 0 if maxv<=0 else (val/maxv) * (h-20)
+        def table(c, x, y, cols, rows, col_colors=None, zebra=True):
+            # rows: list of lists (strings)
+            c.setFont('Helvetica', 9)
+            line_h = 9
+            # header
+            c.setFillColor(colors.HexColor('#f0f3ff'))
+            c.rect(x, y, sum(w for _,w in cols), line_h+2, stroke=0, fill=True)
+            c.setFillColor(colors.HexColor('#222222'))
+            cx = x
+            for (name, w) in cols:
+                c.setFont('Helvetica-Bold', 9)
+                c.drawString(cx+2, y+2, name)
+                cx += w
+            yy = y - line_h
+            for i, r in enumerate(rows):
+                if zebra and (i % 2 == 0):
+                    c.setFillColor(colors.HexColor('#fafafa'))
+                    c.rect(x, yy-1, sum(w for _,w in cols), line_h+1, stroke=0, fill=True)
+                cx = x
+                for j, (val) in enumerate(r):
+                    if col_colors and col_colors.get(j):
+                        c.setFillColor(col_colors[j])
+                    else:
+                        c.setFillColor(colors.HexColor('#000000'))
+                    c.setFont('Helvetica', 9)
+                    c.drawString(cx+2, yy+1, str(val))
+                    cx += cols[j][1]
+                yy -= line_h
+            return yy
+
+        def pie_chart(c, cx, cy, r, items, palette, center_label):
+            # items: list[(label,value)]
+            total = sum(v for _,v in items) or 1
+            start = 90  # start at top
+            bbox = (cx-r, cy-r, cx+r, cy+r)
+            for i,(lab,val) in enumerate(items):
+                extent = 360.0 * (val/total)
                 c.setFillColor(palette[i % len(palette)])
-                c.rect(bx, y, bar_w-2, bh, stroke=0, fill=True)
-            # x labels (sparse)
-            c.setFont('Helvetica', 6)
+                c.wedge(bbox[0], bbox[1], bbox[2], bbox[3], start, extent, stroke=0, fill=1)
+                start += extent
+            # center label
+            c.setFillColor(colors.white)
+            c.circle(cx, cy, r*0.4, stroke=0, fill=1)
             c.setFillColor(colors.HexColor('#333333'))
-            step = max(1, n//12)
-            for i,(lab,_) in enumerate(series):
-                if i % step == 0:
-                    c.drawString(x + 10 + i*bar_w, y-8, lab)
+            c.setFont('Helvetica-Bold', 10)
+            c.drawCentredString(cx, cy-3, center_label)
 
-        def _palette():
-            return [colors.HexColor(h) for h in ['#5B8FF9','#61DDAA','#65789B','#F6BD16','#7262fd','#78D3F8','#9661BC','#F6903D','#E86452','#6DC8EC']]
+        def pie_legend(c, x, y, items, palette, max_lines=4):
+            total = sum(v for _,v in items) or 1
+            lines = items[:max_lines]
+            for i,(lab,val) in enumerate(lines):
+                pct = int(round(100*val/total))
+                c.setFillColor(palette[i % len(palette)])
+                c.rect(x, y-4, 6, 6, stroke=0, fill=1)
+                c.setFillColor(colors.HexColor('#333333'))
+                c.setFont('Helvetica', 8)
+                c.drawString(x+8, y-3, f"{_truncate(lab,12)} {pct}%")
+                y -= 8
 
-        # Build sections from payload
-        meta = payload.get('meta',{})
-        user = meta.get('user','')
-        since_days = meta.get('since_days', 90)
-        granularity = meta.get('granularity','all')
-        overall = payload.get('overall',{})
-        projects_total_window = payload.get('projects_total_window',{})
+        def palette():
+            return [colors.HexColor(h) for h in ['#5B8FF9','#61DDAA','#65789B','#F6BD16','#7262FD','#78D3F8','#9661BC','#F6903D','#E86452','#6DC8EC']]
 
-        c = canvas.Canvas(args.export_pdf, pagesize=landscape(A4))
-        width, height = landscape(A4)
-        _draw_heading(c, "Work Timers Report", f"User: {user}  •  Window: last {since_days} days  •  Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}  •  Granularity: {granularity}")
+        # Collect totals for D/W/M/Y windows
+        since_map = {'D':1, 'W':7, 'M':30, 'Y':365}
+        proj_totals = {k: db.aggregate_project_totals(v) for k,v in since_map.items()}
+        task_totals = {k: db.aggregate_task_totals(v) for k,v in since_map.items()}
+        task_titles = payload.get('task_titles', {})
 
-        pal = _palette()
+        # Build project rows sorted by yearly desc
+        proj_names = set()
+        for d in proj_totals.values():
+            proj_names.update(d.keys())
+        proj_rows_all = []
+        for name in proj_names:
+            d = proj_totals['D'].get(name,0)
+            w = proj_totals['W'].get(name,0)
+            m = proj_totals['M'].get(name,0)
+            y = proj_totals['Y'].get(name,0)
+            proj_rows_all.append((name or '-', y, [name or '-', fmt_hm(d), fmt_hm(w), fmt_hm(m), fmt_hm(y)]))
+        proj_rows_all.sort(key=lambda t: t[1], reverse=True)
 
-        # Left: Top projects (window)
-        top_projects = sorted(projects_total_window.items(), key=lambda kv: kv[1], reverse=True)[:8]
-        _hbar_chart(c, 20*mm, 110*mm, 120*mm, 70*mm, top_projects, pal)
+        # Build task rows sorted by yearly desc
+        task_urls = set()
+        for d in task_totals.values():
+            task_urls.update(d.keys())
+        task_rows_all = []
+        for url in task_urls:
+            name = task_titles.get(url, url)
+            d = task_totals['D'].get(url,0)
+            w = task_totals['W'].get(url,0)
+            m = task_totals['M'].get(url,0)
+            y = task_totals['Y'].get(url,0)
+            task_rows_all.append((name, y, [name and (name[:48]+('…' if len(name)>48 else '')) or '-', fmt_hm(d), fmt_hm(w), fmt_hm(m), fmt_hm(y)]))
+        task_rows_all.sort(key=lambda t: t[1], reverse=True)
+
+        # Compose page
+        c = canvas.Canvas(args.export_pdf, pagesize=A4)
+        draw_header(c)
+
+        # Row of 4 pies: distribution by period (per project share)
+        pal = palette()
+        pie_r = 14*mm
+        # compute items for each period: top5 projects + other
+        def top_items(d: Dict[str,int]):
+            items = sorted(d.items(), key=lambda kv: kv[1], reverse=True)
+            top = items[:5]
+            other = sum(v for _,v in items[5:])
+            if other > 0:
+                top.append(("Other", other))
+            return top
+        c.setFillColor(colors.HexColor('#222222')); c.setFont('Helvetica-Bold', 12)
+        c.drawString(20*mm, 266*mm, 'Distribution by Period (project share)')
+        pies_y = 260*mm
+        x_positions = [40*mm, 90*mm, 140*mm, 190*mm]
+        labels = ['D','W','M','Y']
+        for i,key in enumerate(labels):
+            data = proj_totals.get(key,{}) or {}
+            items = top_items(data)
+            if items:
+                cx = x_positions[i]
+                pie_chart(c, cx, pies_y, pie_r, items, pal, key)
+                # legend beneath each pie using period-specific percentages
+                pie_legend(c, cx - pie_r, pies_y - pie_r - 6*mm, items, pal, max_lines=4)
+        cols_proj = [("Project", 70*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
+        cols_task = [("Task", 100*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
+
+        # Start positions
+        y = 224*mm
         c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-        c.drawString(20*mm, 182*mm, 'Top Projects (Window)')
-
-        # Right: Overall by period (choose day if present, else week)
-        pick = 'day' if 'day' in overall else ('week' if 'week' in overall else 'month')
-        series_all = overall.get(pick, {})
-        # latest 14 for day else 12
-        limit = 14 if pick=='day' else 12
-        keys = sorted(series_all.keys(), reverse=True)[:limit]
-        series = list(reversed([(k, series_all[k]) for k in keys]))
-        _vbar_chart(c, 160*mm, 110*mm, 115*mm, 70*mm, series, pal)
+        c.drawString(20*mm, y, 'Per Project')
+        y -= 6*mm
+        max_rows_proj = 16
+        y = table(c, 20*mm, y, cols_proj, [r[2] for r in proj_rows_all[:max_rows_proj]]) - 4
+        # Separator
+        c.setStrokeColor(colors.HexColor('#dddddd'))
+        c.line(20*mm, y, 190*mm, y)
+        y -= 6*mm
         c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-        c.drawString(160*mm, 182*mm, f"Overall by {pick.capitalize()}")
+        c.drawString(20*mm, y, 'Per Task')
+        y -= 6*mm
+        max_rows_task = max(10, int((y - 20*mm)/9) - 2)
+        table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]])
 
-        # Bottom: Current project/task if provided
-        proj_section = payload.get('project', {})
-        if proj_section:
-            ptitle = proj_section.get('title','')
-            ser = proj_section.get('periods',{}).get(pick,{})
-            keys = sorted(ser.keys(), reverse=True)[:limit]
-            series_p = list(reversed([(k, ser[k]) for k in keys]))
-            _vbar_chart(c, 20*mm, 30*mm, 120*mm, 60*mm, series_p, pal)
-            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-            c.drawString(20*mm, 93*mm, f"Project: {_truncate(ptitle,32)}")
-
-        task_section = payload.get('task', {})
-        if task_section:
-            ser = task_section.get('periods',{}).get(pick,{})
-            keys = sorted(ser.keys(), reverse=True)[:limit]
-            series_t = list(reversed([(k, ser[k]) for k in keys]))
-            _vbar_chart(c, 160*mm, 30*mm, 115*mm, 60*mm, series_t, pal)
-            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-            c.drawString(160*mm, 93*mm, "Task (selected)")
+        # Footer note
+        c.setFont('Helvetica', 8); c.setFillColor(colors.HexColor('#888888'))
+        c.drawRightString(200*mm, 12*mm, 'Times are H:MM over last D=1/W=7/M=30/Y=365 days. Top rows shown.')
 
         c.showPage()
         c.save()
