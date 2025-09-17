@@ -10,6 +10,7 @@
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
 #   W  toggle work timer for the selected task (multiple tasks can run)
 #   R  open timer report (daily/weekly/monthly aggregates)
+#   X  export a JSON report (quick export)
 #   q  quit
 #
 # Config highlights
@@ -404,6 +405,34 @@ class TaskDB:
             if not keep or st >= en:
                 continue
             out[proj] = out.get(proj, 0) + int((en - st).total_seconds())
+        return out
+
+    def aggregate_project_period_totals(self, granularity: str, since_days: Optional[int] = None) -> Dict[str, Dict[str, int]]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT project_title, started_at, ended_at FROM work_sessions")
+        rows = cur.fetchall()
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
+        out: Dict[str, Dict[str, int]] = {}
+        for proj, st_s, en_s in rows:
+            proj = proj or ''
+            st = self._parse_iso(st_s)
+            en = self._parse_iso(en_s) if en_s else None
+            if not st:
+                continue
+            if en is None:
+                en = now
+            st, en, keep = self._clip_range(st, en, since_dt)
+            if not keep or st >= en:
+                continue
+            cur_dt = st
+            while cur_dt < en:
+                boundary = self._next_boundary(cur_dt, granularity)
+                seg_end = min(boundary, en)
+                key = self._period_key(cur_dt, granularity)
+                bucket = out.setdefault(proj, {})
+                bucket[key] = bucket.get(key, 0) + int((seg_end - cur_dt).total_seconds())
+                cur_dt = seg_end
         return out
 
     def upsert_many(self, rows: List[TaskRow]):
@@ -1445,7 +1474,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             "REPORT" if show_report else (
             "HELP" if show_help else "BROWSE"))))
         )
-        base = f" {mode} W:timer R:report u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
+        base = f" {mode} W:timer R:report X:export u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
     # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
         base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
@@ -1820,6 +1849,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             except Exception:
                 pass
         invalidate()
+
+    # Quick export from UI: writes a JSON report next to DB with timestamp
+    @kb.add('X', filter=is_normal)
+    def _(event):
+        nonlocal status_line
+        try:
+            ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+            out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'report-{ts}.json')
+            gran_opts = ['day','week','month']
+            since_days = 90
+            payload: Dict[str, object] = {
+                'meta': {
+                    'generated_at': dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds'),
+                    'user': cfg.user,
+                    'since_days': since_days,
+                    'granularity': 'all',
+                    'scope': 'all',
+                }
+            }
+            overall: Dict[str, Dict[str, int]] = {}
+            for g in gran_opts:
+                overall[g] = db.aggregate_period_totals(g, since_days=since_days)
+            payload['overall'] = overall
+            proj_totals_window = db.aggregate_project_totals(since_days=since_days)
+            payload['projects_total_window'] = proj_totals_window
+            projects_periods: Dict[str, Dict[str, Dict[str,int]]] = {}
+            for g in gran_opts:
+                projects_periods[g] = db.aggregate_project_period_totals(g, since_days=since_days)
+            payload['projects_periods'] = projects_periods
+            with open(out_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+            status_line = f"Exported {out_path}"
+        except Exception as e:
+            status_line = f"Export failed: {e}"
+        invalidate()
     # Sort toggle
     @kb.add('s', filter=is_normal)
     def _(event):
@@ -1885,6 +1949,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  Enter          Toggle detail pane",
                 "  W              Toggle work timer for selected task",
                 "  R              Open timer report (day/week/month)",
+                "  X              Export a JSON report (quick)",
                 "  /              Start search (type, Enter to apply, Esc cancel)",
                 "  s              Toggle sort (Project/Date)",
                 "  p              Cycle project filter",
@@ -2018,6 +2083,13 @@ def main() -> None:
     ap.add_argument("--discover", action="store_true", help="List open Projects v2 for each owner and exit")
     ap.add_argument("--no-ui", action="store_true", help="Run a non-interactive summary (for testing)")
     ap.add_argument("--log-level", default="ERROR", help="File log level (DEBUG, INFO, WARNING, ERROR)")
+    # Report export options
+    ap.add_argument("--export-report", metavar="PATH", help="Write timer report to PATH (JSON)")
+    ap.add_argument("--export-granularity", default="all", choices=["day","week","month","all"], help="Granularity for export (or 'all')")
+    ap.add_argument("--export-since-days", type=int, default=90, help="How many days back to include (default 90)")
+    ap.add_argument("--export-scope", default="all", choices=["overall","project","task","all"], help="Data scope to include")
+    ap.add_argument("--export-project", help="Limit export to a project title (with --export-scope project/task/all)")
+    ap.add_argument("--export-task-url", help="Limit export to a task URL (with --export-scope task/all)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -2049,6 +2121,66 @@ def main() -> None:
         else:
             # Start with empty cache. The UI will show a hint to press 'u' to fetch.
             pass
+
+    def _seconds_hms(s:int) -> str:
+        s = int(max(0, s))
+        h, r = divmod(s, 3600)
+        m, s = divmod(r, 60)
+        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    if args.export_report:
+        # Build a structured JSON payload for external tooling/PDF generation
+        db = TaskDB(args.db)
+        gran_opts = ([args.export_granularity] if args.export_granularity != 'all' else ['day','week','month'])
+        scope = args.export_scope
+        since_days = args.export_since_days
+        payload: Dict[str, object] = {
+            "meta": {
+                "generated_at": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "user": cfg.user,
+                "since_days": since_days,
+                "granularity": args.export_granularity,
+                "scope": scope,
+                "project": args.export_project,
+                "task_url": args.export_task_url,
+            }
+        }
+        # Overall totals
+        overall: Dict[str, Dict[str, int]] = {}
+        for g in gran_opts:
+            overall[g] = db.aggregate_period_totals(g, since_days=since_days)
+        payload["overall"] = overall
+        # Per-project totals and per-period totals
+        proj_totals_window = db.aggregate_project_totals(since_days=since_days)
+        payload["projects_total_window"] = proj_totals_window
+        projects_periods: Dict[str, Dict[str, Dict[str,int]]] = {}
+        for g in gran_opts:
+            projects_periods[g] = db.aggregate_project_period_totals(g, since_days=since_days)
+        payload["projects_periods"] = projects_periods
+        # Optional: single project filter summary
+        if args.export_project:
+            proj = args.export_project
+            proj_section: Dict[str, Dict[str,int]] = {}
+            for g in gran_opts:
+                proj_section[g] = db.aggregate_period_totals(g, since_days=since_days, project_title=proj)
+            payload["project"] = {"title": proj, "periods": proj_section}
+        # Optional: single task filter summary
+        if args.export_task_url:
+            tu = args.export_task_url
+            task_section: Dict[str, Dict[str,int]] = {}
+            for g in gran_opts:
+                task_section[g] = db.aggregate_period_totals(g, since_days=since_days, task_url=tu)
+            payload["task"] = {"url": tu, "periods": task_section}
+        # Write JSON
+        out_path = args.export_report
+        try:
+            with open(out_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+            print(f"Wrote report JSON to {out_path}")
+        except Exception as e:
+            print(f"Failed to write report: {e}", file=sys.stderr)
+            sys.exit(2)
+        return
 
     if args.no_ui:
         rows = db.load()
