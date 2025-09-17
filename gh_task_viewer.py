@@ -1154,11 +1154,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
         # Determine dynamic column widths to fully use available space
-        # Layout: Focus(11) + 2 + Start(12) + 2 + Status(10) + 2 + Title(VAR) + 2 + Project(VAR)
+        # Layout: marker(2) + Focus(11) + 2 + Start(12) + 2 + Status(10) + 2 + Time(12) + 2 + Title(VAR) + 2 + Project(VAR)
         # Right side stats window width is fixed at 32 plus a 1-char separator in root_body
         right_panel_width = 32 + 1
         avail_cols = max(40, total_cols - right_panel_width)
-        fixed = 11 + 2 + 12 + 2 + 10 + 2  # = 39
+        time_w = 12  # "mm:ss|HH:MM" (right aligned)
+        fixed = 2 + 11 + 2 + 12 + 2 + 10 + 2 + time_w + 2  # = 55
         dyn = max(1, avail_cols - fixed)
         proj_min = 12
         title_min = 20
@@ -1170,7 +1171,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             delta = proj_min - proj_w
             title_w = max(title_min, title_w - delta)
             proj_w = proj_min
-        header = f"  {'Focus Day':<11}  {'Start Date':<12}  {'STATUS':<10}  {'TITLE':<{title_w}}  {'PROJECT':<{proj_w}}"
+        header = f"  {'Focus Day':<11}  {'Start Date':<12}  {'STATUS':<10}  {'TIME':>{time_w}}  {'TITLE':<{title_w}}  {'PROJECT':<{proj_w}}"
         frags.append(("bold", header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
@@ -1196,7 +1197,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             project = _truncate(t.project_title, proj_w)
             status_txt = _truncate(t.status or '-', 10)
             marker = '⏱ ' if running else '  '
-            line = f"{marker}{(t.focus_date or '-'):<11}  {t.start_date:<12}  {status_txt:<10}  {title:<{title_w}}  {project:<{proj_w}}"
+            # Time column: current run (mm:ss) and total (H:MM)
+            cur_s = db.task_current_elapsed_seconds(t.url) if (t.url and running) else 0
+            tot_s = db.task_total_seconds(t.url) if t.url else 0
+            mm, ss = divmod(int(max(0, cur_s)), 60)
+            # total in H:MM (no leading zeros on hours)
+            th, rem = divmod(int(max(0, tot_s)), 3600)
+            tm, _ = divmod(rem, 60)
+            time_cell = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else (f"{mm:02d}:{ss:02d}|0:00")
+            time_cell = f"{time_cell:>{time_w}}"
+            line = f"{marker}{(t.focus_date or '-'):<11}  {t.start_date:<12}  {status_txt:<10}  {time_cell}  {title:<{title_w}}  {project:<{proj_w}}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -1227,17 +1237,25 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return "No tasks"
         total = len(rows)
         done_ct = sum(1 for r in rows if r.is_done)
+        def _fmt_hm(total_seconds: int) -> str:
+            s = int(max(0, total_seconds))
+            h, r = divmod(s, 3600)
+            m, _ = divmod(r, 60)
+            return f"{h:d}:{m:02d}"
         lines: List[str] = [f"User: {cfg.user}", f"Total: {total}", f"Done: {done_ct}"]
         # per-project stats
         by_proj: Dict[str, Tuple[int,int]] = {}
         for r in rows:
             d, t = by_proj.get(r.project_title, (0,0))
             by_proj[r.project_title] = (d + (1 if r.is_done else 0), t + 1)
+        # total time by project (all time)
+        proj_time = db.aggregate_project_totals(since_days=None)
         lines.append("")
         lines.append("Proj:")
         for p,(d,t) in sorted(by_proj.items()):
             pct = 0 if t==0 else int(d*100/t)
-            lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}%")
+            secs = proj_time.get(p or '', 0)
+            lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}% {_fmt_hm(secs):>6}")
         lines.append("")
         lines.append("Filters:")
         active_search = search_buffer if in_search else search_term
@@ -1298,8 +1316,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def build_report_text() -> List[Tuple[str,str]]:
         lines: List[str] = []
-        hdr = f"Timer Report — granularity: {report_granularity.upper()}  (keys: d/w/m to switch, Enter/Esc to close)"
+        # current selection snapshot
+        rows = filtered_rows()
+        cur_proj = rows[current_index].project_title if rows else None
+        cur_url = rows[current_index].url if rows else None
+        now_s = db.task_current_elapsed_seconds(cur_url) if cur_url else 0
+        task_s = db.task_total_seconds(cur_url) if cur_url else 0
+        proj_s = db.project_total_seconds(cur_proj) if cur_proj else 0
+        hdr = f"Timer Report — granularity: {report_granularity.upper()}  (d/w/m to switch, Enter/Esc to close)"
         lines.append(hdr)
+        lines.append("")
+        lines.append(f"Now: {_fmt_hms_full(now_s)}  Task: {_fmt_hms_full(task_s)}  Proj: {_fmt_hms_full(proj_s)}  Active: {len(db.active_task_urls())}")
         lines.append("")
         # Choose lookback window
         if report_granularity == 'day':
@@ -1325,9 +1352,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 lines.append(f"  {k:<10} {_fmt_hms_full(v):>10}  {bar}")
         lines.append("")
         # Current selection project/task
-        rows = filtered_rows()
-        cur_proj = rows[current_index].project_title if rows else None
-        cur_url = rows[current_index].url if rows else None
         lines.append(f"Project: {cur_proj or '-'}")
         p_tot = db.aggregate_period_totals(report_granularity, since_days=since_days, project_title=cur_proj) if cur_proj else {}
         p_keys = sorted(p_tot.keys(), reverse=True)[:limit]
@@ -1363,6 +1387,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 nm = (name or '-')
                 bar = '█' * max(1, int(30 * secs / maxv))
                 lines.append(f"  {_truncate(nm,20):<20} {_fmt_hms_full(secs):>10}  {bar}")
+        # Quick multi-granularity snapshot (recent sums)
+        lines.append("")
+        lines.append("Quick view (recent sums):")
+        def _sum_recent(gran: str, days: int, filt_proj=None, filt_task=None) -> int:
+            m = db.aggregate_period_totals(gran, since_days=days, project_title=filt_proj, task_url=filt_task)
+            return sum(m.values())
+        lines.append(f"Overall  D:{_fmt_hms_full(_sum_recent('day', 14))}  W:{_fmt_hms_full(_sum_recent('week', 7*12))}  M:{_fmt_hms_full(_sum_recent('month', 365))}")
+        if cur_proj:
+            lines.append(f"Project  D:{_fmt_hms_full(_sum_recent('day', 14, filt_proj=cur_proj))}  W:{_fmt_hms_full(_sum_recent('week', 7*12, filt_proj=cur_proj))}  M:{_fmt_hms_full(_sum_recent('month', 365, filt_proj=cur_proj))}")
+        if cur_url:
+            lines.append(f"Task     D:{_fmt_hms_full(_sum_recent('day', 14, filt_task=cur_url))}  W:{_fmt_hms_full(_sum_recent('week', 7*12, filt_task=cur_url))}  M:{_fmt_hms_full(_sum_recent('month', 365, filt_task=cur_url))}")
         return [("bold", lines[0])] + [("", "\n" + "\n".join(lines[1:]))]
 
     report_control = FormattedTextControl(text=lambda: build_report_text())
