@@ -8,6 +8,8 @@
 #   P  clear project filter (show all projects again)
 #   N  toggle hide tasks with no date
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
+#   W  toggle work timer for the selected task (multiple tasks can run)
+#   R  open timer report (daily/weekly/monthly aggregates)
 #   q  quit
 #
 # Config highlights
@@ -39,10 +41,11 @@ import sys
 import string
 import json
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Iterable
+from typing import Callable, Dict, List, Optional, Tuple, Iterable, Set
 
 import requests
 import yaml
+import time
 from prompt_toolkit import Application
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding import KeyBindings
@@ -175,10 +178,14 @@ class TaskDB:
         if not cols:
             self.conn.execute(self.CREATE_TABLE_SQL)
             self._idx()
+            # also ensure timer tables
+            self._ensure_timer_tables()
             return
         missing = [c for c in self.SCHEMA_COLUMNS if c not in cols]
         if not missing:
             self._idx()
+            # still ensure timer tables exist
+            self._ensure_timer_tables()
             return
         cur = self.conn.cursor()
         cur.execute("ALTER TABLE tasks RENAME TO tasks_old")
@@ -198,6 +205,206 @@ class TaskDB:
         cur.execute("DROP TABLE tasks_old")
         self.conn.commit()
         self._idx()
+        self._ensure_timer_tables()
+
+    # --- Work session timer tables and helpers ---
+    def _ensure_timer_tables(self):
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS work_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_url TEXT NOT NULL,
+                project_title TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ws_task ON work_sessions(task_url)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ws_open ON work_sessions(ended_at)")
+        self.conn.commit()
+
+    def start_session(self, task_url: str, project_title: Optional[str] = None) -> None:
+        if not task_url:
+            return
+        # Avoid duplicate open sessions for same task
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 FROM work_sessions WHERE task_url=? AND ended_at IS NULL LIMIT 1", (task_url,))
+        if cur.fetchone():
+            return
+        now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+        cur.execute(
+            "INSERT INTO work_sessions(task_url, project_title, started_at, ended_at) VALUES (?,?,?,NULL)",
+            (task_url, project_title, now),
+        )
+        self.conn.commit()
+
+    def stop_session(self, task_url: str) -> None:
+        if not task_url:
+            return
+        now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE work_sessions SET ended_at=? WHERE task_url=? AND ended_at IS NULL",
+            (now, task_url),
+        )
+        self.conn.commit()
+
+    def active_task_urls(self) -> Set[str]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT task_url FROM work_sessions WHERE ended_at IS NULL")
+        return {r[0] for r in cur.fetchall()}
+
+    def _parse_iso(self, s: str) -> Optional[dt.datetime]:
+        if not s:
+            return None
+        try:
+            return dt.datetime.fromisoformat(s)
+        except Exception:
+            try:
+                return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+    def _sum_rows_seconds(self, rows: List[Tuple[str, Optional[str]]]) -> int:
+        total = 0
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        for started_at, ended_at in rows:
+            st = self._parse_iso(started_at)
+            en = self._parse_iso(ended_at) if ended_at else None
+            if st is None:
+                continue
+            if en is None:
+                en = now
+            delta = en - st
+            total += int(delta.total_seconds())
+        return max(0, total)
+
+    def task_total_seconds(self, task_url: str) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT started_at, ended_at FROM work_sessions WHERE task_url=?",
+            (task_url,),
+        )
+        return self._sum_rows_seconds(cur.fetchall())
+
+    def project_total_seconds(self, project_title: str) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT started_at, ended_at FROM work_sessions WHERE project_title=?",
+            (project_title,),
+        )
+        return self._sum_rows_seconds(cur.fetchall())
+
+    def task_current_elapsed_seconds(self, task_url: str) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT started_at, ended_at FROM work_sessions WHERE task_url=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
+            (task_url,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return 0
+        st = self._parse_iso(row[0])
+        if not st:
+            return 0
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        return max(0, int((now - st).total_seconds()))
+
+    # ---- Aggregations for reports ----
+    def _period_key(self, d: dt.datetime, granularity: str) -> str:
+        if granularity == 'day':
+            return d.date().isoformat()
+        if granularity == 'week':
+            iso_year, iso_week, _ = d.isocalendar()
+            return f"{iso_year}-W{iso_week:02d}"
+        if granularity == 'month':
+            return f"{d.year}-{d.month:02d}"
+        raise ValueError("granularity must be 'day' | 'week' | 'month'")
+
+    def _next_boundary(self, d: dt.datetime, granularity: str) -> dt.datetime:
+        if granularity == 'day':
+            base = d.replace(hour=0, minute=0, second=0, microsecond=0)
+            return base + dt.timedelta(days=1)
+        if granularity == 'week':
+            # ISO week: Monday start
+            start_of_week = d - dt.timedelta(days=d.weekday())
+            start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+            return start_of_week + dt.timedelta(days=7)
+        if granularity == 'month':
+            first = d.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if first.month == 12:
+                return first.replace(year=first.year+1, month=1)
+            else:
+                return first.replace(month=first.month+1)
+        raise ValueError("granularity must be 'day' | 'week' | 'month'")
+
+    def _clip_range(self, start: dt.datetime, end: dt.datetime, since: Optional[dt.datetime]) -> Tuple[dt.datetime, dt.datetime, bool]:
+        if since is None:
+            return start, end, True
+        if end <= since:
+            return start, end, False
+        start2 = max(start, since)
+        return start2, end, True
+
+    def _load_sessions(self, project_title: Optional[str] = None, task_url: Optional[str] = None) -> List[Tuple[str, Optional[str], Optional[str]]]:
+        # Returns list of (project_title, started_at, ended_at)
+        cur = self.conn.cursor()
+        if task_url:
+            cur.execute("SELECT project_title, started_at, ended_at FROM work_sessions WHERE task_url=?", (task_url,))
+        elif project_title:
+            cur.execute("SELECT project_title, started_at, ended_at FROM work_sessions WHERE project_title=?", (project_title,))
+        else:
+            cur.execute("SELECT project_title, started_at, ended_at FROM work_sessions")
+        return [(r[0], r[1], r[2]) for r in cur.fetchall()]
+
+    def aggregate_period_totals(self, granularity: str, since_days: Optional[int] = None,
+                                 project_title: Optional[str] = None, task_url: Optional[str] = None) -> Dict[str, int]:
+        rows = self._load_sessions(project_title, task_url)
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
+        out: Dict[str, int] = {}
+        for proj, st_s, en_s in rows:
+            st = self._parse_iso(st_s)
+            en = self._parse_iso(en_s) if en_s else None
+            if not st:
+                continue
+            if en is None:
+                en = now
+            # Clip to since window
+            st, en, keep = self._clip_range(st, en, since_dt)
+            if not keep or st >= en:
+                continue
+            cur = st
+            while cur < en:
+                boundary = self._next_boundary(cur, granularity)
+                seg_end = min(boundary, en)
+                key = self._period_key(cur, granularity)
+                out[key] = out.get(key, 0) + int((seg_end - cur).total_seconds())
+                cur = seg_end
+        return out
+
+    def aggregate_project_totals(self, since_days: Optional[int] = None) -> Dict[str, int]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT project_title, started_at, ended_at FROM work_sessions")
+        rows = cur.fetchall()
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
+        out: Dict[str, int] = {}
+        for proj, st_s, en_s in rows:
+            proj = proj or ''
+            st = self._parse_iso(st_s)
+            en = self._parse_iso(en_s) if en_s else None
+            if not st:
+                continue
+            if en is None:
+                en = now
+            st, en, keep = self._clip_range(st, en, since_dt)
+            if not keep or st >= en:
+                continue
+            out[proj] = out.get(proj, 0) + int((en - st).total_seconds())
+        return out
 
     def upsert_many(self, rows: List[TaskRow]):
         if not rows:
@@ -391,12 +598,102 @@ def _graphql_raw(session: requests.Session, query: str, variables: Dict[str, obj
             pass
         raise
 
+def _retry_sleep(seconds: float, on_wait: Optional[Callable[[str], None]] = None) -> None:
+    try:
+        msg = f"Rate limited; waiting {int(seconds)}s…"
+        if on_wait:
+            on_wait(msg)
+        else:
+            try:
+                logging.getLogger('gh_task_viewer').info(msg)
+            except Exception:
+                pass
+        time.sleep(max(0.0, seconds))
+    except Exception:
+        time.sleep(max(0.0, seconds))
+
+def _parse_retry_after_seconds(resp: Optional[requests.Response]) -> Optional[int]:
+    if not resp:
+        return None
+    # Prefer Retry-After header (secondary rate limits)
+    ra = resp.headers.get('Retry-After') if resp.headers is not None else None
+    if ra:
+        try:
+            return int(float(ra))
+        except Exception:
+            pass
+    # Next, X-RateLimit-Reset (epoch seconds)
+    try:
+        xrlr = resp.headers.get('X-RateLimit-Reset') if resp.headers is not None else None
+        if xrlr:
+            reset_at = int(xrlr)
+            now = int(time.time())
+            return max(1, reset_at - now)
+    except Exception:
+        pass
+    return None
+
+def _graphql_with_backoff(
+    session: requests.Session,
+    query: str,
+    variables: Dict[str, object],
+    on_wait: Optional[Callable[[str], None]] = None,
+    max_total_wait: int = 900,
+) -> Dict:
+    """Call GraphQL with handling for rate limits and transient failures.
+
+    - Retries RATE_LIMITED GraphQL errors with exponential backoff.
+    - Retries HTTP 403/429/502 with Retry-After or exponential backoff.
+    """
+    backoff = 10
+    total_wait = 0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = _graphql_raw(session, query, variables)
+        except requests.exceptions.HTTPError as e:
+            # Handle HTTP-level rate limits/abuse and transient errors
+            status = e.response.status_code if e.response is not None else None
+            if status in (403, 429, 502, 503, 504):
+                wait_s = _parse_retry_after_seconds(e.response)
+                if wait_s is None:
+                    wait_s = min(300, backoff)
+                    backoff = min(300, backoff * 2)
+                if total_wait + wait_s > max_total_wait:
+                    raise
+                _retry_sleep(wait_s, on_wait)
+                total_wait += wait_s
+                continue
+            raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            wait_s = min(60, backoff)
+            backoff = min(300, backoff * 2)
+            if total_wait + wait_s > max_total_wait:
+                raise
+            _retry_sleep(wait_s, on_wait)
+            total_wait += wait_s
+            continue
+
+        # GraphQL-level errors may include RATE_LIMITED with HTTP 200
+        errs = resp.get("errors") or []
+        if errs and any((e.get("type") == "RATE_LIMITED") for e in errs):
+            wait_s = min(300, backoff)
+            backoff = min(300, backoff * 2)
+            if total_wait + wait_s > max_total_wait:
+                # Let caller handle after exceeding budget
+                return resp
+            _retry_sleep(wait_s, on_wait)
+            total_wait += wait_s
+            continue
+        return resp
+
 def discover_open_projects(session: requests.Session, owner_type: str, owner: str) -> List[Dict]:
     if owner_type == "org":
-        data = _graphql_raw(session, GQL_LIST_ORG_PROJECTS, {"login": owner})
+        data = _graphql_with_backoff(session, GQL_LIST_ORG_PROJECTS, {"login": owner})
         nodes = (((data.get("data") or {}).get("organization") or {}).get("projectsV2") or {}).get("nodes") or []
     else:
-        data = _graphql_raw(session, GQL_LIST_USER_PROJECTS, {"login": owner})
+        data = _graphql_with_backoff(session, GQL_LIST_USER_PROJECTS, {"login": owner})
         nodes = (((data.get("data") or {}).get("user") or {}).get("projectsV2") or {}).get("nodes") or []
     return [n for n in nodes if not n.get("closed")]
 
@@ -461,7 +758,7 @@ def fetch_tasks_github(
                 else {"login": owner, "number": number, "after": after}
             )
             query = GQL_SCAN_ORG if owner_type == "org" else GQL_SCAN_USER
-            resp = _graphql_raw(session, query, variables)
+            resp = _graphql_with_backoff(session, query, variables, on_wait=lambda m: tick(m))
 
             errs = resp.get("errors") or []
             if errs:
@@ -472,6 +769,17 @@ def fetch_tasks_github(
                     except Exception:
                         pass
                     break  # skip invalid/inaccessible project number
+                # Handle RATE_LIMITED gracefully: keep partial results and return
+                rate_limited = any((e.get("type") == "RATE_LIMITED") for e in errs)
+                if rate_limited:
+                    if progress:
+                        progress(done, total, f"{_ascii_bar(done,total)}  Rate limited; partial results")
+                    try:
+                        logging.getLogger('gh_task_viewer').warning("Rate limited; returning partial results")
+                    except Exception:
+                        pass
+                    return out
+                # Other errors are considered fatal
                 try:
                     logging.getLogger('gh_task_viewer').error("GraphQL errors: %s", errs)
                 except Exception:
@@ -831,9 +1139,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         # Determine available vertical space (rough estimate: terminal rows - status bar - maybe 0 extra)
         try:
             from prompt_toolkit.application.current import get_app
-            total_rows = get_app().output.get_size().rows
+            size = get_app().output.get_size()
+            total_rows = size.rows
+            total_cols = size.columns
         except Exception:
             total_rows = 40
+            total_cols = 120
         # Reserve 1 row for status bar. Header consumes 2 lines (header + blank after).
         visible_rows = max(1, total_rows - 3)
         # Adjust v_offset to ensure current_index visible
@@ -842,24 +1153,50 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
-        header = "Focus Day   Start Date   STATUS      TITLE                                             PROJECT"
+        # Determine dynamic column widths to fully use available space
+        # Layout: Focus(11) + 2 + Start(12) + 2 + Status(10) + 2 + Title(VAR) + 2 + Project(VAR)
+        # Right side stats window width is fixed at 32 plus a 1-char separator in root_body
+        right_panel_width = 32 + 1
+        avail_cols = max(40, total_cols - right_panel_width)
+        fixed = 11 + 2 + 12 + 2 + 10 + 2  # = 39
+        dyn = max(1, avail_cols - fixed)
+        proj_min = 12
+        title_min = 20
+        # split dyn ~70%/30% between title/project
+        title_w = max(title_min, int(dyn * 0.7))
+        proj_w = max(proj_min, dyn - title_w)
+        # Rebalance if rounding starves project
+        if proj_w < proj_min:
+            delta = proj_min - proj_w
+            title_w = max(title_min, title_w - delta)
+            proj_w = proj_min
+        header = f"  {'Focus Day':<11}  {'Start Date':<12}  {'STATUS':<10}  {'TITLE':<{title_w}}  {'PROJECT':<{proj_w}}"
         frags.append(("bold", header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
             frags.append(("italic", "(no tasks match filters)"))
             return frags
         today = today_date
+        active_urls = db.active_task_urls()
         display_slice = rows[v_offset:v_offset+visible_rows]
         for rel_idx, t in enumerate(display_slice):
             idx = v_offset + rel_idx
             is_sel = (idx == current_index)
             style_row = "reverse" if is_sel else ""
             col = color_for_date(t.focus_date, today)
-            base_style = (col + " bold") if is_sel else col
-            title = _truncate(t.title, 60)
-            project = _truncate(t.project_title, 20)
+            running = bool(t.url and (t.url in active_urls))
+            # For running tasks, override foreground color to cyan (plus bold)
+            if is_sel:
+                base_style = col + " bold"
+            elif running:
+                base_style = "ansicyan bold"
+            else:
+                base_style = col
+            title = _truncate(t.title, title_w)
+            project = _truncate(t.project_title, proj_w)
             status_txt = _truncate(t.status or '-', 10)
-            line = f"{(t.focus_date or '-'):<11}  {t.start_date:<12}  {status_txt:<10}  {title:<60}  {project:<20}"
+            marker = '⏱ ' if running else '  '
+            line = f"{marker}{(t.focus_date or '-'):<11}  {t.start_date:<12}  {status_txt:<10}  {title:<{title_w}}  {project:<{proj_w}}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -919,7 +1256,27 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         total = len(rows)
         active_proj = project_cycle or 'All'
         active_search = search_buffer if in_search else search_term or '-'
-        txt = f" Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
+        # Timer summary for current selection at start for visibility
+        now_s = task_s = proj_s = 0
+        active_count = 0
+        if rows:
+            t = rows[current_index]
+            if t.url:
+                now_s = db.task_current_elapsed_seconds(t.url)
+                task_s = db.task_total_seconds(t.url)
+            if t.project_title:
+                proj_s = db.project_total_seconds(t.project_title)
+        try:
+            active_count = len(db.active_task_urls())
+        except Exception:
+            active_count = 0
+        def _fmt_hms(s:int)->str:
+            s = int(max(0, s))
+            h, r = divmod(s, 3600)
+            m, s = divmod(r, 60)
+            return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        timers = f" Now:{_fmt_hms(now_s)} Task:{_fmt_hms(task_s)} Proj:{_fmt_hms(proj_s)} Act:{active_count} "
+        txt = f"{timers}| Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
         return [("reverse", txt)]
     top_status_control = FormattedTextControl(text=lambda: build_top_status())
     top_status_window = Window(height=1, content=top_status_control)
@@ -928,6 +1285,88 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     detail_control = FormattedTextControl(text=lambda: build_detail_text())
     detail_window = Window(width=80, height=20, content=detail_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
+
+    # Report overlay
+    show_report = False
+    report_granularity = 'day'  # one of: day, week, month
+
+    def _fmt_hms_full(s:int) -> str:
+        s = int(max(0, s))
+        h, r = divmod(s, 3600)
+        m, s = divmod(r, 60)
+        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def build_report_text() -> List[Tuple[str,str]]:
+        lines: List[str] = []
+        hdr = f"Timer Report — granularity: {report_granularity.upper()}  (keys: d/w/m to switch, Enter/Esc to close)"
+        lines.append(hdr)
+        lines.append("")
+        # Choose lookback window
+        if report_granularity == 'day':
+            since_days = 30
+            limit = 14
+        elif report_granularity == 'week':
+            since_days = 7*26
+            limit = 12
+        else:
+            since_days = 365*2
+            limit = 12
+        # Overall
+        lines.append("Overall:")
+        totals = db.aggregate_period_totals(report_granularity, since_days=since_days)
+        keys = sorted(totals.keys(), reverse=True)[:limit]
+        if not keys:
+            lines.append("  (no data)")
+        else:
+            maxv = max(totals[k] for k in keys) or 1
+            for k in keys:
+                v = totals[k]
+                bar = '█' * max(1, int(30 * v / maxv))
+                lines.append(f"  {k:<10} {_fmt_hms_full(v):>10}  {bar}")
+        lines.append("")
+        # Current selection project/task
+        rows = filtered_rows()
+        cur_proj = rows[current_index].project_title if rows else None
+        cur_url = rows[current_index].url if rows else None
+        lines.append(f"Project: {cur_proj or '-'}")
+        p_tot = db.aggregate_period_totals(report_granularity, since_days=since_days, project_title=cur_proj) if cur_proj else {}
+        p_keys = sorted(p_tot.keys(), reverse=True)[:limit]
+        if not p_keys:
+            lines.append("  (no data)")
+        else:
+            maxv = max(p_tot[k] for k in p_keys) or 1
+            for k in p_keys:
+                v = p_tot[k]
+                bar = '█' * max(1, int(30 * v / maxv))
+                lines.append(f"  {k:<10} {_fmt_hms_full(v):>10}  {bar}")
+        lines.append("")
+        lines.append(f"Task: {rows[current_index].title if rows else '-'}")
+        t_tot = db.aggregate_period_totals(report_granularity, since_days=since_days, task_url=cur_url) if cur_url else {}
+        t_keys = sorted(t_tot.keys(), reverse=True)[:limit]
+        if not t_keys:
+            lines.append("  (no data)")
+        else:
+            maxv = max(t_tot[k] for k in t_keys) or 1
+            for k in t_keys:
+                v = t_tot[k]
+                bar = '█' * max(1, int(30 * v / maxv))
+                lines.append(f"  {k:<10} {_fmt_hms_full(v):>10}  {bar}")
+        lines.append("")
+        lines.append("Top projects (window):")
+        proj_totals = db.aggregate_project_totals(since_days=since_days)
+        tops = sorted(proj_totals.items(), key=lambda x: x[1], reverse=True)[:10]
+        if not tops:
+            lines.append("  (no data)")
+        else:
+            maxv = max(v for _,v in tops) or 1
+            for name, secs in tops:
+                nm = (name or '-')
+                bar = '█' * max(1, int(30 * secs / maxv))
+                lines.append(f"  {_truncate(nm,20):<20} {_fmt_hms_full(secs):>10}  {bar}")
+        return [("bold", lines[0])] + [("", "\n" + "\n".join(lines[1:]))]
+
+    report_control = FormattedTextControl(text=lambda: build_report_text())
+    report_window = Window(width=100, height=28, content=report_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
 
     def build_detail_text() -> List[Tuple[str,str]]:
         if not detail_mode:
@@ -955,9 +1394,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     show_help = False
 
+    def _fmt_hms(total_seconds: int) -> str:
+        s = int(max(0, total_seconds))
+        h, r = divmod(s, 3600)
+        m, s = divmod(r, 60)
+        if h:
+            return f"{h:d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
     def build_status_bar() -> str:
-        mode = ("DATE" if in_date_filter else ("SEARCH" if in_search else ("DETAIL" if detail_mode else ("HELP" if show_help else "BROWSE"))))
-        base = f" {mode} u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
+        mode = (
+            "DATE" if in_date_filter else (
+            "SEARCH" if in_search else (
+            "DETAIL" if detail_mode else (
+            "REPORT" if show_report else (
+            "HELP" if show_help else "BROWSE"))))
+        )
+        base = f" {mode} W:timer R:report u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
     # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
         base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
@@ -979,8 +1432,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_search = Condition(lambda: in_search)
     is_date = Condition(lambda: in_date_filter)
     is_detail = Condition(lambda: detail_mode)
-    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode)
-    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode))
+    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report)
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -989,13 +1442,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('q')
     def _(event):
-        nonlocal detail_mode, in_search, search_buffer
+        nonlocal detail_mode, in_search, search_buffer, show_report
         if detail_mode:
             detail_mode = False
             if floats:
                 floats.clear()
             invalidate()
             return
+        if show_report:
+            show_report = False
+            if floats:
+                floats.clear()
+            invalidate(); return
         if in_search:
             in_search = False
             search_buffer = ""
@@ -1007,15 +1465,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('enter')
     def _(event):
-        nonlocal detail_mode
+        nonlocal detail_mode, show_report
         if in_search:
             finalize_search(); return
         if in_date_filter:
             finalize_date(); return
-        detail_mode = not detail_mode
-        floats.clear()
-        if detail_mode:
-            floats.append(Float(content=detail_window, top=2, left=4))
+        if show_report:
+            show_report = False
+            floats.clear()
+        else:
+            detail_mode = not detail_mode
+            floats.clear()
+            if detail_mode:
+                floats.append(Float(content=detail_window, top=2, left=4))
         invalidate()
 
     def move(delta:int):
@@ -1185,7 +1647,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('escape')
     def _(event):
-        nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line
+        nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
         if in_search:
             in_search = False
             search_buffer = ""
@@ -1195,6 +1657,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             in_date_filter = False; date_buffer = ""; invalidate(); return
         if detail_mode:
             detail_mode = False; floats.clear(); invalidate(); return
+        if show_report:
+            show_report = False; floats.clear(); invalidate(); return
 
     @kb.add('backspace')
     def _(event):
@@ -1297,6 +1761,30 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 except Exception:
                     pass
         asyncio.create_task(worker())
+
+    # Timer toggle
+    @kb.add('W', filter=is_normal)
+    def _(event):
+        rows = filtered_rows()
+        if not rows:
+            return
+        t = rows[current_index]
+        if not t.url:
+            return
+        # Toggle: if running -> stop, else start
+        if t.url in db.active_task_urls():
+            db.stop_session(t.url)
+            try:
+                logger.info("Stopped timer for %s", t.url)
+            except Exception:
+                pass
+        else:
+            db.start_session(t.url, t.project_title)
+            try:
+                logger.info("Started timer for %s", t.url)
+            except Exception:
+                pass
+        invalidate()
     # Sort toggle
     @kb.add('s', filter=is_normal)
     def _(event):
@@ -1345,10 +1833,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('?', filter=is_normal)
     def _(event):
-        nonlocal show_help, detail_mode, in_search
+        nonlocal show_help, detail_mode, in_search, show_report
         if in_search:
             return
         detail_mode = False
+        show_report = False
         in_search = False
         show_help = not show_help
         floats.clear()
@@ -1359,6 +1848,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  gg / G         Top / Bottom",
                 "  h/l or arrows  Horizontal scroll",
                 "  Enter          Toggle detail pane",
+                "  W              Toggle work timer for selected task",
+                "  R              Open timer report (day/week/month)",
                 "  /              Start search (type, Enter to apply, Esc cancel)",
                 "  s              Toggle sort (Project/Date)",
                 "  p              Cycle project filter",
@@ -1372,15 +1863,62 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  q / Esc        Quit / Close",
                 f"  Current tasks: {len(filtered_rows())}",
                 "",
+                "Visual cues:",
+                "  ⏱ + cyan row   Task timer running",
+                "",
                 "Press ? to close help."
             ]
             hl_control = FormattedTextControl(text="\n".join(help_lines))
             floats.append(Float(content=Window(width=84, height=24, content=hl_control, style="bg:#202020 #ffffff", wrap_lines=True), top=1, left=2))
         invalidate()
 
+    # Report bindings
+    @kb.add('R', filter=is_normal)
+    def _(event):
+        nonlocal show_report
+        show_report = True
+        floats.clear()
+        floats.append(Float(content=report_window, top=1, left=2))
+        invalidate()
+
+    @kb.add('d', filter=Condition(lambda: show_report))
+    def _(event):
+        nonlocal report_granularity
+        report_granularity = 'day'; invalidate()
+
+    @kb.add('w', filter=Condition(lambda: show_report))
+    def _(event):
+        nonlocal report_granularity
+        report_granularity = 'week'; invalidate()
+
+    @kb.add('m', filter=Condition(lambda: show_report))
+    def _(event):
+        nonlocal report_granularity
+        report_granularity = 'month'; invalidate()
+
     # refresh loop timer to update status bar (search typing etc.)
     style = Style.from_dict({})
     app = Application(layout=Layout(container), key_bindings=kb, full_screen=True, mouse_support=True, style=style, editing_mode=EditingMode.VI)
+
+    # Background ticker to refresh timers & status once per second
+    async def _ticker():
+        while True:
+            try:
+                await asyncio.sleep(1)
+                update_search_status()
+                app.invalidate()
+            except Exception:
+                # don't crash on background exceptions
+                await asyncio.sleep(1)
+                continue
+    try:
+        app.create_background_task(_ticker())
+    except Exception:
+        # Fallback: start via asyncio if available
+        try:
+            asyncio.create_task(_ticker())
+        except Exception:
+            pass
     app.run()
     return
 
