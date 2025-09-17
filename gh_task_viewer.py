@@ -1474,7 +1474,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             "REPORT" if show_report else (
             "HELP" if show_help else "BROWSE"))))
         )
-        base = f" {mode} W:timer R:report X:export u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
+        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
     # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
         base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
@@ -1884,6 +1884,82 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception as e:
             status_line = f"Export failed: {e}"
         invalidate()
+
+    # Quick PDF export from UI
+    @kb.add('Z', filter=is_normal)
+    def _(event):
+        nonlocal status_line
+        try:
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.pdfgen import canvas
+            from reportlab.lib import colors
+            from reportlab.lib.units import mm
+        except Exception:
+            status_line = "PDF export needs reportlab (pip install reportlab)"; invalidate(); return
+        try:
+            # Build payload (same as JSON quick export)
+            gran_opts = ['day','week','month']
+            since_days = 90
+            payload = {
+                'meta': {
+                    'generated_at': dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds'),
+                    'user': cfg.user,
+                    'since_days': since_days,
+                    'granularity': 'all',
+                    'scope': 'all',
+                },
+                'overall': {g: db.aggregate_period_totals(g, since_days=since_days) for g in gran_opts},
+                'projects_total_window': db.aggregate_project_totals(since_days=since_days),
+            }
+            # Render one-page PDF (reuse minimal renderer here)
+            ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+            out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'report-{ts}.pdf')
+            c = canvas.Canvas(out_path, pagesize=landscape(A4))
+            width, height = landscape(A4)
+            # Heading
+            c.setFillColor(colors.HexColor('#222222'))
+            c.setFont('Helvetica-Bold', 18)
+            c.drawString(20*mm, 195*mm, 'Work Timers Report')
+            c.setFont('Helvetica', 10); c.setFillColor(colors.HexColor('#444444'))
+            c.drawString(20*mm, 188*mm, f"User: {cfg.user} • Window: last {since_days} days • Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            # Simple bars for overall day if present
+            pal = [colors.HexColor(h) for h in ['#5B8FF9','#61DDAA','#65789B','#F6BD16','#7262fd','#78D3F8','#9661BC','#F6903D','#E86452','#6DC8EC']]
+            series_all = payload['overall'].get('day') or payload['overall'].get('week') or {}
+            keys = sorted(series_all.keys(), reverse=True)[:14]
+            series = list(reversed([(k, series_all[k]) for k in keys]))
+            # Draw bars
+            x, y, w, h = 20*mm, 110*mm, 255*mm, 70*mm
+            if series:
+                maxv = max(v for _,v in series) or 1
+                n = len(series); bar_w = max(4, (w-20)/n)
+                for i,(lab,val) in enumerate(series):
+                    bx = x + 10 + i*bar_w; bh = (val/maxv)*(h-20)
+                    c.setFillColor(pal[i%len(pal)]); c.rect(bx, y, bar_w-2, bh, stroke=0, fill=True)
+                    if i % max(1,n//12) == 0:
+                        c.setFont('Helvetica', 6); c.setFillColor(colors.HexColor('#333333'))
+                        c.drawString(bx, y-8, lab)
+            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+            c.drawString(x, 182*mm, 'Overall Activity')
+            # Top projects
+            tops = sorted(payload['projects_total_window'].items(), key=lambda kv: kv[1], reverse=True)[:8]
+            if tops:
+                x2, y2, w2, h2 = 20*mm, 30*mm, 255*mm, 60*mm
+                maxv = max(v for _,v in tops) or 1
+                row_h = h2/max(1,len(tops))
+                for i,(name,val) in enumerate(tops):
+                    yy = y2 + h2 - (i+1)*row_h + 2
+                    bw = (val/maxv)*(w2-80)
+                    c.setFillColor(pal[i%len(pal)]); c.roundRect(x2+80, yy, max(0,bw), row_h-6, 2, fill=True, stroke=0)
+                    c.setFont('Helvetica', 8); c.setFillColor(colors.black)
+                    nm = name or '-'
+                    c.drawRightString(x2+76, yy+(row_h-8)/2, nm[:30])
+                c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+                c.drawString(x2, 93*mm, 'Top Projects (Window)')
+            c.showPage(); c.save()
+            status_line = f"Exported {out_path}"
+        except Exception as e:
+            status_line = f"PDF export failed: {e}"
+        invalidate()
     # Sort toggle
     @kb.add('s', filter=is_normal)
     def _(event):
@@ -1950,6 +2026,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  W              Toggle work timer for selected task",
                 "  R              Open timer report (day/week/month)",
                 "  X              Export a JSON report (quick)",
+                "  Z              Export a PDF report (quick)",
                 "  /              Start search (type, Enter to apply, Esc cancel)",
                 "  s              Toggle sort (Project/Date)",
                 "  p              Cycle project filter",
@@ -2090,6 +2167,8 @@ def main() -> None:
     ap.add_argument("--export-scope", default="all", choices=["overall","project","task","all"], help="Data scope to include")
     ap.add_argument("--export-project", help="Limit export to a project title (with --export-scope project/task/all)")
     ap.add_argument("--export-task-url", help="Limit export to a task URL (with --export-scope task/all)")
+    ap.add_argument("--export-pdf", metavar="PATH", help="Write a 1-page PDF report to PATH")
+    ap.add_argument("--pdf-from-json", metavar="JSON", help="Render PDF from an existing JSON report payload")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -2128,24 +2207,19 @@ def main() -> None:
         m, s = divmod(r, 60)
         return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-    if args.export_report:
-        # Build a structured JSON payload for external tooling/PDF generation
-        db = TaskDB(args.db)
-        gran_opts = ([args.export_granularity] if args.export_granularity != 'all' else ['day','week','month'])
-        scope = args.export_scope
-        since_days = args.export_since_days
+    def _build_report_payload(db: TaskDB, cfg: Config, since_days: int, granularity: str, scope: str, proj: Optional[str], task_url: Optional[str]) -> Dict[str, object]:
+        gran_opts = ([granularity] if granularity != 'all' else ['day','week','month'])
         payload: Dict[str, object] = {
             "meta": {
                 "generated_at": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
                 "user": cfg.user,
                 "since_days": since_days,
-                "granularity": args.export_granularity,
+                "granularity": granularity,
                 "scope": scope,
-                "project": args.export_project,
-                "task_url": args.export_task_url,
+                "project": proj,
+                "task_url": task_url,
             }
         }
-        # Overall totals
         overall: Dict[str, Dict[str, int]] = {}
         for g in gran_opts:
             overall[g] = db.aggregate_period_totals(g, since_days=since_days)
@@ -2158,19 +2232,25 @@ def main() -> None:
             projects_periods[g] = db.aggregate_project_period_totals(g, since_days=since_days)
         payload["projects_periods"] = projects_periods
         # Optional: single project filter summary
-        if args.export_project:
-            proj = args.export_project
+        if proj:
             proj_section: Dict[str, Dict[str,int]] = {}
             for g in gran_opts:
                 proj_section[g] = db.aggregate_period_totals(g, since_days=since_days, project_title=proj)
             payload["project"] = {"title": proj, "periods": proj_section}
         # Optional: single task filter summary
-        if args.export_task_url:
-            tu = args.export_task_url
+        if task_url:
             task_section: Dict[str, Dict[str,int]] = {}
             for g in gran_opts:
-                task_section[g] = db.aggregate_period_totals(g, since_days=since_days, task_url=tu)
-            payload["task"] = {"url": tu, "periods": task_section}
+                task_section[g] = db.aggregate_period_totals(g, since_days=since_days, task_url=task_url)
+            payload["task"] = {"url": task_url, "periods": task_section}
+        return payload
+
+    if args.export_report and not args.export_pdfs if False else False:
+        pass
+
+    if args.export_report:
+        # Build a structured JSON payload for external tooling/PDF generation
+        payload = _build_report_payload(db, cfg, args.export_since_days, args.export_granularity, args.export_scope, args.export_project, args.export_task_url)
         # Write JSON
         out_path = args.export_report
         try:
@@ -2180,6 +2260,138 @@ def main() -> None:
         except Exception as e:
             print(f"Failed to write report: {e}", file=sys.stderr)
             sys.exit(2)
+        return
+
+    if args.export_pdf:
+        # Build payload from DB or load from given JSON
+        if args.pdf_from_json:
+            try:
+                with open(args.pdf_from_json, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            except Exception as e:
+                print(f"Failed to read JSON payload: {e}", file=sys.stderr)
+                sys.exit(2)
+        else:
+            payload = _build_report_payload(db, cfg, args.export_since_days, args.export_granularity, args.export_scope, args.export_project, args.export_task_url)
+
+        # Render PDF via ReportLab (optional dependency)
+        try:
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.pdfgen import canvas
+            from reportlab.lib import colors
+            from reportlab.lib.units import mm
+        except Exception:
+            print("ReportLab not installed. Try: pip install reportlab", file=sys.stderr)
+            sys.exit(2)
+
+        def _draw_heading(c, title, sub):
+            c.setFillColor(colors.HexColor('#222222'))
+            c.setFont('Helvetica-Bold', 18)
+            c.drawString(20*mm, 195*mm, title)
+            c.setFont('Helvetica', 10)
+            c.setFillColor(colors.HexColor('#444444'))
+            c.drawString(20*mm, 188*mm, sub)
+
+        def _fmt_hms(s:int)->str:
+            s = int(max(0, s))
+            h, r = divmod(s, 3600)
+            m, s = divmod(r, 60)
+            return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+        def _hbar_chart(c, x, y, w, h, data_pairs, palette):
+            # data_pairs: list[(label, seconds)] top-N already trimmed
+            if not data_pairs:
+                return
+            maxv = max(v for _, v in data_pairs) or 1
+            rows = len(data_pairs)
+            row_h = h / max(rows,1)
+            for i,(label,val) in enumerate(data_pairs):
+                yy = y + h - (i+1)*row_h + 2
+                bw = 0 if maxv<=0 else (val/maxv) * (w-60)
+                c.setFillColor(palette[i % len(palette)])
+                c.roundRect(x+60, yy, max(0,bw), row_h-6, 2, fill=True, stroke=0)
+                c.setFillColor(colors.HexColor('#000000'))
+                c.setFont('Helvetica', 8)
+                c.drawRightString(x+56, yy+ (row_h-8)/2, label[:22])
+                c.drawString(x+60 + max(0,bw) + 4, yy + (row_h-8)/2, _fmt_hms(int(val)))
+
+        def _vbar_chart(c, x, y, w, h, series, palette):
+            # series: list[(period_label, seconds)] already trimmed/reversed to show chronological
+            if not series:
+                return
+            n = len(series)
+            maxv = max(v for _,v in series) or 1
+            bar_w = max(4, (w - 20) / n)
+            for i,(lab,val) in enumerate(series):
+                bx = x + 10 + i*bar_w
+                bh = 0 if maxv<=0 else (val/maxv) * (h-20)
+                c.setFillColor(palette[i % len(palette)])
+                c.rect(bx, y, bar_w-2, bh, stroke=0, fill=True)
+            # x labels (sparse)
+            c.setFont('Helvetica', 6)
+            c.setFillColor(colors.HexColor('#333333'))
+            step = max(1, n//12)
+            for i,(lab,_) in enumerate(series):
+                if i % step == 0:
+                    c.drawString(x + 10 + i*bar_w, y-8, lab)
+
+        def _palette():
+            return [colors.HexColor(h) for h in ['#5B8FF9','#61DDAA','#65789B','#F6BD16','#7262fd','#78D3F8','#9661BC','#F6903D','#E86452','#6DC8EC']]
+
+        # Build sections from payload
+        meta = payload.get('meta',{})
+        user = meta.get('user','')
+        since_days = meta.get('since_days', 90)
+        granularity = meta.get('granularity','all')
+        overall = payload.get('overall',{})
+        projects_total_window = payload.get('projects_total_window',{})
+
+        c = canvas.Canvas(args.export_pdf, pagesize=landscape(A4))
+        width, height = landscape(A4)
+        _draw_heading(c, "Work Timers Report", f"User: {user}  •  Window: last {since_days} days  •  Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}  •  Granularity: {granularity}")
+
+        pal = _palette()
+
+        # Left: Top projects (window)
+        top_projects = sorted(projects_total_window.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        _hbar_chart(c, 20*mm, 110*mm, 120*mm, 70*mm, top_projects, pal)
+        c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+        c.drawString(20*mm, 182*mm, 'Top Projects (Window)')
+
+        # Right: Overall by period (choose day if present, else week)
+        pick = 'day' if 'day' in overall else ('week' if 'week' in overall else 'month')
+        series_all = overall.get(pick, {})
+        # latest 14 for day else 12
+        limit = 14 if pick=='day' else 12
+        keys = sorted(series_all.keys(), reverse=True)[:limit]
+        series = list(reversed([(k, series_all[k]) for k in keys]))
+        _vbar_chart(c, 160*mm, 110*mm, 115*mm, 70*mm, series, pal)
+        c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+        c.drawString(160*mm, 182*mm, f"Overall by {pick.capitalize()}")
+
+        # Bottom: Current project/task if provided
+        proj_section = payload.get('project', {})
+        if proj_section:
+            ptitle = proj_section.get('title','')
+            ser = proj_section.get('periods',{}).get(pick,{})
+            keys = sorted(ser.keys(), reverse=True)[:limit]
+            series_p = list(reversed([(k, ser[k]) for k in keys]))
+            _vbar_chart(c, 20*mm, 30*mm, 120*mm, 60*mm, series_p, pal)
+            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+            c.drawString(20*mm, 93*mm, f"Project: {_truncate(ptitle,32)}")
+
+        task_section = payload.get('task', {})
+        if task_section:
+            ser = task_section.get('periods',{}).get(pick,{})
+            keys = sorted(ser.keys(), reverse=True)[:limit]
+            series_t = list(reversed([(k, ser[k]) for k in keys]))
+            _vbar_chart(c, 160*mm, 30*mm, 115*mm, 60*mm, series_t, pal)
+            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+            c.drawString(160*mm, 93*mm, "Task (selected)")
+
+        c.showPage()
+        c.save()
+        print(f"Wrote PDF to {args.export_pdf}")
         return
 
     if args.no_ui:
