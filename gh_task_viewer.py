@@ -2039,8 +2039,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     top.append(("Other", other))
                 return top
             c.setFillColor(colors.HexColor('#222222')); c.setFont('Helvetica-Bold', 12)
-            c.drawString(20*mm, 266*mm, 'Distribution by Period (project share)')
-            pies_y = 260*mm
+            c.drawString(20*mm, 250*mm, 'Distribution by Period (project share)')
+            pies_y = 235*mm
             x_positions = [40*mm, 90*mm, 140*mm, 190*mm]
             for i,key in enumerate(['D','W','M','Y']):
                 data = proj_totals.get(key,{}) or {}
@@ -2048,10 +2048,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if items:
                     cx = x_positions[i]
                     pie_chart(c, cx, pies_y, 14*mm, items, pal, key)
-                    pie_legend(c, cx - 14*mm, pies_y - 14*mm - 6*mm, items, pal, max_lines=4)
+                    pie_legend(c, cx - 14*mm, pies_y - 14*mm - 6*mm, items, pal, max_lines=3)
             cols_proj = [("Project", 70*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
             cols_task = [("Task", 100*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
-            y = 224*mm
+            y = 195*mm
             c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
             c.drawString(20*mm, y, 'Per Project')
             y -= 6*mm
@@ -2527,8 +2527,8 @@ def main() -> None:
                 top.append(("Other", other))
             return top
         c.setFillColor(colors.HexColor('#222222')); c.setFont('Helvetica-Bold', 12)
-        c.drawString(20*mm, 266*mm, 'Distribution by Period (project share)')
-        pies_y = 260*mm
+        c.drawString(20*mm, 250*mm, 'Distribution by Period (project share)')
+        pies_y = 235*mm
         x_positions = [40*mm, 90*mm, 140*mm, 190*mm]
         labels = ['D','W','M','Y']
         for i,key in enumerate(labels):
@@ -2537,13 +2537,13 @@ def main() -> None:
             if items:
                 cx = x_positions[i]
                 pie_chart(c, cx, pies_y, pie_r, items, pal, key)
-                # legend beneath each pie using period-specific percentages
-                pie_legend(c, cx - pie_r, pies_y - pie_r - 6*mm, items, pal, max_lines=4)
+                # legend beneath each pie using period-specific percentages (limit 3 lines for compactness)
+                pie_legend(c, cx - pie_r, pies_y - pie_r - 6*mm, items, pal, max_lines=3)
         cols_proj = [("Project", 70*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
         cols_task = [("Task", 100*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
 
         # Start positions
-        y = 224*mm
+        y = 195*mm
         c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
         c.drawString(20*mm, y, 'Per Project')
         y -= 6*mm
