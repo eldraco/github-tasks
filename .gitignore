@@ -3,3 +3,6 @@ venv
 config_gh_task.yml
 *.json
 *.pdf
+config.yaml
+*.db
+.*.db
