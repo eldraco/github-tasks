@@ -24,8 +24,20 @@ pip install -r requirements.txt
 
 2) Auth token
 
-- Create a classic personal access token or fine-grained token with scopes: `repo`, `project`, `read:org` (as needed by your repos/orgs).
-- Set it as env var `GITHUB_TOKEN` or put it into a local `.env` file next to the script:
+Create a GitHub personal access token with the necessary scopes:
+
+- Recommended: classic token (Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token)
+- Scopes to enable:
+  - `repo` (full repository access)
+  - `project` (access Projects v2 via GraphQL)
+  - `user` (read user profile details for filtering/assignment checks)
+  - `notifications` (optional, recommended if you later expand features)
+  - `gist` (optional, only needed if exporting to gists)
+  - `admin:org` (only if you need to access private org projects; otherwise use `read:org`)
+
+Note: if you use fine-grained tokens, make sure to grant access to the organizations and repositories you need, and include Projects and Repository permissions analogous to the above classic scopes.
+
+Set the token in your environment as `GITHUB_TOKEN`, or place it into a local `.env` file next to the script:
 
 ```
 GITHUB_TOKEN=ghp_your_token_here
