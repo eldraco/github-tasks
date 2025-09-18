@@ -1039,7 +1039,7 @@ def _truncate(s: str, maxlen: int) -> str:
     width = 0
     for ch in s:
         ch_w = _char_width(ch)
-        if width + ch_w + ell_w > maxlen:
+        if width + ch_w + ell_w >= maxlen:
             break
         out.append(ch)
         width += ch_w
