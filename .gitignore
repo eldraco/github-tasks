@@ -6,3 +6,4 @@ config_gh_task.yml
 config.yaml
 *.db
 .*.db
+*.log
