@@ -7,3 +7,6 @@ config.yaml
 *.db
 .*.db
 *.log
+*.db-shm
+.gitignore
+*.db-wal
