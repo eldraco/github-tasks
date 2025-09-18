@@ -562,14 +562,19 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
         nodes{
           content{
             __typename
-            ... on DraftIssue { title }
+            ... on DraftIssue {
+              title
+              creator { login }
+            }
             ... on Issue {
               title url repository{ nameWithOwner }
               assignees(first:50){ nodes{ login } }
+              author { login }
             }
             ... on PullRequest {
               title url repository{ nameWithOwner }
               assignees(first:50){ nodes{ login } }
+              author { login }
             }
           }
                     fieldValues(first:50){
@@ -604,14 +609,19 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
         nodes{
           content{
             __typename
-            ... on DraftIssue { title }
+            ... on DraftIssue {
+              title
+              creator { login }
+            }
             ... on Issue {
               title url repository{ nameWithOwner }
               assignees(first:50){ nodes{ login } }
+              author { login }
             }
             ... on PullRequest {
               title url repository{ nameWithOwner }
               assignees(first:50){ nodes{ login } }
+              author { login }
             }
           }
                     fieldValues(first:50){
@@ -777,6 +787,11 @@ def fetch_tasks_github(
     session = _session(token)
     regex = re.compile(cfg.date_field_regex, re.IGNORECASE)
     me = cfg.user
+    me_login = me.strip().lower()
+    def _norm_login(login: Optional[str]) -> Optional[str]:
+        if isinstance(login, str):
+            return login.strip().lower()
+        return None
     iso_now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
     out: List[TaskRow] = []
 
@@ -864,20 +879,32 @@ def fetch_tasks_github(
                     rep = content.get("repository") or {}
                     repo = rep.get("nameWithOwner")
 
-                assignees = []
+                assignees_norm: List[str] = []
                 if ctype in ("Issue","PullRequest"):
-                    assignees = [n["login"] for n in (content.get("assignees") or {}).get("nodes") or [] if n and "login" in n]
+                    for node in (content.get("assignees") or {}).get("nodes") or []:
+                        login_norm = _norm_login((node or {}).get("login"))
+                        if login_norm:
+                            assignees_norm.append(login_norm)
                 people_logins: List[str] = []
                 status_text: Optional[str] = None
+                author_login_norm: Optional[str] = None
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldUserValue":
-                        people_logins.extend([n["login"] for n in (fv.get("users") or {}).get("nodes") or [] if n and "login" in n])
+                        for node in (fv.get("users") or {}).get("nodes") or []:
+                            login_norm = _norm_login((node or {}).get("login"))
+                            if login_norm:
+                                people_logins.append(login_norm)
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldSingleSelectValue":
                         fname_sel = ((fv.get("field") or {}).get("name") or "").lower()
                         if fname_sel in ("status","state","progress"):
                             status_text = (fv.get("name") or "").strip()
-                assigned_to_me = (me in assignees) or (me in people_logins)
-                if (not assigned_to_me) and (not include_unassigned):
+                if ctype == "DraftIssue":
+                    author_login_norm = _norm_login(((content.get("creator") or {})).get("login"))
+                elif ctype in ("Issue","PullRequest"):
+                    author_login_norm = _norm_login(((content.get("author") or {})).get("login"))
+                assigned_to_me = (me_login in assignees_norm) or (me_login in people_logins)
+                created_by_me = author_login_norm == me_login if author_login_norm else False
+                if (not assigned_to_me) and (not created_by_me) and (not include_unassigned):
                     continue
 
                 # Extract optional Focus Day for coloring and Today filter
