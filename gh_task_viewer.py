@@ -1047,7 +1047,9 @@ def _truncate(s: str, maxlen: int) -> str:
     while out and width + ell_w > maxlen:
         removed = out.pop()
         width -= _char_width(removed)
-    return "".join(out) + ellipsis if out else ellipsis[:maxlen]
+    if out:
+        return "".join(out) + ellipsis
+    return ellipsis if maxlen >= ell_w else ""
 
 
 def _pad_display(text: Optional[str], width: int, align: str = "left") -> str:
