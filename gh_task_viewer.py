@@ -769,7 +769,8 @@ def discover_open_projects(session: requests.Session, owner_type: str, owner: st
     else:
         data = _graphql_with_backoff(session, GQL_LIST_USER_PROJECTS, {"login": owner})
         nodes = (((data.get("data") or {}).get("user") or {}).get("projectsV2") or {}).get("nodes") or []
-    return [n for n in nodes if n is not None and isinstance(n, dict) and not n.get("closed")]
+    # GitHub may return null nodes when the caller lacks permission for a project; skip them safely.
+    return [n for n in nodes if isinstance(n, dict) and not n.get("closed")]
 
 
 # -----------------------------
