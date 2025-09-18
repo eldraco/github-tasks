@@ -80,6 +80,7 @@ class Config:
     user: str
     date_field_regex: str
     projects: List[ProjectSpec]
+    iteration_field_regex: Optional[str] = None
 
 
 def _compile_date_regex(raw: dict) -> str:
@@ -91,6 +92,15 @@ def _compile_date_regex(raw: dict) -> str:
     return raw.get("date_field_regex") or "start"
 
 
+def _compile_iteration_regex(raw: dict) -> Optional[str]:
+    names = raw.get("iteration_field_names")
+    if names and isinstance(names, list) and names:
+        parts = [f"^{re.escape(n)}$" for n in names]
+        return "|".join(parts)
+    it_regex = raw.get("iteration_field_regex")
+    return it_regex or None
+
+
 def load_config(path: str) -> Config:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
@@ -98,6 +108,7 @@ def load_config(path: str) -> Config:
     if not user:
         raise ValueError("Config: 'user' is required.")
     dfr = _compile_date_regex(raw)
+    ifr = _compile_iteration_regex(raw)
     prjs: List[ProjectSpec] = []
     for item in raw.get("projects", []):
         nums_raw = item.get("numbers", None)
@@ -111,7 +122,7 @@ def load_config(path: str) -> Config:
             prjs.append(ProjectSpec("user", item["user"], nums))
         else:
             raise ValueError(f"Project entry needs 'org' or 'user': {item}")
-    return Config(user=user, date_field_regex=dfr, projects=prjs)
+    return Config(user=user, date_field_regex=dfr, projects=prjs, iteration_field_regex=ifr)
 
 
 # -----------------------------
@@ -127,10 +138,14 @@ class TaskRow:
     start_date: str
     focus_field: str
     focus_date: str
-    title: str
-    repo: Optional[str]
-    url: str
-    updated_at: str
+    iteration_field: str = ""
+    iteration_title: str = ""
+    iteration_start: str = ""
+    iteration_duration: int = 0
+    title: str = ""
+    repo: Optional[str] = None
+    url: str = ""
+    updated_at: str = ""
     status: Optional[str] = None  # textual status (eg. In Progress, Done)
     is_done: int = 0              # 1 if done / completed
 
@@ -140,7 +155,8 @@ class TaskDB:
         "owner_type","owner","project_number","project_title",
         "start_field","start_date",
         "focus_field","focus_date",
-        "title","repo","url","updated_at","status","is_done"
+        "iteration_field","iteration_title","iteration_start","iteration_duration",
+        "title","repo","url","updated_at","status","is_done","assigned_to_me","created_by_me"
     ]
     CREATE_TABLE_SQL = """      CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +168,10 @@ class TaskDB:
         start_date TEXT NOT NULL,
         focus_field TEXT NOT NULL,
         focus_date TEXT NOT NULL,
+        iteration_field TEXT,
+        iteration_title TEXT,
+        iteration_start TEXT,
+        iteration_duration INTEGER DEFAULT 0,
         title TEXT NOT NULL,
         repo TEXT,
         url TEXT NOT NULL,
@@ -200,6 +220,7 @@ class TaskDB:
             "owner_type":"''","owner":"''","project_number":"0","project_title":"''",
             "start_field":"''","start_date":"''",
             "focus_field":"''","focus_date":"''",
+            "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
             "title":"''","repo":"NULL","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
         }
@@ -479,14 +500,16 @@ class TaskDB:
               owner_type, owner, project_number, project_title,
               start_field, start_date,
               focus_field, focus_date,
-              title, repo, url, updated_at, status, is_done
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              iteration_field, iteration_title, iteration_start, iteration_duration,
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
                           updated_at=excluded.updated_at,
                           status=excluded.status,
-                          is_done=excluded.is_done
+                          iteration_field=excluded.iteration_field,
+                          iteration_title=excluded.iteration_title,
+                          iteration_start=excluded.iteration_start,
+                          iteration_duration=excluded.iteration_duration,
             """,
             [
                 (
@@ -498,6 +521,10 @@ class TaskDB:
                     r.start_date,
                     r.focus_field,
                     r.focus_date,
+                    r.iteration_field,
+                    r.iteration_title,
+                    r.iteration_start,
+                    r.iteration_duration,
                     r.title,
                     r.repo,
                     r.url,
@@ -523,7 +550,8 @@ class TaskDB:
             today = today or dt.date.today().isoformat()
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,title,repo,url,updated_at,status,is_done
+                       start_date,focus_field,focus_date,
+                       iteration_field,iteration_title,iteration_start,iteration_duration,
                 FROM tasks WHERE focus_date = ?
                 ORDER BY project_title, focus_date, repo, title
                 """,
@@ -532,7 +560,8 @@ class TaskDB:
         else:
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,title,repo,url,updated_at,status,is_done
+                       start_date,focus_field,focus_date,
+                       iteration_field,iteration_title,iteration_start,iteration_duration,
                 FROM tasks
                 ORDER BY project_title, focus_date, repo, title
                 """
@@ -597,6 +626,12 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
                                 name
                                 field { ... on ProjectV2FieldCommon { name } }
                             }
+                            ... on ProjectV2ItemFieldIterationValue {
+                                title
+                                startDate
+                                duration
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
                         }
                     }
           project{ title url }
@@ -642,6 +677,12 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
                             }
                             ... on ProjectV2ItemFieldSingleSelectValue {
                                 name
+                                field { ... on ProjectV2FieldCommon { name } }
+                            }
+                            ... on ProjectV2ItemFieldIterationValue {
+                                title
+                                startDate
+                                duration
                                 field { ... on ProjectV2FieldCommon { name } }
                             }
                         }
@@ -791,6 +832,7 @@ def fetch_tasks_github(
 ) -> List[TaskRow]:
     session = _session(token)
     regex = re.compile(cfg.date_field_regex, re.IGNORECASE)
+    iter_regex = re.compile(cfg.iteration_field_regex, re.IGNORECASE) if cfg.iteration_field_regex else None
     me = cfg.user
     me_login = me.strip().lower()
     def _norm_login(login: Optional[str]) -> Optional[str]:
@@ -893,6 +935,11 @@ def fetch_tasks_github(
                 people_logins: List[str] = []
                 status_text: Optional[str] = None
                 author_login_norm: Optional[str] = None
+                iteration_field: str = ""
+                iteration_title: str = ""
+                iteration_start: str = ""
+                iteration_duration: int = 0
+                iteration_captured = False
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldUserValue":
                         for node in (fv.get("users") or {}).get("nodes") or []:
@@ -903,6 +950,17 @@ def fetch_tasks_github(
                         fname_sel = ((fv.get("field") or {}).get("name") or "").lower()
                         if fname_sel in ("status","state","progress"):
                             status_text = (fv.get("name") or "").strip()
+                    if (not iteration_captured) and fv and fv.get("__typename") == "ProjectV2ItemFieldIterationValue":
+                        fname_iter = ((fv.get("field") or {}).get("name") or "")
+                        if (iter_regex is None) or iter_regex.search(fname_iter):
+                            iteration_field = fname_iter
+                            iteration_title = (fv.get("title") or "")
+                            iteration_start = fv.get("startDate") or ""
+                            try:
+                                iteration_duration = int(fv.get("duration") or 0)
+                            except (TypeError, ValueError):
+                                iteration_duration = 0
+                            iteration_captured = True
                 if ctype == "DraftIssue":
                     author_login_norm = _norm_login(((content.get("creator") or {})).get("login"))
                 elif ctype in ("Issue","PullRequest"):
@@ -951,6 +1009,10 @@ def fetch_tasks_github(
                                 start_field=fname, start_date=fdate,
                                 focus_field=focus_fname or "",
                                 focus_date=focus_fdate or "",
+                                iteration_field=iteration_field,
+                                iteration_title=iteration_title,
+                                iteration_start=iteration_start,
+                                iteration_duration=iteration_duration,
                                 title=title, repo=repo, url=url, updated_at=iso_now,
                                 status=status_text, is_done=done_flag
                             )
@@ -970,6 +1032,10 @@ def fetch_tasks_github(
                             start_field="(no date)", start_date="",  # empty date -> neutral grey
                             focus_field=focus_fname or "",
                             focus_date=focus_fdate or "",
+                            iteration_field=iteration_field,
+                            iteration_title=iteration_title,
+                            iteration_start=iteration_start,
+                            iteration_duration=iteration_duration,
                             title=title + (" (unassigned)" if not assigned_to_me else ""), repo=repo, url=url, updated_at=iso_now,
                             status=status_text, is_done=done_flag
                         )
@@ -1118,6 +1184,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     hide_done = False
     hide_no_date = False  # new toggle to hide tasks without any date
     show_unassigned = False
+    include_created = True
+    use_iteration = False
     project_cycle: Optional[str] = None
     search_term: Optional[str] = None
     in_search = False
@@ -1171,6 +1239,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'hide_done': hide_done,
             'hide_no_date': hide_no_date,
             'show_unassigned': show_unassigned,
+            'include_created': include_created,
+            'use_iteration': use_iteration,
             'project_cycle': project_cycle,
             'search_term': search_term,
             'date_max': date_max,
@@ -1194,6 +1264,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     hide_done = bool(_st.get('hide_done', hide_done))
     hide_no_date = bool(_st.get('hide_no_date', hide_no_date))
     show_unassigned = bool(_st.get('show_unassigned', show_unassigned))
+    include_created = bool(_st.get('include_created', include_created))
+    use_iteration = bool(_st.get('use_iteration', use_iteration))
     project_cycle = _st.get('project_cycle', project_cycle)
     search_term = _st.get('search_term', search_term)
     date_max = _st.get('date_max', date_max)
@@ -1222,7 +1294,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if hide_done:
             out = [r for r in out if not r.is_done]
         if hide_no_date:
-            out = [r for r in out if r.focus_date]
+            if use_iteration:
+                out = [r for r in out if r.iteration_title or r.iteration_start]
+            else:
+                out = [r for r in out if r.focus_date]
         if project_cycle:
             out = [r for r in out if r.project_title == project_cycle]
         active_search = search_buffer if in_search else search_term
@@ -1295,19 +1370,40 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         right_panel_width = 32 + 1
         avail_cols = max(40, total_cols - right_panel_width)
         time_w = 12  # "mm:ss|HH:MM" (right aligned)
-        fixed = 2 + 11 + 2 + 12 + 2 + 10 + 2 + time_w + 2  # = 55
-        dyn = max(1, avail_cols - fixed)
-        proj_min = 12
-        title_min = 20
-        # split dyn ~70%/30% between title/project
-        title_w = max(title_min, int(dyn * 0.7))
-        proj_w = max(proj_min, dyn - title_w)
-        # Rebalance if rounding starves project
-        if proj_w < proj_min:
-            delta = proj_min - proj_w
-            title_w = max(title_min, title_w - delta)
-            proj_w = proj_min
-        header = f"  {'Focus Day':<11}  {'Start Date':<12}  {'STATUS':<10}  {'TIME':>{time_w}}  {'TITLE':<{title_w}}  {'PROJECT':<{proj_w}}"
+        if use_iteration:
+            iter_min = 15
+            title_min = 20
+            proj_min = 12
+            sum_min = iter_min + title_min + proj_min
+            base_fixed = 2 + 2 + 10 + 2 + time_w + 2 + 2  # marker + spaces + status + time separators
+            dyn_total = max(sum_min, avail_cols - base_fixed)
+            extra = dyn_total - sum_min
+            iter_w = iter_min + extra // 4
+            title_w = title_min + extra // 2
+            proj_w = proj_min + extra - (extra // 4) - (extra // 2)
+            header = (
+                "  " + _pad_display("Iteration", iter_w) +
+                "  " + _pad_display("STATUS", 10) +
+                "  " + _pad_display("TIME", time_w, align='right') +
+                "  " + _pad_display("TITLE", title_w) +
+                "  " + _pad_display("PROJECT", proj_w)
+            )
+        else:
+            proj_min = 12
+            title_min = 20
+            fixed = 2 + 11 + 2 + 12 + 2 + 10 + 2 + time_w + 2  # marker + focus + start + status + time + spaces
+            dyn = max(title_min + proj_min, avail_cols - fixed)
+            extra = dyn - (title_min + proj_min)
+            title_w = title_min + extra // 2
+            proj_w = proj_min + extra - (extra // 2)
+            header = (
+                "  " + _pad_display("Focus Day", 11) +
+                "  " + _pad_display("Start Date", 12) +
+                "  " + _pad_display("STATUS", 10) +
+                "  " + _pad_display("TIME", time_w, align='right') +
+                "  " + _pad_display("TITLE", title_w) +
+                "  " + _pad_display("PROJECT", proj_w)
+            )
         frags.append(("bold", header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
@@ -1344,7 +1440,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             time_cell = _pad_display(time_text, time_w, align='right')
             title_cell = _pad_display(t.title, title_w)
             project_cell = _pad_display(t.project_title, proj_w)
-            line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
+            if use_iteration:
+                iter_label = t.iteration_title or t.iteration_start or '-'
+                if t.iteration_title and t.iteration_start:
+                    iter_label = f"{t.iteration_title} ({t.iteration_start})"
+                iteration_cell = _pad_display(iter_label or '-', iter_w)
+                line = f"{marker}{iteration_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
+            else:
+                focus_cell = _pad_display(t.focus_date or '-', 11)
+                start_cell = _pad_display(t.start_date, 12)
+                line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -1403,6 +1508,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         lines.append(f"Today:{'Y' if show_today_only else 'N'}")
         lines.append(f"Date<=:{date_max or '-'}")
         lines.append(f"Search:{_truncate(active_search or '-',12)}")
+        lines.append(f"View:{'Iteration' if use_iteration else 'Dates'}")
         return "\n".join(lines)
 
     table_control = FormattedTextControl(text=lambda: build_table_fragments())
@@ -1433,7 +1539,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             m, s = divmod(r, 60)
             return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
         timers = f" Now:{_fmt_hms(now_s)} Task:{_fmt_hms(task_s)} Proj:{_fmt_hms(proj_s)} Act:{active_count} "
-        txt = f"{timers}| Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
+        view_label = 'Iteration' if use_iteration else 'Dates'
+        txt = f"{timers}| Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | View: {view_label}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
         return [("reverse", txt)]
     top_status_control = FormattedTextControl(text=lambda: build_top_status())
     top_status_window = Window(height=1, content=top_status_control)
@@ -1549,6 +1656,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not rows:
             return [("", "No selection")] 
         t = rows[current_index]
+        iter_parts = []
+        if t.iteration_title:
+            iter_parts.append(t.iteration_title)
+        if t.iteration_start:
+            iter_parts.append(t.iteration_start)
+        iter_display = " | ".join(iter_parts) if iter_parts else "-"
+        iter_suffix = []
+        if t.iteration_field:
+            iter_suffix.append(t.iteration_field)
+        if t.iteration_duration:
+            iter_suffix.append(f"{t.iteration_duration}d")
+        iter_meta = f" ({', '.join(iter_suffix)})" if iter_suffix else ""
         lines = [
             f"Project: {t.project_title}",
             f"Title:   {t.title}",
@@ -1556,6 +1675,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             f"URL:     {t.url}",
             f"Start:   {t.start_date} ({t.start_field})",
             f"Focus:   {t.focus_date or '-'} ({t.focus_field or '-'})",
+            f"Iter:    {iter_display}{iter_meta}",
             f"Status:  {t.status}",
             f"Done:    {'Yes' if t.is_done else 'No'}",
             "",
@@ -1584,13 +1704,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             "REPORT" if show_report else (
             "HELP" if show_help else "BROWSE"))))
         )
-        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
+        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned C:created j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all I:iteration ?:help q:quit "
     # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
         base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
             base += "[HideDone] "
         if hide_no_date:
             base += "[HideNoDate] "
+        if use_iteration:
+            base += "[Iteration] "
     # project and search are shown on the top status bar
         if date_max:
             base += f"[<= {date_max}] "
@@ -1792,6 +1914,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal hide_no_date, current_index
         hide_no_date = not hide_no_date
         current_index = 0
+        invalidate()
+
+    @kb.add('I', filter=is_normal)
+    def _(event):
+        # Toggle date vs iteration layout
+        if detail_mode or in_search:
+            return
+        nonlocal use_iteration, h_offset, status_line
+        use_iteration = not use_iteration
+        h_offset = 0
+        status_line = 'Iteration view ON' if use_iteration else 'Iteration view OFF'
         invalidate()
 
     # search mode
@@ -2225,6 +2358,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  U              Toggle include unassigned (then press u to refetch)",
                 "  d              Toggle done-only filter",
                 "  N              Toggle hide tasks without a date",
+                "  I              Toggle iteration/date view",
                 "  t / a          Today-only / All dates",
                 "  u              Update (fetch GitHub)",
                 "  ?              Toggle help",
