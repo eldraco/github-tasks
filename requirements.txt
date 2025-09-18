@@ -1,0 +1,4 @@
+prompt_toolkit>=3.0.39
+requests>=2.31.0
+PyYAML>=6.0.1
+reportlab>=4.0.0
