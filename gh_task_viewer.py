@@ -126,6 +126,38 @@ def load_config(path: str) -> Config:
 
 
 # -----------------------------
+# Project discovery cache
+# -----------------------------
+
+TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
+
+
+def _load_target_cache() -> Dict[str, List[Dict[str, object]]]:
+    try:
+        with open(TARGET_CACHE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_target_cache(data: Dict[str, List[Dict[str, object]]]) -> None:
+    try:
+        directory = os.path.dirname(TARGET_CACHE_PATH)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+        with open(TARGET_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        try:
+            logging.getLogger('gh_task_viewer').warning("Unable to write project cache", exc_info=True)
+        except Exception:
+            pass
+
+
+# -----------------------------
 # DB
 # -----------------------------
 @dataclass
@@ -819,11 +851,21 @@ def _graphql_with_backoff(
 
 def discover_open_projects(session: requests.Session, owner_type: str, owner: str) -> List[Dict]:
     if owner_type == "org":
-        data = _graphql_with_backoff(session, GQL_LIST_ORG_PROJECTS, {"login": owner})
-        nodes = (((data.get("data") or {}).get("organization") or {}).get("projectsV2") or {}).get("nodes") or []
+        resp = _graphql_with_backoff(session, GQL_LIST_ORG_PROJECTS, {"login": owner})
+        errs = resp.get("errors") or []
+        if errs:
+            raise RuntimeError(
+                f"Project discovery failed for org:{owner}: " + "; ".join(e.get("message", str(e)) for e in errs)
+            )
+        nodes = (((resp.get("data") or {}).get("organization") or {}).get("projectsV2") or {}).get("nodes") or []
     else:
-        data = _graphql_with_backoff(session, GQL_LIST_USER_PROJECTS, {"login": owner})
-        nodes = (((data.get("data") or {}).get("user") or {}).get("projectsV2") or {}).get("nodes") or []
+        resp = _graphql_with_backoff(session, GQL_LIST_USER_PROJECTS, {"login": owner})
+        errs = resp.get("errors") or []
+        if errs:
+            raise RuntimeError(
+                f"Project discovery failed for user:{owner}: " + "; ".join(e.get("message", str(e)) for e in errs)
+            )
+        nodes = (((resp.get("data") or {}).get("user") or {}).get("projectsV2") or {}).get("nodes") or []
     return [n for n in nodes if n is not None and isinstance(n, dict) and not n.get("closed")]
 
 
@@ -856,20 +898,60 @@ def fetch_tasks_github(
     iso_now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
     out: List[TaskRow] = []
 
+    target_cache = _load_target_cache()
+    cache_updated = False
     targets: List[Tuple[str,str,int,str]] = []
     for spec in cfg.projects:
+        cache_key = f"{spec.owner_type}:{spec.owner}"
         if spec.numbers is None:
-            projs = discover_open_projects(session, spec.owner_type, spec.owner)
+            discovered: List[Dict[str, object]] = []
+            projs: List[Dict[str, object]] = []
+            try:
+                projs = discover_open_projects(session, spec.owner_type, spec.owner)
+            except Exception as err:
+                try:
+                    logging.getLogger('gh_task_viewer').warning("Project discovery failed: %s", err)
+                except Exception:
+                    pass
+                projs = []
             for n in projs:
                 num_val = n.get("number")
                 try:
                     num_int = int(num_val) if num_val is not None else -1
                 except (TypeError, ValueError):
                     continue
-                targets.append((spec.owner_type, spec.owner, num_int, n.get("title") or ""))
+                title = n.get("title") or ""
+                targets.append((spec.owner_type, spec.owner, num_int, title))
+                discovered.append({"number": num_int, "title": title})
+            if discovered:
+                target_cache[cache_key] = discovered
+                cache_updated = True
+            elif cache_key in target_cache:
+                cached_entries = target_cache.get(cache_key) or []
+                if cached_entries:
+                    try:
+                        logging.getLogger('gh_task_viewer').warning(
+                            "Project discovery empty for %s; using cached project list", cache_key)
+                    except Exception:
+                        pass
+                    for entry in cached_entries:
+                        try:
+                            num_int = int(entry.get("number"))
+                        except Exception:
+                            continue
+                        targets.append((spec.owner_type, spec.owner, num_int, entry.get("title") or ""))
+                else:
+                    target_cache.pop(cache_key, None)
+                    cache_updated = True
         else:
             for num in spec.numbers:
                 targets.append((spec.owner_type, spec.owner, int(num), ""))
+
+    if cache_updated:
+        _save_target_cache(target_cache)
+
+    if not targets:
+        raise RuntimeError("No project targets resolved; check config or specify project numbers")
 
     total = len(targets)
     try:
