@@ -19,7 +19,7 @@ Requires Python 3.9+.
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -U pip
-pip install prompt_toolkit requests PyYAML reportlab
+pip install -r requirements.txt
 ```
 
 2) Auth token
@@ -198,4 +198,3 @@ The fetcher uses backoff and handles GitHub GraphQL `RATE_LIMITED` gracefully. I
 ## License
 
 This repo contains original code for a terminal viewer; no license is asserted here. If you plan to publish or share, please add an explicit license of your choice.
-
