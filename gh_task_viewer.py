@@ -148,6 +148,8 @@ class TaskRow:
     updated_at: str = ""
     status: Optional[str] = None  # textual status (eg. In Progress, Done)
     is_done: int = 0              # 1 if done / completed
+    assigned_to_me: int = 0       # 1 if explicitly assigned
+    created_by_me: int = 0        # 1 if authored/created by me
 
 
 class TaskDB:
@@ -178,6 +180,8 @@ class TaskDB:
         updated_at TEXT NOT NULL,
         status TEXT,
         is_done INTEGER DEFAULT 0,
+        assigned_to_me INTEGER DEFAULT 0,
+        created_by_me INTEGER DEFAULT 0,
         UNIQUE(owner_type, owner, project_number, title, url, start_field, start_date)
       )
     """
@@ -223,6 +227,7 @@ class TaskDB:
             "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
             "title":"''","repo":"NULL","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
+            "assigned_to_me":"0","created_by_me":"0",
         }
         sel = ", ".join([c if c in cols else defaults[c] for c in self.SCHEMA_COLUMNS])
         cur.execute(
@@ -501,15 +506,20 @@ class TaskDB:
               start_field, start_date,
               focus_field, focus_date,
               iteration_field, iteration_title, iteration_start, iteration_duration,
+              title, repo, url, updated_at, status, is_done, assigned_to_me, created_by_me
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
                           updated_at=excluded.updated_at,
                           status=excluded.status,
+                          is_done=excluded.is_done,
                           iteration_field=excluded.iteration_field,
                           iteration_title=excluded.iteration_title,
                           iteration_start=excluded.iteration_start,
                           iteration_duration=excluded.iteration_duration,
+                          assigned_to_me=excluded.assigned_to_me,
+                          created_by_me=excluded.created_by_me
             """,
             [
                 (
@@ -531,6 +541,8 @@ class TaskDB:
                     r.updated_at,
                     r.status,
                     r.is_done,
+                    r.assigned_to_me,
+                    r.created_by_me,
                 )
                 for r in rows
             ],
@@ -552,6 +564,7 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
+                       title,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me
                 FROM tasks WHERE focus_date = ?
                 ORDER BY project_title, focus_date, repo, title
                 """,
@@ -562,6 +575,7 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
+                       title,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me
                 FROM tasks
                 ORDER BY project_title, focus_date, repo, title
                 """
@@ -1014,7 +1028,9 @@ def fetch_tasks_github(
                                 iteration_start=iteration_start,
                                 iteration_duration=iteration_duration,
                                 title=title, repo=repo, url=url, updated_at=iso_now,
-                                status=status_text, is_done=done_flag
+                                status=status_text, is_done=done_flag,
+                                assigned_to_me=int(assigned_to_me),
+                                created_by_me=int(created_by_me)
                             )
                         )
                         found_date = True
@@ -1037,7 +1053,9 @@ def fetch_tasks_github(
                             iteration_start=iteration_start,
                             iteration_duration=iteration_duration,
                             title=title + (" (unassigned)" if not assigned_to_me else ""), repo=repo, url=url, updated_at=iso_now,
-                            status=status_text, is_done=done_flag
+                            status=status_text, is_done=done_flag,
+                            assigned_to_me=int(assigned_to_me),
+                            created_by_me=int(created_by_me)
                         )
                     )
 
@@ -1298,6 +1316,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 out = [r for r in out if r.iteration_title or r.iteration_start]
             else:
                 out = [r for r in out if r.focus_date]
+        if not include_created:
+            out = [r for r in out if not (r.created_by_me and not r.assigned_to_me)]
         if project_cycle:
             out = [r for r in out if r.project_title == project_cycle]
         active_search = search_buffer if in_search else search_term
@@ -1364,9 +1384,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
-        # Determine dynamic column widths to fully use available space
-        # Layout: marker(2) + Focus(11) + 2 + Start(12) + 2 + Status(10) + 2 + Time(12) + 2 + Title(VAR) + 2 + Project(VAR)
-        # Right side stats window width is fixed at 32 plus a 1-char separator in root_body
+        # Determine column widths; right panel width fixed at 32 + separator.
         right_panel_width = 32 + 1
         avail_cols = max(40, total_cols - right_panel_width)
         time_w = 12  # "mm:ss|HH:MM" (right aligned)
@@ -1434,8 +1452,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             th, rem = divmod(int(max(0, tot_s)), 3600)
             tm, _ = divmod(rem, 60)
             time_text = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else f"{mm:02d}:{ss:02d}|0:00"
-            focus_cell = _pad_display(t.focus_date or '-', 11)
-            start_cell = _pad_display(t.start_date, 12)
             status_cell = _pad_display(t.status or '-', 10)
             time_cell = _pad_display(time_text, time_w, align='right')
             title_cell = _pad_display(t.title, title_w)
@@ -1503,7 +1519,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         lines.append("")
         lines.append("Filters:")
         active_search = search_buffer if in_search else search_term
-        lines.append(f"HideDone:{'Y' if hide_done else 'N'} HideNoDate:{'Y' if hide_no_date else 'N'} Unassigned:{'Y' if show_unassigned else 'N'}")
+        lines.append(f"HideDone:{'Y' if hide_done else 'N'} HideNoDate:{'Y' if hide_no_date else 'N'} Unassigned:{'Y' if show_unassigned else 'N'} Created:{'Y' if include_created else 'N'}")
         lines.append(f"Proj:{_truncate(project_cycle or 'All',10)}")
         lines.append(f"Today:{'Y' if show_today_only else 'N'}")
         lines.append(f"Date<=:{date_max or '-'}")
@@ -1678,6 +1694,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             f"Iter:    {iter_display}{iter_meta}",
             f"Status:  {t.status}",
             f"Done:    {'Yes' if t.is_done else 'No'}",
+            f"Assigned:{'Yes' if t.assigned_to_me else 'No'}",
+            f"Created: {'Yes' if t.created_by_me else 'No'}",
             "",
             "Press Enter / q / Esc to close"
         ]
@@ -1711,6 +1729,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             base += "[HideDone] "
         if hide_no_date:
             base += "[HideNoDate] "
+        if not include_created:
+            base += "[NoCreated] "
         if use_iteration:
             base += "[Iteration] "
     # project and search are shown on the top status bar
@@ -1925,6 +1945,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         use_iteration = not use_iteration
         h_offset = 0
         status_line = 'Iteration view ON' if use_iteration else 'Iteration view OFF'
+        invalidate()
+
+    @kb.add('C', filter=is_normal)
+    def _(event):
+        # Toggle inclusion of tasks created-by-me but not assigned
+        if detail_mode or in_search:
+            return
+        nonlocal include_created, status_line, current_index
+        include_created = not include_created
+        current_index = 0
+        status_line = 'Including created tasks' if include_created else 'Hiding created-only tasks'
         invalidate()
 
     # search mode
@@ -2358,6 +2389,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  U              Toggle include unassigned (then press u to refetch)",
                 "  d              Toggle done-only filter",
                 "  N              Toggle hide tasks without a date",
+                "  C              Toggle showing created-but-unassigned tasks",
                 "  I              Toggle iteration/date view",
                 "  t / a          Today-only / All dates",
                 "  u              Update (fetch GitHub)",
@@ -2445,7 +2477,9 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 focus_field="Focus Day", focus_date=date_str,
                 title=f"Task {i}-{d_off}", repo="demo/repo",
                 url=f"https://example.com/{i}-{d_off}", updated_at=iso_now, status=status,
-                is_done=1 if status.lower()=="done" else 0
+                is_done=1 if status.lower()=="done" else 0,
+                assigned_to_me=1 if (i + d_off) % 2 == 0 else 0,
+                created_by_me=1 if (i + d_off) % 3 == 0 else 0
             ))
     return rows
 
