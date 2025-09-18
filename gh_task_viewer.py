@@ -41,6 +41,7 @@ import sqlite3
 import sys
 import string
 import json
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Iterable, Set
 
@@ -53,6 +54,10 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, VSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
+try:
+    from prompt_toolkit.utils import get_cwidth as _pt_get_cwidth
+except ImportError:  # pragma: no cover - fallback when prompt_toolkit changes API
+    _pt_get_cwidth = None
 # Buffer-based input removed; keep core controls only
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.filters import Condition
@@ -982,20 +987,6 @@ def fetch_tasks_github(
 
     if progress:
         progress(total, total, f"{_ascii_bar(total,total)}  Done")
-    # Ensure each project appears at least once
-    existing = {(r.owner_type, r.owner, r.project_number) for r in out}
-    for owner_type, owner, number, ptitle in targets:
-        key = (owner_type, owner, number)
-        if key not in existing:
-            out.append(
-                TaskRow(
-                    owner_type=owner_type, owner=owner, project_number=number,
-                    project_title=ptitle or "(project)", start_field="(none)", start_date="",
-                    focus_field="", focus_date="",
-                    title="(no assigned items) - press Shift+U to include unassigned", repo=None, url="", updated_at=iso_now,
-                    status=None, is_done=0
-                )
-            )
     return out
 
 
@@ -1013,9 +1004,64 @@ def color_for_date(d: str, today: dt.date) -> str:
         return "ansiyellow"
     return "ansigreen"
 
+def _char_width(ch: str) -> int:
+    """Return printable cell width for a single character."""
+    if _pt_get_cwidth is not None:
+        try:
+            return _pt_get_cwidth(ch)
+        except Exception:
+            pass
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.category(ch) == "Cf":  # zero-width formatting chars
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_char_width(ch) for ch in text)
+
+
+def _sanitize_cell_text(s: Optional[str]) -> str:
+    return (s or "").replace("\n", " ").replace("\r", " ")
+
+
 def _truncate(s: str, maxlen: int) -> str:
-    s = (s or "").replace("\n", " ").replace("\r", " ")
-    return s if len(s) <= maxlen else s[: maxlen - 1] + "…"
+    """Truncate string to a maximum display width, preserving whole glyphs."""
+    s = _sanitize_cell_text(s)
+    if maxlen <= 0:
+        return ""
+    if _display_width(s) <= maxlen:
+        return s
+    ellipsis = "…"
+    ell_w = _display_width(ellipsis)
+    out: List[str] = []
+    width = 0
+    for ch in s:
+        ch_w = _char_width(ch)
+        if width + ch_w + ell_w > maxlen:
+            break
+        out.append(ch)
+        width += ch_w
+    # Ensure ellipsis fits; if not, drop last chars until it does.
+    while out and width + ell_w > maxlen:
+        removed = out.pop()
+        width -= _char_width(removed)
+    return "".join(out) + ellipsis if out else ellipsis[:maxlen]
+
+
+def _pad_display(text: Optional[str], width: int, align: str = "left") -> str:
+    """Pad/truncate text to an exact display width using spaces."""
+    align = align.lower()
+    raw = _truncate(_sanitize_cell_text(text), width)
+    pad = max(0, width - _display_width(raw))
+    if align == "right":
+        return " " * pad + raw
+    if align == "center":
+        left = pad // 2
+        right = pad - left
+        return (" " * left) + raw + (" " * right)
+    return raw + (" " * pad)
 
 def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str]]:
     """Return a list of (style, text) tuples for FormattedTextControl."""
@@ -1035,13 +1081,15 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
             frags.append(("bold", header))
             frags.append(("", "\n"))
         col = color_for_date(t.focus_date, today)
-        title = _truncate(t.title, 45)
-        repo  = _truncate(t.repo or "-", 20)
-        url   = _truncate(t.url, 40)
-        status = _truncate(t.status or "-", 10)
-        frags.append((col, f"{t.focus_date or '-':<11}  {t.start_date:<12}"))
+        focus_cell = _pad_display(t.focus_date or '-', 11)
+        start_cell = _pad_display(t.start_date, 12)
+        status_cell = _pad_display(t.status or '-', 10)
+        title_cell = _pad_display(t.title, 45)
+        repo_cell = _pad_display(t.repo or '-', 20)
+        url_cell = _pad_display(t.url, 40)
+        frags.append((col, focus_cell))
         frags.append(("",  "  "))
-        frags.append(("", f"{status:<10}  {title:<45}  {repo:<20}  {url}"))
+        frags.append(("", f"{start_cell}  {status_cell}  {title_cell}  {repo_cell}  {url_cell}"))
         frags.append(("", "\n"))
 
     if frags and frags[-1] == ("", "\n"):
@@ -1279,9 +1327,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 base_style = "ansicyan bold"
             else:
                 base_style = col
-            title = _truncate(t.title, title_w)
-            project = _truncate(t.project_title, proj_w)
-            status_txt = _truncate(t.status or '-', 10)
             marker = '⏱ ' if running else '  '
             # Time column: current run (mm:ss) and total (H:MM)
             cur_s = db.task_current_elapsed_seconds(t.url) if (t.url and running) else 0
@@ -1290,9 +1335,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             # total in H:MM (no leading zeros on hours)
             th, rem = divmod(int(max(0, tot_s)), 3600)
             tm, _ = divmod(rem, 60)
-            time_cell = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else (f"{mm:02d}:{ss:02d}|0:00")
-            time_cell = f"{time_cell:>{time_w}}"
-            line = f"{marker}{(t.focus_date or '-'):<11}  {t.start_date:<12}  {status_txt:<10}  {time_cell}  {title:<{title_w}}  {project:<{proj_w}}"
+            time_text = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else f"{mm:02d}:{ss:02d}|0:00"
+            focus_cell = _pad_display(t.focus_date or '-', 11)
+            start_cell = _pad_display(t.start_date, 12)
+            status_cell = _pad_display(t.status or '-', 10)
+            time_cell = _pad_display(time_text, time_w, align='right')
+            title_cell = _pad_display(t.title, title_w)
+            project_cell = _pad_display(t.project_title, proj_w)
+            line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -1341,7 +1391,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         for p,(d,t) in sorted(by_proj.items()):
             pct = 0 if t==0 else int(d*100/t)
             secs = proj_time.get(p or '', 0)
-            lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}% {_fmt_hm(secs):>6}")
+            proj_cell = _pad_display(p, 12)
+            lines.append(f"{proj_cell}{d:>2}/{t:<2} {pct:>3}% {_fmt_hm(secs):>6}")
         lines.append("")
         lines.append("Filters:")
         active_search = search_buffer if in_search else search_term
