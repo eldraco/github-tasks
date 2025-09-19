@@ -182,6 +182,13 @@ class TaskRow:
     is_done: int = 0              # 1 if done / completed
     assigned_to_me: int = 0       # 1 if explicitly assigned
     created_by_me: int = 0        # 1 if authored/created by me
+    item_id: str = ""
+    project_id: str = ""
+    status_field_id: str = ""
+    status_option_id: str = ""
+    status_options: str = "[]"
+    status_dirty: int = 0
+    status_pending_option_id: str = ""
 
 
 class TaskDB:
@@ -190,7 +197,8 @@ class TaskDB:
         "start_field","start_date",
         "focus_field","focus_date",
         "iteration_field","iteration_title","iteration_start","iteration_duration",
-        "title","repo","url","updated_at","status","is_done","assigned_to_me","created_by_me"
+        "title","repo","url","updated_at","status","is_done","assigned_to_me","created_by_me",
+        "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id"
     ]
     CREATE_TABLE_SQL = """      CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,6 +222,13 @@ class TaskDB:
         is_done INTEGER DEFAULT 0,
         assigned_to_me INTEGER DEFAULT 0,
         created_by_me INTEGER DEFAULT 0,
+        item_id TEXT,
+        project_id TEXT,
+        status_field_id TEXT,
+        status_option_id TEXT,
+        status_options TEXT,
+        status_dirty INTEGER DEFAULT 0,
+        status_pending_option_id TEXT,
         UNIQUE(owner_type, owner, project_number, title, url, start_field, start_date)
       )
     """
@@ -260,6 +275,8 @@ class TaskDB:
             "title":"''","repo":"NULL","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
             "assigned_to_me":"0","created_by_me":"0",
+            "item_id":"''","project_id":"''","status_field_id":"''","status_option_id":"''",
+            "status_options":"'[]'","status_dirty":"0","status_pending_option_id":"''",
         }
         sel = ", ".join([c if c in cols else defaults[c] for c in self.SCHEMA_COLUMNS])
         cur.execute(
@@ -528,6 +545,30 @@ class TaskDB:
                 cur_dt = seg_end
         return out
 
+    def mark_status_pending(self, url: str, status_text: str, option_id: str, is_done: int) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status=?, is_done=?, status_dirty=1, status_pending_option_id=?, status_option_id=? WHERE url=?",
+            (status_text, int(is_done), option_id or '', option_id or '', url),
+        )
+        self.conn.commit()
+
+    def mark_status_synced(self, url: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status_dirty=0, status_pending_option_id='' WHERE url=?",
+            (url,),
+        )
+        self.conn.commit()
+
+    def reset_status(self, url: str, status_text: str, option_id: str, is_done: int) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status=?, is_done=?, status_option_id=?, status_dirty=0, status_pending_option_id='' WHERE url=?",
+            (status_text, int(is_done), option_id or '', url),
+        )
+        self.conn.commit()
+
     def upsert_many(self, rows: List[TaskRow]):
         if not rows:
             return
@@ -538,8 +579,9 @@ class TaskDB:
               start_field, start_date,
               focus_field, focus_date,
               iteration_field, iteration_title, iteration_start, iteration_duration,
-              title, repo, url, updated_at, status, is_done, assigned_to_me, created_by_me
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              title, repo, url, updated_at, status, is_done, assigned_to_me, created_by_me,
+              item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
@@ -551,7 +593,14 @@ class TaskDB:
                           iteration_start=excluded.iteration_start,
                           iteration_duration=excluded.iteration_duration,
                           assigned_to_me=excluded.assigned_to_me,
-                          created_by_me=excluded.created_by_me
+                          created_by_me=excluded.created_by_me,
+                          item_id=excluded.item_id,
+                          project_id=excluded.project_id,
+                          status_field_id=excluded.status_field_id,
+                          status_option_id=excluded.status_option_id,
+                          status_options=excluded.status_options,
+                          status_dirty=excluded.status_dirty,
+                          status_pending_option_id=excluded.status_pending_option_id
             """,
             [
                 (
@@ -575,6 +624,13 @@ class TaskDB:
                     r.is_done,
                     r.assigned_to_me,
                     r.created_by_me,
+                    r.item_id,
+                    r.project_id,
+                    r.status_field_id,
+                    r.status_option_id,
+                    r.status_options,
+                    int(r.status_dirty),
+                    r.status_pending_option_id,
                 )
                 for r in rows
             ],
@@ -596,7 +652,8 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me
+                       title,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id
                 FROM tasks WHERE focus_date = ?
                 ORDER BY project_title, focus_date, repo, title
                 """,
@@ -607,7 +664,8 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me
+                       title,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id
                 FROM tasks
                 ORDER BY project_title, focus_date, repo, title
                 """
@@ -640,6 +698,7 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
       items(first:100, after:$after){
         pageInfo{ hasNextPage endCursor }
         nodes{
+          id
           content{
             __typename
             ... on DraftIssue {
@@ -662,15 +721,23 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
                             __typename
                             ... on ProjectV2ItemFieldDateValue {
                                 date
-                                field { ... on ProjectV2FieldCommon { name } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldUserValue {
                                 users(first:50){ nodes{ login } }
-                                field { ... on ProjectV2FieldCommon { name } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldSingleSelectValue {
                                 name
-                                field { ... on ProjectV2FieldCommon { name } }
+                                optionId
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                  ... on ProjectV2SingleSelectField {
+                                    id
+                                    name
+                                    options { id name }
+                                  }
+                                }
                             }
                             ... on ProjectV2ItemFieldIterationValue {
                                 title
@@ -680,7 +747,7 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
                             }
                         }
                     }
-          project{ title url }
+          project{ title url id }
         }
       }
     }
@@ -693,6 +760,7 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
       items(first:100, after:$after){
         pageInfo{ hasNextPage endCursor }
         nodes{
+          id
           content{
             __typename
             ... on DraftIssue {
@@ -715,15 +783,23 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
                             __typename
                             ... on ProjectV2ItemFieldDateValue {
                                 date
-                                field { ... on ProjectV2FieldCommon { name } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldUserValue {
                                 users(first:50){ nodes{ login } }
-                                field { ... on ProjectV2FieldCommon { name } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldSingleSelectValue {
                                 name
-                                field { ... on ProjectV2FieldCommon { name } }
+                                optionId
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                  ... on ProjectV2SingleSelectField {
+                                    id
+                                    name
+                                    options { id name }
+                                  }
+                                }
                             }
                             ... on ProjectV2ItemFieldIterationValue {
                                 title
@@ -733,10 +809,24 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
                             }
                         }
                     }
-          project{ title url }
+          project{ title url id }
         }
       }
     }
+  }
+}
+"""
+
+GQL_MUTATION_SET_STATUS = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{singleSelectOptionId:$optionId}
+    }
+  ){
+    projectV2Item{ id }
   }
 }
 """
@@ -848,6 +938,24 @@ def _graphql_with_backoff(
             total_wait += wait_s
             continue
         return resp
+
+
+def set_project_status(token: str, project_id: str, item_id: str, field_id: str, option_id: str) -> None:
+    if not token:
+        raise RuntimeError("Cannot update status without GITHUB_TOKEN")
+    if not (project_id and item_id and field_id and option_id):
+        raise RuntimeError("Status update missing required identifiers")
+    session = _session(token)
+    variables = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "optionId": option_id,
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_STATUS, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Status update failed: " + "; ".join(e.get("message", str(e)) for e in errs))
 
 def discover_open_projects(session: requests.Session, owner_type: str, owner: str) -> List[Dict]:
     if owner_type == "org":
@@ -1013,10 +1121,14 @@ def fetch_tasks_github(
 
             items = (proj_node.get("items") or {}).get("nodes") or []
             for it in items:
+                item_id = it.get("id") or ""
                 content = it.get("content") or {}
                 ctype = content.get("__typename")
                 title = content.get("title") or "(Draft item)"
                 url = content.get("url") or it.get("project", {}).get("url") or ""
+                project_info = it.get("project") or {}
+                project_title = project_info.get("title") or ""
+                project_id = project_info.get("id") or ""
                 repo = None
                 if ctype in ("Issue","PullRequest"):
                     rep = content.get("repository") or {}
@@ -1030,6 +1142,9 @@ def fetch_tasks_github(
                             assignees_norm.append(login_norm)
                 people_logins: List[str] = []
                 status_text: Optional[str] = None
+                status_field_id: str = ""
+                status_option_id: str = ""
+                status_options_list: List[Dict[str, str]] = []
                 author_login_norm: Optional[str] = None
                 iteration_field: str = ""
                 iteration_title: str = ""
@@ -1043,9 +1158,19 @@ def fetch_tasks_github(
                             if login_norm:
                                 people_logins.append(login_norm)
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldSingleSelectValue":
-                        fname_sel = ((fv.get("field") or {}).get("name") or "").lower()
+                        field_data = fv.get("field") or {}
+                        fname_sel = (field_data.get("name") or "").lower()
+                        option_id_val = fv.get("optionId") or ""
+                        options_raw = field_data.get("options") or []
+                        if options_raw:
+                            status_options_list = [
+                                {"id": opt.get("id"), "name": opt.get("name")}
+                                for opt in options_raw if opt and opt.get("id")
+                            ]
                         if fname_sel in ("status","state","progress"):
                             status_text = (fv.get("name") or "").strip()
+                            status_field_id = field_data.get("id") or ""
+                            status_option_id = option_id_val
                     if (not iteration_captured) and fv and fv.get("__typename") == "ProjectV2ItemFieldIterationValue":
                         fname_iter = ((fv.get("field") or {}).get("name") or "")
                         if (iter_regex is None) or iter_regex.search(fname_iter):
@@ -1101,7 +1226,7 @@ def fetch_tasks_github(
                         out.append(
                             TaskRow(
                                 owner_type=owner_type, owner=owner, project_number=number,
-                                project_title=(it.get("project") or {}).get("title") or "",
+                                project_title=project_title,
                                 start_field=fname, start_date=fdate,
                                 focus_field=focus_fname or "",
                                 focus_date=focus_fdate or "",
@@ -1112,7 +1237,14 @@ def fetch_tasks_github(
                                 title=title, repo=repo, url=url, updated_at=iso_now,
                                 status=status_text, is_done=done_flag,
                                 assigned_to_me=int(assigned_to_me),
-                                created_by_me=int(created_by_me)
+                                created_by_me=int(created_by_me),
+                                item_id=item_id,
+                                project_id=project_id,
+                                status_field_id=status_field_id,
+                                status_option_id=status_option_id,
+                                status_options=json.dumps(status_options_list, ensure_ascii=False),
+                                status_dirty=0,
+                                status_pending_option_id=""
                             )
                         )
                         found_date = True
@@ -1126,8 +1258,8 @@ def fetch_tasks_github(
                     out.append(
                         TaskRow(
                             owner_type=owner_type, owner=owner, project_number=number,
-                            project_title=(it.get("project") or {}).get("title") or "",
-                            start_field="(no date)", start_date="",  # empty date -> neutral grey
+                            project_title=project_title,
+                            start_field="(no date)", start_date="",
                             focus_field=focus_fname or "",
                             focus_date=focus_fdate or "",
                             iteration_field=iteration_field,
@@ -1137,7 +1269,14 @@ def fetch_tasks_github(
                             title=title + (" (unassigned)" if not assigned_to_me else ""), repo=repo, url=url, updated_at=iso_now,
                             status=status_text, is_done=done_flag,
                             assigned_to_me=int(assigned_to_me),
-                            created_by_me=int(created_by_me)
+                            created_by_me=int(created_by_me),
+                            item_id=item_id,
+                            project_id=project_id,
+                            status_field_id=status_field_id,
+                            status_option_id=status_option_id,
+                            status_options=json.dumps(status_options_list, ensure_ascii=False),
+                            status_dirty=0,
+                            status_pending_option_id=""
                         )
                     )
 
@@ -1300,6 +1439,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     h_offset = 0
     detail_mode = False
     status_line = ""
+    pending_status_urls: Set[str] = set()
     # Inline search buffer (used when in_search == True)
 
     if state_path is None:
@@ -1378,6 +1518,101 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return db.load(today_only=show_today_only, today=today_date.isoformat())
 
     all_rows = load_all()
+
+    STATUS_KEYWORDS: Dict[str, List[str]] = {
+        'done': ["done", "complete", "completed", "finished", "closed", "resolved", "merged", "✅", "✔"],
+        'in_progress': ["in progress", "progress", "doing", "active", "working"]
+    }
+
+    def _status_options_map(row: TaskRow) -> Dict[str, Tuple[str, str]]:
+        try:
+            data = json.loads(row.status_options or "[]")
+        except Exception:
+            data = []
+        out: Dict[str, Tuple[str, str]] = {}
+        if isinstance(data, list):
+            for opt in data:
+                if not isinstance(opt, dict):
+                    continue
+                name = (opt.get("name") or "").strip()
+                opt_id = (opt.get("id") or "").strip()
+                if name and opt_id:
+                    out[name.lower()] = (opt_id, name)
+        if row.status and row.status_option_id:
+            low = row.status.strip().lower()
+            out.setdefault(low, (row.status_option_id, row.status))
+        return out
+
+    def _match_status_option(row: TaskRow, target: str) -> Tuple[str, str]:
+        options = _status_options_map(row)
+        keywords = STATUS_KEYWORDS.get(target, [])
+        for kw in keywords:
+            opt = options.get(kw.lower())
+            if opt:
+                return opt
+        for key, opt in options.items():
+            if any(kw in key for kw in keywords):
+                return opt
+        return ("", "")
+
+    def _is_done_name(name: str) -> int:
+        low = (name or "").lower()
+        return int(any(kw in low for kw in STATUS_KEYWORDS['done']))
+
+    async def _apply_status_change(target: str):
+        nonlocal all_rows, status_line
+        if not token:
+            status_line = "GITHUB_TOKEN required for status updates"
+            invalidate(); return
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate(); return
+        row = rows[current_index]
+        if row.url in pending_status_urls:
+            status_line = "Status update already in progress"
+            invalidate(); return
+        if not (row.project_id and row.item_id and row.status_field_id):
+            status_line = "Task missing status metadata"
+            invalidate(); return
+        option_id, display_name = _match_status_option(row, target)
+        if not option_id:
+            status_line = f"No status option matches '{target}'"
+            invalidate(); return
+        if (row.status_option_id == option_id) and not row.status_dirty:
+            status_line = f"Already {display_name}"
+            invalidate(); return
+        new_is_done = _is_done_name(display_name)
+        original_status = row.status or ""
+        original_option = row.status_option_id or ""
+        original_is_done = row.is_done
+        try:
+            db.mark_status_pending(row.url, display_name, option_id, new_is_done)
+        except Exception as exc:
+            status_line = f"Failed to mark pending: {exc}"
+            invalidate(); return
+        pending_status_urls.add(row.url)
+        all_rows = load_all()
+        status_line = f"Updating status to {display_name}…"
+        invalidate()
+
+        loop = asyncio.get_running_loop()
+
+        def _do_update():
+            set_project_status(token, row.project_id, row.item_id, row.status_field_id, option_id)
+
+        try:
+            await loop.run_in_executor(None, _do_update)
+        except Exception as exc:
+            db.reset_status(row.url, original_status, original_option, original_is_done)
+            status_line = f"Status update failed: {exc}"
+        else:
+            db.mark_status_synced(row.url)
+            status_line = f"Status set to {display_name}"
+        finally:
+            pending_status_urls.discard(row.url)
+            all_rows = load_all()
+            invalidate()
 
     def _safe_date(s: str) -> Optional[dt.date]:
         try:
@@ -1535,6 +1770,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             tm, _ = divmod(rem, 60)
             time_text = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else f"{mm:02d}:{ss:02d}|0:00"
             status_cell = _pad_display(t.status or '-', 10)
+            if t.status_dirty:
+                status_cell = _pad_display((t.status or '-') + '*', 10)
             time_cell = _pad_display(time_text, time_w, align='right')
             title_cell = _pad_display(t.title, title_w)
             project_cell = _pad_display(t.project_title, proj_w)
@@ -1776,8 +2013,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             f"Iter:    {iter_display}{iter_meta}",
             f"Status:  {t.status}",
             f"Done:    {'Yes' if t.is_done else 'No'}",
+            f"Pending: {'Yes' if t.status_dirty else 'No'}",
             f"Assigned:{'Yes' if t.assigned_to_me else 'No'}",
             f"Created: {'Yes' if t.created_by_me else 'No'}",
+            f"FieldID: {t.status_field_id or '-'}",
             "",
             "Press Enter / q / Esc to close"
         ]
@@ -1804,7 +2043,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             "REPORT" if show_report else (
             "HELP" if show_help else "BROWSE"))))
         )
-        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned C:created j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all I:iteration ?:help q:quit "
+        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned C:created D:mark-done I:mark-progress j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all V:iteration ?:help q:quit "
     # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
         base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
@@ -2018,7 +2257,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_index = 0
         invalidate()
 
-    @kb.add('I', filter=is_normal)
+    @kb.add('V', filter=is_normal)
     def _(event):
         # Toggle date vs iteration layout
         if detail_mode or in_search:
@@ -2039,6 +2278,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_index = 0
         status_line = 'Including created tasks' if include_created else 'Hiding created-only tasks'
         invalidate()
+
+    @kb.add('D', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        asyncio.create_task(_apply_status_change('done'))
+
+    @kb.add('I', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        asyncio.create_task(_apply_status_change('in_progress'))
 
     # search mode
     @kb.add('/')
@@ -2472,7 +2723,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  d              Toggle done-only filter",
                 "  N              Toggle hide tasks without a date",
                 "  C              Toggle showing created-but-unassigned tasks",
-                "  I              Toggle iteration/date view",
+                "  V              Toggle iteration/date view",
+                "  D              Mark status as Done",
+                "  I              Mark status as In Progress",
                 "  t / a          Today-only / All dates",
                 "  u              Update (fetch GitHub)",
                 "  ?              Toggle help",
@@ -2549,10 +2802,17 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
     iso_now = dt.datetime.now().isoformat(timespec="seconds")
     projects = ["Alpha", "Beta", "Gamma"]
     statuses = ["Todo", "In Progress", "Done", "Blocked"]
+    status_options = [
+        {"id": "opt-todo", "name": "Todo"},
+        {"id": "opt-in-progress", "name": "In Progress"},
+        {"id": "opt-done", "name": "Done"},
+        {"id": "opt-blocked", "name": "Blocked"},
+    ]
     for i, proj in enumerate(projects, start=1):
         for d_off in range(-2, 5):
             date_str = (today + dt.timedelta(days=d_off)).isoformat()
             status = statuses[(i + d_off) % len(statuses)]
+            option_id = next((opt["id"] for opt in status_options if opt["name"] == status), "opt-todo")
             rows.append(TaskRow(
                 owner_type="org", owner="example", project_number=i, project_title=proj,
                 start_field="Start date", start_date=date_str,
@@ -2561,7 +2821,12 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 url=f"https://example.com/{i}-{d_off}", updated_at=iso_now, status=status,
                 is_done=1 if status.lower()=="done" else 0,
                 assigned_to_me=1 if (i + d_off) % 2 == 0 else 0,
-                created_by_me=1 if (i + d_off) % 3 == 0 else 0
+                created_by_me=1 if (i + d_off) % 3 == 0 else 0,
+                item_id=f"item-{i}-{d_off}",
+                project_id=f"proj-{i}",
+                status_field_id="status-field",
+                status_option_id=option_id,
+                status_options=json.dumps(status_options, ensure_ascii=False)
             ))
     return rows
 
