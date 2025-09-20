@@ -322,9 +322,24 @@ class TaskDB:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ws_task ON work_sessions(task_url)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ws_open ON work_sessions(ended_at)")
+        # Detailed timer events log for later forensics/reports
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS timer_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_url TEXT NOT NULL,
+                project_title TEXT,
+                repo TEXT,
+                labels TEXT,
+                action TEXT NOT NULL, -- 'start' | 'stop'
+                at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_te_task_at ON timer_events(task_url, at)")
         self.conn.commit()
 
-    def start_session(self, task_url: str, project_title: Optional[str] = None) -> None:
+    def start_session(self, task_url: str, project_title: Optional[str] = None, repo: Optional[str] = None, labels_json: Optional[str] = None) -> None:
         if not task_url:
             return
         # Avoid duplicate open sessions for same task
@@ -337,9 +352,13 @@ class TaskDB:
             "INSERT INTO work_sessions(task_url, project_title, started_at, ended_at) VALUES (?,?,?,NULL)",
             (task_url, project_title, now),
         )
+        cur.execute(
+            "INSERT INTO timer_events(task_url, project_title, repo, labels, action, at) VALUES (?,?,?,?,?,?)",
+            (task_url, project_title, repo, labels_json or "[]", 'start', now),
+        )
         self.conn.commit()
 
-    def stop_session(self, task_url: str) -> None:
+    def stop_session(self, task_url: str, project_title: Optional[str] = None, repo: Optional[str] = None, labels_json: Optional[str] = None) -> None:
         if not task_url:
             return
         now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -347,6 +366,19 @@ class TaskDB:
         cur.execute(
             "UPDATE work_sessions SET ended_at=? WHERE task_url=? AND ended_at IS NULL",
             (now, task_url),
+        )
+        cur.execute(
+            "INSERT INTO timer_events(task_url, project_title, repo, labels, action, at) VALUES (?,?,?,?,?,?)",
+            (task_url, project_title, repo, labels_json or "[]", 'stop', now),
+        )
+        self.conn.commit()
+
+    def log_timer_event(self, task_url: str, project_title: Optional[str], repo: Optional[str], labels_json: Optional[str], action: str, at_ts: Optional[str] = None) -> None:
+        at_ts = at_ts or dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO timer_events(task_url, project_title, repo, labels, action, at) VALUES (?,?,?,?,?,?)",
+            (task_url, project_title, repo, labels_json or "[]", action, at_ts),
         )
         self.conn.commit()
 
@@ -980,6 +1012,46 @@ def _session(token: str) -> requests.Session:
     s.headers["Authorization"] = f"Bearer {token}"
     s.headers["Accept"] = "application/vnd.github+json"
     return s
+
+
+def _parse_issue_url(url: str) -> Optional[tuple[str,str,int]]:
+    try:
+        m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/(issues|pull)/([0-9]+)", url or "")
+        if not m:
+            return None
+        owner, name, _, num = m.groups()
+        return owner, name, int(num)
+    except Exception:
+        return None
+
+def fetch_labels_for_url(token: Optional[str], url: str) -> List[str]:
+    if not token:
+        return []
+    parts = _parse_issue_url(url)
+    if not parts:
+        return []
+    owner, name, number = parts
+    try:
+        headers = { 'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json' }
+        import requests as _rq
+        r = _rq.get(f'https://api.github.com/repos/{owner}/{name}/issues/{number}', headers=headers, timeout=20)
+        if r.status_code != 200:
+            return []
+        data = r.json() or {}
+        labels = data.get('labels') or []
+        out = []
+        for lab in labels:
+            if isinstance(lab, dict):
+                nm = lab.get('name')
+                if nm:
+                    out.append(str(nm))
+        return out
+    except Exception:
+        try:
+            logging.getLogger('gh_task_viewer').exception('fetch_labels_for_url failed')
+        except Exception:
+            pass
+        return []
 
 def _graphql_raw(session: requests.Session, query: str, variables: Dict[str, object]) -> Dict:
     try:
@@ -3465,15 +3537,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return
         # Toggle: if running -> stop, else start
         if t.url in db.active_task_urls():
-            db.stop_session(t.url)
+            labels = fetch_labels_for_url(token, t.url) if token else []
+            db.stop_session(t.url, t.project_title, t.repo, json.dumps(labels))
             try:
                 logger.info("Stopped timer for %s", t.url)
             except Exception:
                 pass
         else:
-            db.start_session(t.url, t.project_title)
+            labels = fetch_labels_for_url(token, t.url) if token else []
+            db.start_session(t.url, t.project_title, t.repo, json.dumps(labels))
             try:
-                logger.info("Started timer for %s", t.url)
+                logger.info("Started timer for %s labels=%s", t.url, labels)
             except Exception:
                 pass
         invalidate()
