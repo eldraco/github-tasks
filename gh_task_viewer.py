@@ -2325,42 +2325,58 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             frags.pop()
         return frags
 
-    def summarize() -> str:
+    def summarize() -> List[Tuple[str,str]]:
         rows = filtered_rows()
-        if not rows:
-            return "No tasks"
         total = len(rows)
         done_ct = sum(1 for r in rows if r.is_done)
-        def _fmt_hm(total_seconds: int) -> str:
-            s = int(max(0, total_seconds))
-            h, r = divmod(s, 3600)
-            m, _ = divmod(r, 60)
-            return f"{h:d}:{m:02d}"
-        lines: List[str] = [f"User: {cfg.user}", f"Total: {total}", f"Done: {done_ct}"]
-        # per-project stats
-        by_proj: Dict[str, Tuple[int,int]] = {}
-        for r in rows:
-            d, t = by_proj.get(r.project_title, (0,0))
-            by_proj[r.project_title] = (d + (1 if r.is_done else 0), t + 1)
-        # total time by project (all time)
-        proj_time = db.aggregate_project_totals(since_days=None)
-        lines.append("")
-        lines.append("Proj:")
-        for p,(d,t) in sorted(by_proj.items()):
-            pct = 0 if t==0 else int(d*100/t)
-            secs = proj_time.get(p or '', 0)
-            proj_cell = _pad_display(p, 12)
-            lines.append(f"{proj_cell}{d:>2}/{t:<2} {pct:>3}% {_fmt_hm(secs):>6}")
-        lines.append("")
-        lines.append("Filters:")
-        active_search = search_buffer if in_search else search_term
-        lines.append(f"HideDone:{'Y' if hide_done else 'N'} HideNoDate:{'Y' if hide_no_date else 'N'} Unassigned:{'Y' if show_unassigned else 'N'} Created:{'Y' if include_created else 'N'}")
-        lines.append(f"Proj:{_truncate(project_cycle or 'All',10)}")
-        lines.append(f"Today:{'Y' if show_today_only else 'N'}")
-        lines.append(f"Date<=:{date_max or '-'}")
-        lines.append(f"Search:{_truncate(active_search or '-',12)}")
-        lines.append(f"View:{'Iteration' if use_iteration else 'Dates'}")
-        return "\n".join(lines)
+        def _fmt_hm(ts: int) -> str:
+            s = int(max(0, ts)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
+        def _fmt_mmss(ts: int) -> str:
+            s = int(max(0, ts)); m, s = divmod(s, 60); return f"{m:02d}:{s:02d}"
+        # Timer snapshot
+        now_s = task_s = proj_s = 0
+        active_count = 0
+        try:
+            active_count = len(db.active_task_urls())
+        except Exception:
+            active_count = 0
+        if rows:
+            cur = rows[current_index]
+            if cur.url:
+                now_s = db.task_current_elapsed_seconds(cur.url)
+                task_s = db.task_total_seconds(cur.url)
+            if cur.project_title:
+                proj_s = db.project_total_seconds(cur.project_title)
+        active_search_val = (search_buffer if in_search else search_term) or '-'
+        fr: List[Tuple[str,str]] = []
+        fr += [("bold", "Overview\n")]
+        fr += [("ansicyan", f"👤 {cfg.user}\n")]
+        fr += [("", f"📝 Shown: {total:<3} ✅ {done_ct}\n")]
+        fr += [("", f"⏱ Now: {_fmt_mmss(now_s)}\n")]
+        fr += [("", f"🧩 Task: {_fmt_hm(task_s)}\n")]
+        fr += [("", f"📦 Proj: {_fmt_hm(proj_s)}\n")]
+        fr += [("", f"🟢 Active: {active_count}\n")]
+        fr += [("", "\n")]
+        fr += [("bold", "Filters\n")]
+        fr += [("", f"🔎 {_truncate(active_search_val,22)}\n")]
+        fr += [("", f"📁 {_truncate(project_cycle or 'All',22)}\n")]
+        if date_max:
+            fr += [("", f"📅 <= {date_max}\n")]
+        fr += [("", f"☑️ Done:{'Hide' if hide_done else 'Off'} NoDate:{'Hide' if hide_no_date else 'Off'}\n")]
+        # Top 5 projects by time (30d)
+        try:
+            pt30 = db.aggregate_project_totals(since_days=30)
+            tops = sorted(pt30.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            if tops:
+                fr += [("", "\n")]
+                fr += [("bold", "Top Proj (30d)\n")]
+                for name, secs in tops:
+                    fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
+        except Exception:
+            pass
+        if fr and fr[-1][1].endswith("\n"):
+            fr[-1] = (fr[-1][0], fr[-1][1][:-1])
+        return fr
 
     table_control = FormattedTextControl(text=lambda: build_table_fragments())
     table_window = Window(content=table_control, wrap_lines=False, always_hide_cursor=True)
@@ -2553,27 +2569,35 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def build_status_bar() -> str:
         mode = (
-            "DATE" if in_date_filter else (
-            "SEARCH" if in_search else (
-            "DETAIL" if detail_mode else (
-            "REPORT" if show_report else (
-            "HELP" if show_help else "BROWSE"))))
+            "🗓️ DATE" if in_date_filter else (
+            "🔎 SEARCH" if in_search else (
+            "📄 DETAIL" if detail_mode else (
+            "📊 REPORT" if show_report else (
+            "❓ HELP" if show_help else "🧭 BROWSE"))))
         )
-        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned C:created A:add-task D:mark-done I:mark-progress j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all V:iteration ?:help q:quit "
-    # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
-        base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
-        if hide_done:
-            base += "[HideDone] "
-        if hide_no_date:
-            base += "[HideNoDate] "
-        if not include_created:
-            base += "[NoCreated] "
-        if use_iteration:
-            base += "[Iteration] "
-    # project and search are shown on the top status bar
-        if date_max:
-            base += f"[<= {date_max}] "
-        return base + status_line
+        # Minimal, elegant bottom bar with live timers only
+        rows = filtered_rows()
+        now_s = task_s = proj_s = 0
+        active_count = 0
+        try:
+            active_count = len(db.active_task_urls())
+        except Exception:
+            active_count = 0
+        if rows:
+            t = rows[current_index]
+            if t.url:
+                now_s = db.task_current_elapsed_seconds(t.url)
+                task_s = db.task_total_seconds(t.url)
+            if t.project_title:
+                proj_s = db.project_total_seconds(t.project_title)
+        def _mmss(s:int)->str:
+            s = int(max(0, s)); m, s = divmod(s, 60); return f"{m:02d}:{s:02d}"
+        def _hm(s:int)->str:
+            s = int(max(0, s)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
+        base = f" {mode}  ⏱ {_mmss(now_s)}  🧩 {_hm(task_s)}  📦 {_hm(proj_s)}  🟢 {active_count} "
+        if status_line:
+            base += "  " + status_line
+        return base
 
     from prompt_toolkit.layout.containers import Float, FloatContainer
     add_control = FormattedTextControl(text=lambda: build_add_overlay())
