@@ -55,6 +55,7 @@ from prompt_toolkit.layout import HSplit, VSplit, Layout, Window
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import Frame
 try:
     from prompt_toolkit.utils import get_cwidth as _pt_get_cwidth
 except ImportError:  # pragma: no cover - fallback when prompt_toolkit changes API
@@ -3586,30 +3587,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         show_help = not show_help
         floats.clear()
         if show_help:
-            # Pretty help with box and emojis
-            def boxed(title: str, lines: List[str], width: int = 84) -> str:
-                inner = width - 2
-                # Top border
-                out = ["╭" + ("─" * (width-2)) + "╮"]
-                # Title line centered
-                t = f" {title.strip()} "
-                t = t[: max(0, inner-2)]
-                pad = max(0, (inner-2) - len(t))
-                left = pad // 2
-                right = pad - left
-                out.append("│ " + (" "*left) + t + (" "*right) + " │")
-                # Separator
-                out.append("├" + ("─" * (width-2)) + "┤")
-                # Body
-                for ln in lines:
-                    ln = ln.rstrip()
-                    if len(ln) > inner-2:
-                        ln = ln[:inner-5] + "…"
-                    out.append("│ " + ln.ljust(inner-2) + " │")
-                # Bottom border
-                out.append("╰" + ("─" * (width-2)) + "╯")
-                return "\n".join(out)
-
             help_lines = [
                 "🧭 Navigation",
                 "  j/k • arrows        Move selection",
@@ -3647,11 +3624,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "Visual: ⏱ + cyan row = task timer running",
                 "Press ? to close help."
             ]
-            content = boxed("Help", help_lines, width=84)
-            hl_control = FormattedTextControl(text=content)
+            txt = "\n".join(help_lines)
+            hl_control = FormattedTextControl(text=txt)
             from prompt_toolkit.layout.dimension import Dimension
-            floats.append(Float(content=Window(width=84, height=Dimension(preferred=30, max=40), content=hl_control, style="bg:#202020 #ffffff", wrap_lines=False), top=1, left=2))
-        invalidate()
+            # Compute size based on terminal
+            try:
+                from prompt_toolkit.application.current import get_app
+                size = get_app().output.get_size()
+                cols = size.columns
+                rows = size.rows
+            except Exception:
+                cols, rows = 120, 40
+            w = max(60, min(100, cols - 6))
+            h = max(12, min(rows - 4, 32))
+            body = Window(width=Dimension.exact(w-2), height=Dimension.exact(h-2), content=hl_control, wrap_lines=False, always_hide_cursor=True)
+            frame = Frame(body=body, title="Help")
+            floats.append(Float(content=frame, top=1, left=2))
+            invalidate()
 
     # Report bindings
     @kb.add('R', filter=is_normal)
