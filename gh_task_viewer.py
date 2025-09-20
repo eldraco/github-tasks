@@ -1960,54 +1960,63 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def build_add_overlay() -> List[Tuple[str, str]]:
         if not add_mode:
             return []
-        lines: List[str] = []
         step = add_state.get('step', 'project')
-        lines.append("Add Item")
-        lines.append("")
+        body: List[str] = []
+        # Header per step
+        headers = {
+            'mode': '🧷 Choose Type',
+            'project': '📁 Select Project',
+            'repo': '📦 Select Repository',
+            'title': '📝 Enter Title',
+            'date': '📅 Start Date (YYYY-MM-DD)',
+            'iteration': '🔁 Select Iteration',
+            'confirm': '✅ Confirm',
+        }
+        title_head = headers.get(step, '➕ Add Item')
+        # Body lines depending on step
         if step == 'mode':
-            lines.append("Select type (j/k to move, Enter to choose, Esc cancel):")
+            body.append("Use j/k to move, Enter to choose, Esc to cancel")
             choices = add_state.get('mode_choices') or []
             for idx, label in enumerate(choices):
-                prefix = "➤ " if idx == add_state.get('mode_index', 0) else "  "
-                lines.append(f"{prefix}{label}")
+                prefix = "➤" if idx == add_state.get('mode_index', 0) else " "
+                body.append(f" {prefix} {label}")
         elif step == 'project':
-            lines.append("Select project (j/k to move, Enter to choose, Esc cancel):")
+            body.append("Use j/k to move, Enter to choose, Esc to cancel")
             choices = add_state.get('project_choices') or []
             if not choices:
-                lines.append("  (no projects available)")
+                body.append("  (no projects available)")
             for idx, proj in enumerate(choices):
-                prefix = "➤ " if idx == add_state.get('project_index', 0) else "  "
-                lines.append(f"{prefix}{proj.get('project_title')} (#{proj.get('project_number')})")
+                prefix = "➤" if idx == add_state.get('project_index', 0) else " "
+                body.append(f" {prefix} {proj.get('project_title')} (#{proj.get('project_number')})")
         elif step == 'repo':
             choices = add_state.get('repo_choices') or []
             if choices:
-                lines.append("Select repository (j/k to move, Enter to choose, Esc cancel):")
+                body.append("Use j/k to move, Enter to choose, Esc to cancel")
                 for idx, repo_entry in enumerate(choices):
-                    prefix = "➤ " if idx == add_state.get('repo_index', 0) else "  "
-                    lines.append(f"{prefix}{repo_entry.get('repo')}" )
+                    prefix = "➤" if idx == add_state.get('repo_index', 0) else " "
+                    body.append(f" {prefix} {repo_entry.get('repo')}")
             else:
-                lines.append("Enter repository owner/name (Enter to continue, Esc cancel):")
-                lines.append(add_state.get('repo_manual', '') + "_")
+                body.append("Type owner/name, Enter to confirm, Esc to cancel")
+                body.append(add_state.get('repo_manual', '') + "_")
         elif step == 'title':
-            lines.append("Enter task title (Enter to continue, Esc cancel):")
-            title = add_state.get('title', '')
-            lines.append(title + "_")
+            body.append("Type a concise title, Enter to continue, Esc cancel")
+            body.append(add_state.get('title', '') + "_")
         elif step == 'date':
-            lines.append("Enter start date YYYY-MM-DD (Enter to skip, Esc cancel):")
-            lines.append(add_state.get('date', '') + "_")
+            body.append("Enter start date (optional), Enter to skip")
+            body.append(add_state.get('date', '') + "_")
         elif step == 'iteration':
-            lines.append("Select iteration (j/k to move, Enter to choose, Esc cancel):")
+            body.append("Use j/k to move, Enter to choose, Esc cancel")
             choices = add_state.get('iteration_choices') or []
             if not choices:
-                lines.append("  (no iterations configured)")
+                body.append("  (no iterations configured)")
             for idx, opt in enumerate(choices):
-                prefix = "➤ " if idx == add_state.get('iteration_index', 0) else "  "
-                title = opt.get('title') or '(None)'
-                lines.append(f"{prefix}{title}")
+                prefix = "➤" if idx == add_state.get('iteration_index', 0) else " "
+                label = opt.get('title') or '(None)'
+                body.append(f" {prefix} {label}")
         elif step == 'confirm':
             project = _current_add_project()
-            title = add_state.get('title', '').strip()
-            date_val = add_state.get('date', '').strip() or '(none)'
+            tval = add_state.get('title', '').strip()
+            dval = add_state.get('date', '').strip() or '(none)'
             iteration_choice = add_state.get('iteration_choices') or []
             idx = add_state.get('iteration_index', 0)
             iter_label = '(none)'
@@ -2022,18 +2031,37 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     repo_label = repo_choices[max(0, min(repo_idx, len(repo_choices)-1))].get('repo') or '(unknown)'
                 else:
                     repo_label = add_state.get('repo_manual', '(unknown)') or '(unknown)'
-            lines.append("Confirm new task:")
-            lines.append(f" Project : {project.get('project_title') if project else '(unknown)'}")
-            lines.append(f" Type    : {'Issue' if add_state.get('mode', 'issue') == 'issue' else 'Project Task'}")
+            body.append("Review and press Enter to create, Esc cancel")
+            body.append("")
+            body.append(f"📁 Project  : {project.get('project_title') if project else '(unknown)'}")
+            body.append(f"🧷 Type     : {'Issue' if add_state.get('mode', 'issue') == 'issue' else 'Project Task'}")
             if add_state.get('mode', 'issue') == 'issue':
-                lines.append(f" Repo    : {repo_label}")
-            lines.append(f" Title   : {title}")
-            lines.append(f" Date    : {date_val}")
-            lines.append(f" Iteration: {iter_label}")
-            lines.append("")
-            lines.append("Enter to create • Backspace to edit title • Esc cancel")
-        text = "\n".join(lines)
-        return [("", text)]
+                body.append(f"📦 Repo     : {repo_label}")
+            body.append(f"📝 Title    : {tval}")
+            body.append(f"📅 Date     : {dval}")
+            body.append(f"🔁 Iteration: {iter_label}")
+
+        # Box renderer
+        def boxed(title: str, lines: List[str], width: int = 92) -> str:
+            inner = width - 2
+            out = ["╭" + ("─" * (width-2)) + "╮"]
+            t = f" {title.strip()} "
+            t = t[: max(0, inner-2)]
+            pad = max(0, (inner-2) - len(t))
+            left = pad // 2
+            right = pad - left
+            out.append("│ " + (" "*left) + t + (" "*right) + " │")
+            out.append("├" + ("─" * (width-2)) + "┤")
+            for ln in lines:
+                ln = ln.rstrip()
+                if len(ln) > inner-2:
+                    ln = ln[:inner-5] + "…"
+                out.append("│ " + ln.ljust(inner-2) + " │")
+            out.append("╰" + ("─" * (width-2)) + "╯")
+            return "\n".join(out)
+
+        content = boxed(title_head, body, width=92)
+        return [("", content)]
 
     STATUS_KEYWORDS: Dict[str, List[str]] = {
         'done': ["done", "complete", "completed", "finished", "closed", "resolved", "merged", "✅", "✔"],
@@ -2602,7 +2630,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     from prompt_toolkit.layout.containers import Float, FloatContainer
     add_control = FormattedTextControl(text=lambda: build_add_overlay())
     from prompt_toolkit.layout.dimension import Dimension
-    add_window = Window(width=90, height=Dimension(preferred=24, max=40), content=add_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
+    add_window = Window(width=92, height=Dimension(preferred=26, max=44), content=add_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
     floats = []
 
     def close_add_mode(message: Optional[str] = None):
@@ -3558,41 +3586,71 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         show_help = not show_help
         floats.clear()
         if show_help:
+            # Pretty help with box and emojis
+            def boxed(title: str, lines: List[str], width: int = 84) -> str:
+                inner = width - 2
+                # Top border
+                out = ["╭" + ("─" * (width-2)) + "╮"]
+                # Title line centered
+                t = f" {title.strip()} "
+                t = t[: max(0, inner-2)]
+                pad = max(0, (inner-2) - len(t))
+                left = pad // 2
+                right = pad - left
+                out.append("│ " + (" "*left) + t + (" "*right) + " │")
+                # Separator
+                out.append("├" + ("─" * (width-2)) + "┤")
+                # Body
+                for ln in lines:
+                    ln = ln.rstrip()
+                    if len(ln) > inner-2:
+                        ln = ln[:inner-5] + "…"
+                    out.append("│ " + ln.ljust(inner-2) + " │")
+                # Bottom border
+                out.append("╰" + ("─" * (width-2)) + "╯")
+                return "\n".join(out)
+
             help_lines = [
-                "Hotkeys:",
-                "  j/k or arrows  Move selection",
-                "  gg / G         Top / Bottom",
-                "  h/l or arrows  Horizontal scroll",
-                "  Enter          Toggle detail pane",
-                "  W              Toggle work timer for selected task",
-                "  R              Open timer report (day/week/month)",
-                "  X              Export a JSON report (quick)",
-                "  Z              Export a PDF report (quick)",
-                "  /              Start search (type, Enter to apply, Esc cancel)",
-                "  s              Toggle sort (Project/Date)",
-                "  p              Cycle project filter",
-                "  P              Clear project filter (show all)",
-                "  U              Toggle include unassigned (then press u to refetch)",
-                "  d              Toggle done-only filter",
-                "  N              Toggle hide tasks without a date",
-                "  C              Toggle showing created-but-unassigned tasks",
-                "  A              Add a new issue/task",
-                "  V              Toggle iteration/date view",
-                "  D              Mark status as Done",
-                "  I              Mark status as In Progress",
-                "  t / a          Today-only / All dates",
-                "  u              Update (fetch GitHub)",
-                "  ?              Toggle help",
-                "  q / Esc        Quit / Close",
-                f"  Current tasks: {len(filtered_rows())}",
+                "🧭 Navigation",
+                "  j/k • arrows        Move selection",
+                "  gg / G              Top / Bottom",
+                "  h/l • arrows        Horizontal scroll",
+                "  Enter               Toggle detail",
                 "",
-                "Visual cues:",
-                "  ⏱ + cyan row   Task timer running",
+                "🔎 Search & Sort",
+                "  /                   Start search (Enter apply, Esc cancel)",
+                "  s                   Toggle sort (Project/Date)",
                 "",
+                "🎛️ Filters",
+                "  p / P               Cycle / Clear project",
+                "  d                   Hide done",
+                "  N                   Hide no-date",
+                "  F                   Date ≤ YYYY-MM-DD",
+                "  t / a               Today / All",
+                "  C                   Show created (no assignee)",
+                "  V                   Toggle iteration/date view",
+                "",
+                "⏱ Timers & Reports",
+                "  W                   Toggle work timer",
+                "  R                   Open timer report",
+                "  X                   Export JSON report",
+                "  Z                   Export PDF report",
+                "",
+                "🌐 Fetch",
+                "  u                   Update (fetch GitHub)",
+                "",
+                "❓ General",
+                "  ?                   Toggle help",
+                "  q / Esc             Quit / Close",
+                "",
+                f"Current tasks shown: {len(filtered_rows())}",
+                "Visual: ⏱ + cyan row = task timer running",
                 "Press ? to close help."
             ]
-            hl_control = FormattedTextControl(text="\n".join(help_lines))
-            floats.append(Float(content=Window(width=84, height=24, content=hl_control, style="bg:#202020 #ffffff", wrap_lines=True), top=1, left=2))
+            content = boxed("Help", help_lines, width=84)
+            hl_control = FormattedTextControl(text=content)
+            from prompt_toolkit.layout.dimension import Dimension
+            floats.append(Float(content=Window(width=84, height=Dimension(preferred=30, max=40), content=hl_control, style="bg:#202020 #ffffff", wrap_lines=False), top=1, left=2))
         invalidate()
 
     # Report bindings
