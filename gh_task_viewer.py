@@ -1998,13 +1998,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     body.append(f" {prefix} {repo_entry.get('repo')}")
             else:
                 body.append("Type owner/name, Enter to confirm, Esc to cancel")
-                body.append(add_state.get('repo_manual', '') + "_")
+                r = add_state.get('repo_manual', '')
+                cur = max(0, min(len(r), add_state.get('repo_cursor', len(r))))
+                body.append(r[:cur] + "_" + r[cur:])
         elif step == 'title':
             body.append("Type a concise title, Enter to continue, Esc cancel")
-            body.append(add_state.get('title', '') + "_")
+            t = add_state.get('title', '')
+            cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
+            body.append(t[:cur] + "_" + t[cur:])
         elif step == 'date':
             body.append("Enter start date (optional), Enter to skip")
-            body.append(add_state.get('date', '') + "_")
+            d = add_state.get('date', '')
+            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
+            body.append(d[:cur] + "_" + d[cur:])
         elif step == 'iteration':
             body.append("Use j/k to move, Enter to choose, Esc cancel")
             choices = add_state.get('iteration_choices') or []
@@ -3042,22 +3048,85 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         close_add_mode('Add cancelled')
 
+    def _move_cursor(field: str, delta: int):
+        key = f"{field}_cursor"
+        s = add_state.get(field, '')
+        cur = max(0, min(len(s), add_state.get(key, len(s))))
+        cur = max(0, min(len(s), cur + delta))
+        add_state[key] = cur
+
+    def _add_delete_one():
+        step = add_state.get('step')
+        if step == 'title':
+            t = add_state.get('title', '')
+            cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
+            if cur > 0:
+                add_state['title'] = t[:cur-1] + t[cur:]
+                add_state['title_cursor'] = cur-1
+        elif step == 'date':
+            d = add_state.get('date', '')
+            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
+            if cur > 0:
+                add_state['date'] = d[:cur-1] + d[cur:]
+                add_state['date_cursor'] = cur-1
+        elif step == 'repo' and not add_state.get('repo_choices'):
+            r = add_state.get('repo_manual', '')
+            cur = max(0, min(len(r), add_state.get('repo_cursor', len(r))))
+            if cur > 0:
+                add_state['repo_manual'] = r[:cur-1] + r[cur:]
+                add_state['repo_cursor'] = cur-1
+        invalidate()
+
     @kb.add('backspace', filter=is_add_mode)
+    def _(event):
+        _add_delete_one()
+
+    @kb.add('delete', filter=is_add_mode)
+    def _(event):
+        # Forward delete at cursor
+        step = add_state.get('step')
+        changed = False
+        if step == 'title':
+            t = add_state.get('title','')
+            cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
+            if cur < len(t):
+                add_state['title'] = t[:cur] + t[cur+1:]
+                changed = True
+        elif step == 'date':
+            d = add_state.get('date','')
+            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
+            if cur < len(d):
+                add_state['date'] = d[:cur] + d[cur+1:]
+                changed = True
+        elif step == 'repo' and not add_state.get('repo_choices'):
+            r = add_state.get('repo_manual','')
+            cur = max(0, min(len(r), add_state.get('repo_cursor', len(r))))
+            if cur < len(r):
+                add_state['repo_manual'] = r[:cur] + r[cur+1:]
+                changed = True
+        if changed:
+            invalidate()
+
+    @kb.add('left', filter=is_add_mode)
     def _(event):
         step = add_state.get('step')
         if step == 'title':
-            title = add_state.get('title', '')
-            add_state['title'] = title[:-1]
+            _move_cursor('title', -1)
         elif step == 'date':
-            date_buf = add_state.get('date', '')
-            add_state['date'] = date_buf[:-1]
-        elif step == 'confirm':
-            add_state['step'] = 'title'
-        elif step == 'iteration':
-            add_state['step'] = 'date'
+            _move_cursor('date', -1)
         elif step == 'repo' and not add_state.get('repo_choices'):
-            repo_buf = add_state.get('repo_manual', '')
-            add_state['repo_manual'] = repo_buf[:-1]
+            _move_cursor('repo', -1)
+        invalidate()
+
+    @kb.add('right', filter=is_add_mode)
+    def _(event):
+        step = add_state.get('step')
+        if step == 'title':
+            _move_cursor('title', 1)
+        elif step == 'date':
+            _move_cursor('date', 1)
+        elif step == 'repo' and not add_state.get('repo_choices'):
+            _move_cursor('repo', 1)
         invalidate()
 
     def _cycle_add(delta: int):
@@ -3111,15 +3180,21 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         ch = event.data or ""
         if not ch or ch in ('\n', '\r'):
             return
-        add_state['title'] = add_state.get('title', '') + ch
+        t = add_state.get('title','')
+        cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
+        add_state['title'] = t[:cur] + ch + t[cur:]
+        add_state['title_cursor'] = cur + len(ch)
         invalidate()
 
     @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'date'))
     def _(event):
         ch = event.data or ""
         if ch and (ch.isdigit() or ch == '-'):
-            if len(add_state.get('date', '')) < 10:
-                add_state['date'] = add_state.get('date', '') + ch
+            d = add_state.get('date','')
+            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
+            if len(d) < 10:
+                add_state['date'] = d[:cur] + ch + d[cur:]
+                add_state['date_cursor'] = cur + 1
                 invalidate()
 
     @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'repo' and not add_state.get('repo_choices')))
@@ -3127,7 +3202,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         ch = event.data or ""
         if not ch or ch in ('\n', '\r'):
             return
-        add_state['repo_manual'] = add_state.get('repo_manual', '') + ch
+        r = add_state.get('repo_manual','')
+        cur = max(0, min(len(r), add_state.get('repo_cursor', len(r))))
+        add_state['repo_manual'] = r[:cur] + ch + r[cur:]
+        add_state['repo_cursor'] = cur + len(ch)
         invalidate()
 
     @kb.add('enter', filter=is_add_mode)
@@ -3152,11 +3230,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_state['iteration_choices'] = _build_iteration_choices(project) if project else []
             add_state['iteration_index'] = 0
             add_state['step'] = 'title'
+            add_state['title_cursor'] = len(add_state.get('title',''))
         elif step == 'title':
             if not add_state.get('title', '').strip():
                 status_line = 'Title is required'
             else:
                 add_state['step'] = 'date'
+                add_state['date_cursor'] = len(add_state.get('date',''))
         elif step == 'date':
             date_val = add_state.get('date', '').strip()
             if date_val:
@@ -3177,6 +3257,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     add_state['repo_manual'] = add_state.get('repo_manual', '')
                     status_line = 'Enter repository owner/name'
                 add_state['step'] = 'repo'
+                if not repo_choices:
+                    add_state['repo_cursor'] = len(add_state.get('repo_manual',''))
             else:
                 choices = _build_iteration_choices(project) if project else []
                 add_state['iteration_choices'] = choices
@@ -3279,7 +3361,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if show_report:
             show_report = False; floats.clear(); invalidate(); return
 
-    @kb.add('backspace')
+    @kb.add('backspace', filter=Condition(lambda: (not add_mode) and (in_search or in_date_filter)))
     def _(event):
         nonlocal search_buffer, date_buffer, status_line
         if in_search and search_buffer:
