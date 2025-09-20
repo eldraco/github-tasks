@@ -9,6 +9,7 @@
 #   N  toggle hide tasks with no date
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
 #   W  toggle work timer for the selected task (multiple tasks can run)
+#   E  edit work sessions for the selected task
 #   R  open timer report (daily/weekly/monthly aggregates)
 #   X  export a JSON report (quick export)
 #   q  quit
@@ -133,6 +134,7 @@ def load_config(path: str) -> Config:
 
 TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
 USER_ID_CACHE: Dict[str, str] = {}
+_UNSET = object()
 
 
 def _load_target_cache() -> Dict[str, List[Dict[str, object]]]:
@@ -419,6 +421,67 @@ class TaskDB:
             (task_url,),
         )
         return self._sum_rows_seconds(cur.fetchall())
+
+    def get_sessions_for_task(self, task_url: str) -> List[Dict[str, object]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT id, project_title, started_at, ended_at
+            FROM work_sessions
+            WHERE task_url=?
+            ORDER BY started_at DESC, id DESC
+            """,
+            (task_url,),
+        )
+        rows = []
+        for sid, proj, started_at, ended_at in cur.fetchall():
+            rows.append({
+                'id': sid,
+                'project_title': proj,
+                'started_at': started_at,
+                'ended_at': ended_at,
+            })
+        return rows
+
+    def update_session_times(self, session_id: int, *, started_at: object = _UNSET, ended_at: object = _UNSET) -> None:
+        if started_at is _UNSET and ended_at is _UNSET:
+            return
+        cur = self.conn.cursor()
+        fields: List[str] = []
+        params: List[object] = []
+        if started_at is not _UNSET:
+            fields.append("started_at=?")
+            params.append(started_at)
+        if ended_at is not _UNSET:
+            fields.append("ended_at=?")
+            params.append(ended_at)
+        params.append(session_id)
+        cur.execute(f"UPDATE work_sessions SET {', '.join(fields)} WHERE id=?", params)
+        cur.execute("SELECT task_url, project_title FROM work_sessions WHERE id=?", (session_id,))
+        row = cur.fetchone()
+        if row:
+            task_url, project_title = row
+        else:
+            task_url, project_title = '', None
+        self.conn.commit()
+        if task_url:
+            try:
+                self.log_timer_event(task_url, project_title, None, "[]", 'edit')
+            except Exception:
+                pass
+
+    def delete_session(self, session_id: int) -> None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT task_url, project_title FROM work_sessions WHERE id=?", (session_id,))
+        row = cur.fetchone()
+        cur.execute("DELETE FROM work_sessions WHERE id=?", (session_id,))
+        self.conn.commit()
+        if row:
+            task_url, project_title = row
+            try:
+                self.log_timer_event(task_url, project_title, None, "[]", 'delete')
+            except Exception:
+                pass
 
     def project_total_seconds(self, project_title: str) -> int:
         cur = self.conn.cursor()
@@ -1867,6 +1930,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     add_mode = False
     add_state: Dict[str, object] = {}
     add_float: Optional[Float] = None
+    edit_sessions_mode = False
+    session_state: Dict[str, object] = {}
+    session_float: Optional[Float] = None
     update_in_progress = False
     # Inline search buffer (used when in_search == True)
 
@@ -2579,6 +2645,352 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         m, s = divmod(r, 60)
         return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+    def _parse_session_dt(raw: Optional[str]) -> Optional[dt.datetime]:
+        if not raw:
+            return None
+        try:
+            dt_val = dt.datetime.fromisoformat(raw)
+        except Exception:
+            try:
+                dt_val = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        if dt_val.tzinfo is None:
+            local_tz = dt.datetime.now(dt.timezone.utc).astimezone().tzinfo
+            if local_tz is not None:
+                dt_val = dt_val.replace(tzinfo=local_tz)
+        return dt_val.astimezone()
+
+    def _fmt_session_dt(value: Optional[dt.datetime]) -> str:
+        if not value:
+            return '-'
+        return value.astimezone().strftime('%Y-%m-%d %H:%M')
+
+    def _refresh_session_editor(preserve_id: Optional[int] = None) -> None:
+        task_url = session_state.get('task_url') if session_state else None
+        entries: List[Dict[str, object]] = []
+        selected_id = preserve_id or session_state.get('selected_id') if session_state else None
+        if task_url:
+            try:
+                raw_sessions = db.get_sessions_for_task(task_url)
+            except Exception as exc:
+                session_state['message'] = f"Load failed: {exc}"  # type: ignore[index]
+                raw_sessions = []
+            now = dt.datetime.now(dt.timezone.utc).astimezone()
+            for row in raw_sessions:
+                sid = row.get('id')
+                try:
+                    sid_int = int(sid) if sid is not None else None
+                except Exception:
+                    sid_int = None
+                st_raw = row.get('started_at')
+                en_raw = row.get('ended_at')
+                st_dt = _parse_session_dt(st_raw)
+                en_dt = _parse_session_dt(en_raw)
+                duration = 0
+                if st_dt:
+                    start_ref = st_dt.astimezone(dt.timezone.utc)
+                    end_for_calc = (en_dt or now).astimezone(dt.timezone.utc)
+                    duration = max(0, int((end_for_calc - start_ref).total_seconds()))
+                entries.append({
+                    'id': sid_int,
+                    'start_raw': st_raw,
+                    'end_raw': en_raw,
+                    'start_dt': st_dt,
+                    'end_dt': en_dt,
+                    'start_display': _fmt_session_dt(st_dt),
+                    'end_display': _fmt_session_dt(en_dt) if en_dt else ('running...' if en_raw is None else '-'),
+                    'duration': duration,
+                    'open': en_raw is None,
+                })
+        session_state['sessions'] = entries  # type: ignore[index]
+        if not entries:
+            session_state['cursor'] = 0  # type: ignore[index]
+            session_state['selected_id'] = None  # type: ignore[index]
+            session_state['total_duration'] = 0  # type: ignore[index]
+            return
+        target_id = selected_id
+        if target_id is None or not any(e.get('id') == target_id for e in entries):
+            target_id = entries[0].get('id')
+        idx = 0
+        for i, entry in enumerate(entries):
+            if entry.get('id') == target_id:
+                idx = i
+                break
+        session_state['cursor'] = idx  # type: ignore[index]
+        session_state['selected_id'] = entries[idx].get('id')  # type: ignore[index]
+        session_state['total_duration'] = sum(int(e.get('duration') or 0) for e in entries)  # type: ignore[index]
+
+    def _current_session() -> Optional[Dict[str, object]]:
+        sessions = session_state.get('sessions') if session_state else []
+        if not sessions:
+            return None
+        idx = session_state.get('cursor', 0)
+        idx = max(0, min(int(idx), len(sessions)-1))
+        return sessions[idx]
+
+    def _set_session_message(msg: str) -> None:
+        session_state['message'] = msg  # type: ignore[index]
+
+    def _format_input_value(dt_val: Optional[dt.datetime]) -> str:
+        if not dt_val:
+            return ''
+        return dt_val.astimezone().strftime('%Y-%m-%d %H:%M')
+
+    def _parse_user_datetime(value: str, fallback: Optional[dt.datetime]) -> Optional[dt.datetime]:
+        raw = (value or '').strip()
+        if not raw:
+            return None
+        if raw.lower() == 'now':
+            return dt.datetime.now(dt.timezone.utc).astimezone()
+        candidates = [raw, raw.replace(' ', 'T')]
+        tz_hint = (fallback.tzinfo if fallback and fallback.tzinfo else dt.datetime.now(dt.timezone.utc).astimezone().tzinfo)
+        for cand in candidates:
+            try:
+                dt_val = dt.datetime.fromisoformat(cand)
+            except Exception:
+                continue
+            if dt_val.tzinfo is None and tz_hint is not None:
+                dt_val = dt_val.replace(tzinfo=tz_hint)
+            return dt_val.astimezone()
+        return None
+
+    def _move_session_cursor(delta: int) -> None:
+        sessions = session_state.get('sessions') if session_state else []
+        if not sessions:
+            session_state['cursor'] = 0  # type: ignore[index]
+            session_state['selected_id'] = None  # type: ignore[index]
+            return
+        idx = int(session_state.get('cursor', 0) or 0)
+        idx = (idx + delta) % len(sessions)
+        session_state['cursor'] = idx  # type: ignore[index]
+        session_state['selected_id'] = sessions[idx].get('id')  # type: ignore[index]
+        invalidate()
+
+    def open_session_editor() -> None:
+        nonlocal edit_sessions_mode, session_float, session_state, status_line, detail_mode, show_report, in_search, in_date_filter
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate()
+            return
+        task = rows[current_index]
+        if not task.url:
+            status_line = "Selected task missing URL"
+            invalidate()
+            return
+        edit_sessions_mode = True
+        detail_mode = False
+        show_report = False
+        in_search = False
+        in_date_filter = False
+        session_state = {
+            'task_url': task.url,
+            'task_title': task.title or task.url,
+            'project_title': task.project_title or '',
+            'cursor': 0,
+            'sessions': [],
+            'edit_field': None,
+            'input': '',
+            'message': '',
+            'selected_id': None,
+            'total_duration': 0,
+        }
+        _refresh_session_editor()
+        if session_float and session_float in floats:
+            floats.remove(session_float)
+        session_float = Float(content=session_window, top=2, left=4)
+        floats.append(session_float)
+        status_line = 'Timer sessions editor open'
+        invalidate()
+
+    def close_session_editor(message: Optional[str] = None) -> None:
+        nonlocal edit_sessions_mode, session_float, session_state, status_line
+        if session_float and session_float in floats:
+            floats.remove(session_float)
+        session_float = None
+        edit_sessions_mode = False
+        session_state = {}
+        if message is not None:
+            status_line = message
+        invalidate()
+
+    def _begin_session_edit(field: str) -> None:
+        if session_state.get('edit_field') is not None:
+            return
+        current = _current_session()
+        if not current:
+            _set_session_message('No session selected')
+            invalidate()
+            return
+        if field == 'start':
+            default_dt = current.get('start_dt')
+        else:
+            default_dt = current.get('end_dt')
+        session_state['edit_field'] = field  # type: ignore[index]
+        session_state['input'] = _format_input_value(default_dt)  # type: ignore[index]
+        _set_session_message('')
+        invalidate()
+
+    def _cancel_session_edit(message: Optional[str] = None) -> None:
+        session_state['edit_field'] = None  # type: ignore[index]
+        session_state['input'] = ''  # type: ignore[index]
+        if message is not None:
+            _set_session_message(message)
+        invalidate()
+
+    def _commit_session_edit() -> None:
+        nonlocal status_line
+        field = session_state.get('edit_field')
+        if not field:
+            return
+        current = _current_session()
+        if not current:
+            _cancel_session_edit('No session selected')
+            return
+        raw_input = session_state.get('input', '')
+        start_dt = current.get('start_dt')
+        end_dt = current.get('end_dt')
+        session_id = current.get('id')
+        try:
+            session_id_int = int(session_id)
+        except Exception:
+            _cancel_session_edit('Session metadata missing id')
+            return
+        try:
+            if field == 'start':
+                new_start = _parse_user_datetime(raw_input, start_dt or end_dt)
+                if not new_start:
+                    _set_session_message('Invalid start timestamp')
+                    return
+                if end_dt and new_start > end_dt:
+                    _set_session_message('Start must be before end')
+                    return
+                iso_val = new_start.astimezone(dt.timezone.utc).isoformat(timespec='seconds')
+                db.update_session_times(session_id_int, started_at=iso_val)
+                msg = 'Start updated'
+            else:
+                if not raw_input.strip():
+                    new_end = None
+                else:
+                    new_end = _parse_user_datetime(raw_input, end_dt or start_dt or dt.datetime.now(dt.timezone.utc).astimezone())
+                if new_end and start_dt and new_end < start_dt:
+                    _set_session_message('End must be after start')
+                    return
+                iso_val = new_end.astimezone(dt.timezone.utc).isoformat(timespec='seconds') if new_end else None
+                db.update_session_times(session_id_int, ended_at=iso_val)
+                msg = 'End updated' if new_end else 'End cleared'
+            _cancel_session_edit()
+            _refresh_session_editor(preserve_id=session_id_int)
+            _set_session_message(msg)
+            status_line = msg
+            invalidate()
+        except Exception as exc:
+            _set_session_message(f'Update failed: {exc}')
+            invalidate()
+
+    def _adjust_session_end(minutes: int) -> None:
+        nonlocal status_line
+        current = _current_session()
+        if not current:
+            _set_session_message('No session selected')
+            return
+        start_dt = current.get('start_dt')
+        end_dt = current.get('end_dt') or dt.datetime.now(dt.timezone.utc).astimezone()
+        session_id = current.get('id')
+        try:
+            session_id_int = int(session_id)
+        except Exception:
+            _set_session_message('Session metadata missing id')
+            invalidate()
+            return
+        new_end = end_dt + dt.timedelta(minutes=minutes)
+        if start_dt and new_end < start_dt:
+            new_end = start_dt
+        iso_val = new_end.astimezone(dt.timezone.utc).isoformat(timespec='seconds')
+        try:
+            db.update_session_times(session_id_int, ended_at=iso_val)
+        except Exception as exc:
+            _set_session_message(f'Adjust failed: {exc}')
+            return
+        _refresh_session_editor(preserve_id=session_id_int)
+        msg = f'End adjusted by {minutes:+d} min'
+        _set_session_message(msg)
+        status_line = msg
+        invalidate()
+
+    def _delete_current_session() -> None:
+        nonlocal status_line
+        current = _current_session()
+        if not current:
+            _set_session_message('No session selected')
+            invalidate()
+            return
+        session_id = current.get('id')
+        try:
+            session_id_int = int(session_id)
+        except Exception:
+            _set_session_message('Session metadata missing id')
+            invalidate()
+            return
+        try:
+            db.delete_session(session_id_int)
+        except Exception as exc:
+            _set_session_message(f'Delete failed: {exc}')
+            return
+        _refresh_session_editor()
+        _set_session_message('Session deleted')
+        status_line = 'Session deleted'
+        invalidate()
+
+
+    def build_session_editor_text() -> List[Tuple[str, str]]:
+        if not edit_sessions_mode:
+            return []
+        title = session_state.get('task_title') or session_state.get('task_url') or 'Timer Sessions'
+        project_title = session_state.get('project_title') or ''
+        sessions = session_state.get('sessions') or []
+        cursor = int(session_state.get('cursor', 0) or 0)
+        total_secs = int(session_state.get('total_duration', 0) or 0)
+        edit_field = session_state.get('edit_field')
+        buffer_val = session_state.get('input', '')
+        message = session_state.get('message', '')
+        lines: List[str] = []
+        lines.append(f"Timer Sessions - {title}")
+        if project_title:
+            lines.append(f"Project: {project_title}")
+        lines.append("")
+        if not sessions:
+            lines.append("  No recorded sessions for this task.")
+        else:
+            lines.append(f"  Total logged: {_fmt_hms_full(total_secs)}")
+            lines.append("")
+            for idx, sess in enumerate(sessions):
+                marker = '>' if idx == cursor else ' '
+                start_disp = sess.get('start_display') or '-'
+                end_disp = sess.get('end_display') or '-'
+                dur_disp = _fmt_hms_full(int(sess.get('duration') or 0))
+                running_flag = ' ⏱' if sess.get('open') else ''
+                lines.append(f"{marker} {idx+1:02d}  {start_disp}  ->  {end_disp:<19}  {dur_disp:>9}{running_flag}")
+        lines.append("")
+        if edit_field:
+            lines.append(f"Editing {edit_field} (Enter=save | Esc=cancel)")
+            lines.append(f"Value: {buffer_val}")
+        else:
+            lines.append("Commands: Enter=end  S=start  +/- adjust 5m  </> adjust 1m  x/Del delete  R=refresh  Esc/q close")
+            lines.append("Tip: Provide 'YYYY-MM-DD HH:MM' or ISO timestamps when editing.")
+        if message:
+            lines.append("")
+            lines.append(message)
+        block = "\n".join(lines)
+        if '\n' in block:
+            head, rest = block.split('\n', 1)
+            return [("bold", head), ("", "\n" + rest)]
+        return [("bold", block)]
+
+    session_control = FormattedTextControl(text=lambda: build_session_editor_text())
+    session_window = Window(width=96, height=24, content=session_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
+
     def build_report_text() -> List[Tuple[str,str]]:
         lines: List[str] = []
         # current selection snapshot
@@ -2720,13 +3132,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return f"{m:02d}:{s:02d}"
 
     def build_status_bar() -> str:
-        mode = (
-            "🗓️ DATE" if in_date_filter else (
-            "🔎 SEARCH" if in_search else (
-            "📄 DETAIL" if detail_mode else (
-            "📊 REPORT" if show_report else (
-            "❓ HELP" if show_help else "🧭 BROWSE"))))
-        )
+        if in_date_filter:
+            mode = "🗓️ DATE"
+        elif in_search:
+            mode = "🔎 SEARCH"
+        elif detail_mode:
+            mode = "📄 DETAIL"
+        elif show_report:
+            mode = "📊 REPORT"
+        elif edit_sessions_mode:
+            mode = "TIMER EDIT"
+        elif show_help:
+            mode = "❓ HELP"
+        else:
+            mode = "🧭 BROWSE"
         # Minimal, elegant bottom bar with live timers only
         rows = filtered_rows()
         now_s = task_s = proj_s = 0
@@ -2776,8 +3195,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_date = Condition(lambda: in_date_filter)
     is_detail = Condition(lambda: detail_mode)
     is_add_mode = Condition(lambda: add_mode)
-    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode)
-    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode))
+    is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
+    is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
+    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode)
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -2922,6 +3343,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('q')
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
+        if edit_sessions_mode:
+            if session_state.get('edit_field') is not None:
+                _cancel_session_edit('Edit cancelled')
+            else:
+                close_session_editor('Timer editor closed')
+            return
         if add_mode:
             close_add_mode('Add cancelled')
             return
@@ -2948,6 +3375,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('enter')
     def _(event):
         nonlocal detail_mode, show_report
+        if edit_sessions_mode:
+            if session_state.get('edit_field') is not None:
+                _commit_session_edit()
+            else:
+                _begin_session_edit('end')
+            return
         if in_search:
             finalize_search(); return
         if in_date_filter:
@@ -3122,6 +3555,70 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         include_created = not include_created
         current_index = 0
         status_line = 'Including created tasks' if include_created else 'Hiding created-only tasks'
+        invalidate()
+
+    @kb.add('E', filter=is_normal)
+    def _(event):
+        open_session_editor()
+
+    @kb.add('j', filter=is_session_idle)
+    @kb.add('down', filter=is_session_idle)
+    def _(event):
+        _move_session_cursor(1)
+
+    @kb.add('k', filter=is_session_idle)
+    @kb.add('up', filter=is_session_idle)
+    def _(event):
+        _move_session_cursor(-1)
+
+    @kb.add('s', filter=is_session_idle)
+    def _(event):
+        _begin_session_edit('start')
+
+    @kb.add('r', filter=is_session_idle)
+    def _(event):
+        _refresh_session_editor(session_state.get('selected_id'))
+        invalidate()
+
+    @kb.add('+', filter=is_session_idle)
+    @kb.add('=', filter=is_session_idle)
+    def _(event):
+        _adjust_session_end(5)
+
+    @kb.add('-', filter=is_session_idle)
+    @kb.add('_', filter=is_session_idle)
+    def _(event):
+        _adjust_session_end(-5)
+
+    @kb.add('>', filter=is_session_idle)
+    def _(event):
+        _adjust_session_end(1)
+
+    @kb.add('<', filter=is_session_idle)
+    def _(event):
+        _adjust_session_end(-1)
+
+    @kb.add('x', filter=is_session_idle)
+    @kb.add('delete', filter=is_session_idle)
+    def _(event):
+        _delete_current_session()
+
+    @kb.add('backspace', filter=is_session_input)
+    def _(event):
+        buf = session_state.get('input', '')
+        if buf:
+            session_state['input'] = buf[:-1]  # type: ignore[index]
+        invalidate()
+
+    @kb.add(Keys.Any, filter=is_session_input)
+    def _(event):
+        ch = event.data or ''
+        if not ch or ch in ('\n', '\r'):
+            return
+        buf = session_state.get('input', '')
+        if len(buf) >= 64:
+            return
+        session_state['input'] = buf + ch  # type: ignore[index]
         invalidate()
 
     @kb.add('A', filter=is_normal)
@@ -3475,6 +3972,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('escape')
     def _(event):
         nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
+        if edit_sessions_mode:
+            if session_state.get('edit_field') is not None:
+                _cancel_session_edit('Edit cancelled')
+            else:
+                close_session_editor('Timer editor closed')
+            return
         if add_mode:
             close_add_mode('Add cancelled')
             return
@@ -3823,6 +4326,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "🛠 Task Actions",
                 "  A                   Add issue / project task",
                 "  D / I               Set status Done / In Progress",
+                "  E                   Edit work sessions",
                 "",
                 "⏱ Timers & Reports",
                 "  W                   Toggle work timer",
