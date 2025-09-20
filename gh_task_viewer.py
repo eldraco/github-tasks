@@ -964,6 +964,17 @@ GQL_MUTATION_ADD_PROJECT_ITEM = """mutation($projectId:ID!, $contentId:ID!) {
 
 GQL_QUERY_REPO = """query($owner:String!, $name:String!){ repository(owner:$owner, name:$name){ id nameWithOwner } }"""
 
+GQL_PROJECT_FIELDS = """query($id:ID!){
+  node(id:$id){
+    ... on ProjectV2{
+      fields(first:100){
+        nodes{ ... on ProjectV2FieldCommon { id name } }
+      }
+    }
+  }
+}
+"""
+
 def _session(token: str) -> requests.Session:
     s = requests.Session()
     s.headers["Authorization"] = f"Bearer {token}"
@@ -1101,6 +1112,11 @@ def create_project_draft(token: str, project_id: str, title: str, body: str = ""
     resp = _graphql_with_backoff(session, GQL_MUTATION_CREATE_DRAFT, variables)
     errs = resp.get("errors") or []
     if errs:
+        import logging
+        try:
+            logging.getLogger('gh_task_viewer').error("create_project_draft error: %s", errs)
+        except Exception:
+            pass
         raise RuntimeError("Create task failed: " + "; ".join(e.get("message", str(e)) for e in errs))
     try:
         return ((resp.get("data") or {}).get("addProjectV2DraftIssue") or {}).get("projectItem", {}).get("id") or ""
@@ -1121,6 +1137,11 @@ def set_project_date(token: str, project_id: str, item_id: str, field_id: str, d
     resp = _graphql_with_backoff(session, GQL_MUTATION_SET_DATE, variables)
     errs = resp.get("errors") or []
     if errs:
+        import logging
+        try:
+            logging.getLogger('gh_task_viewer').error("set_project_date error: %s", errs)
+        except Exception:
+            pass
         raise RuntimeError("Setting date failed: " + "; ".join(e.get("message", str(e)) for e in errs))
 
 
@@ -1205,6 +1226,10 @@ def add_project_item(token: str, project_id: str, content_id: str) -> str:
     resp = _graphql_with_backoff(session, GQL_MUTATION_ADD_PROJECT_ITEM, variables)
     errs = resp.get("errors") or []
     if errs:
+        try:
+            logging.getLogger('gh_task_viewer').error("add_project_item error: %s", errs)
+        except Exception:
+            pass
         raise RuntimeError("Add issue to project failed: " + "; ".join(e.get("message", str(e)) for e in errs))
     item = ((resp.get("data") or {}).get("addProjectV2ItemById") or {}).get("item") or {}
     return item.get("id") or ""
@@ -1244,6 +1269,23 @@ def discover_open_projects(session: requests.Session, owner_type: str, owner: st
             )
         nodes = (((resp.get("data") or {}).get("user") or {}).get("projectsV2") or {}).get("nodes") or []
     return [n for n in nodes if n is not None and isinstance(n, dict) and not n.get("closed")]
+
+def get_project_field_id_by_name(token: str, project_id: str, name_lower: str) -> Optional[str]:
+    if not project_id:
+        return None
+    session = _session(token)
+    resp = _graphql_with_backoff(session, GQL_PROJECT_FIELDS, {"id": project_id})
+    errs = resp.get("errors") or []
+    if errs:
+        return None
+    node = (resp.get("data") or {}).get("node") or {}
+    fields = ((node.get("fields") or {}).get("nodes")) or []
+    target = (name_lower or '').strip().lower()
+    for f in fields:
+        nm = (f.get("name") or '').strip().lower()
+        if nm == target:
+            return f.get("id") or None
+    return None
 
 
 # -----------------------------
@@ -2007,7 +2049,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
             body.append(t[:cur] + "_" + t[cur:])
         elif step == 'date':
-            body.append("Enter start date (optional), Enter to skip")
+            body.append("Enter Focus Day (YYYY-MM-DD), Enter to accept")
             d = add_state.get('date', '')
             cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
             body.append(d[:cur] + "_" + d[cur:])
@@ -2045,7 +2087,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if add_state.get('mode', 'issue') == 'issue':
                 body.append(f"📦 Repo     : {repo_label}")
             body.append(f"📝 Title    : {tval}")
-            body.append(f"📅 Date     : {dval}")
+            # Clarify that Start is today (auto) and Date is Focus Day
+            today = dt.date.today().isoformat()
+            body.append(f"🗓️ Start    : {today} (auto)")
+            body.append(f"📅 Focus    : {dval}")
             body.append(f"🔁 Iteration: {iter_label}")
 
         # Box renderer
@@ -2731,7 +2776,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             update_in_progress = False
             invalidate()
 
-    async def create_task_async(project_choice: Dict[str, object], title: str, date_val: str, iteration_id: str, mode: str, repo_choice: Optional[Dict[str, str]], repo_manual: Optional[str]):
+    async def create_task_async(project_choice: Dict[str, object], title: str, focus_val: str, iteration_id: str, mode: str, repo_choice: Optional[Dict[str, str]], repo_manual: Optional[str]):
         nonlocal status_line
         if not token:
             status_line = "GITHUB_TOKEN required to add tasks"
@@ -2768,9 +2813,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 item_id = await loop.run_in_executor(None, lambda: create_project_draft(token, project_id, title))
                 if not item_id:
                     raise RuntimeError('GitHub did not return item id')
+            # Always set start date to today if the project has a date field
+            today_iso = dt.date.today().isoformat()
             start_field_id = project_choice.get('start_field_id') or ''
-            if date_val and start_field_id:
-                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, date_val))
+            if start_field_id:
+                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, today_iso))
+            # Optionally set Focus Day to requested value
+            if focus_val:
+                focus_field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, 'focus day'))
+                if focus_field_id:
+                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, focus_field_id, focus_val))
             iteration_field_id = project_choice.get('iteration_field_id') or ''
             if iteration_id and iteration_field_id:
                 await loop.run_in_executor(None, lambda: set_project_iteration(token, project_id, item_id, iteration_field_id, iteration_id))
@@ -2785,6 +2837,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, [user_id]))
         except Exception as exc:
             status_line = f"Create failed: {exc}"
+            try:
+                logger.exception("Create task failed: %s", exc)
+            except Exception:
+                pass
         else:
             status_line = "Issue created; refreshing…" if mode == 'issue' else "Task created; refreshing…"
             asyncio.create_task(update_worker())
@@ -3235,9 +3291,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if not add_state.get('title', '').strip():
                 status_line = 'Title is required'
             else:
+                # Pre-fill start date = today (used implicitly), and ask for Focus Day (defaults today)
+                today = dt.date.today().isoformat()
+                add_state['date'] = today
+                add_state['date_cursor'] = len(today)
                 add_state['step'] = 'date'
                 add_state['date_cursor'] = len(add_state.get('date',''))
         elif step == 'date':
+            # 'date' here represents Focus Day; start date is set automatically to today
             date_val = add_state.get('date', '').strip()
             if date_val:
                 try:
@@ -3246,10 +3307,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     status_line = "Invalid date format"
                     invalidate(); return
             project = _current_add_project()
-            if date_val and project and not project.get('start_field_id'):
-                status_line = 'Project has no writable date field; date ignored'
-                add_state['date'] = ''
-                date_val = ''
             mode = add_state.get('mode', 'issue')
             if mode == 'issue':
                 repo_choices = add_state.get('repo_choices') or []
