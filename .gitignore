@@ -3,3 +3,10 @@ venv
 config_gh_task.yml
 *.json
 *.pdf
+config.yaml
+*.db
+.*.db
+*.log
+*.db-shm
+.gitignore
+*.db-wal

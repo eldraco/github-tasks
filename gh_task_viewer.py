@@ -41,6 +41,7 @@ import sqlite3
 import sys
 import string
 import json
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Iterable, Set
 
@@ -51,8 +52,13 @@ from prompt_toolkit import Application
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, VSplit, Layout, Window
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
+try:
+    from prompt_toolkit.utils import get_cwidth as _pt_get_cwidth
+except ImportError:  # pragma: no cover - fallback when prompt_toolkit changes API
+    _pt_get_cwidth = None
 # Buffer-based input removed; keep core controls only
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.filters import Condition
@@ -75,6 +81,7 @@ class Config:
     user: str
     date_field_regex: str
     projects: List[ProjectSpec]
+    iteration_field_regex: Optional[str] = None
 
 
 def _compile_date_regex(raw: dict) -> str:
@@ -86,6 +93,15 @@ def _compile_date_regex(raw: dict) -> str:
     return raw.get("date_field_regex") or "start"
 
 
+def _compile_iteration_regex(raw: dict) -> Optional[str]:
+    names = raw.get("iteration_field_names")
+    if names and isinstance(names, list) and names:
+        parts = [f"^{re.escape(n)}$" for n in names]
+        return "|".join(parts)
+    it_regex = raw.get("iteration_field_regex")
+    return it_regex or None
+
+
 def load_config(path: str) -> Config:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
@@ -93,6 +109,7 @@ def load_config(path: str) -> Config:
     if not user:
         raise ValueError("Config: 'user' is required.")
     dfr = _compile_date_regex(raw)
+    ifr = _compile_iteration_regex(raw)
     prjs: List[ProjectSpec] = []
     for item in raw.get("projects", []):
         nums_raw = item.get("numbers", None)
@@ -106,7 +123,40 @@ def load_config(path: str) -> Config:
             prjs.append(ProjectSpec("user", item["user"], nums))
         else:
             raise ValueError(f"Project entry needs 'org' or 'user': {item}")
-    return Config(user=user, date_field_regex=dfr, projects=prjs)
+    return Config(user=user, date_field_regex=dfr, projects=prjs, iteration_field_regex=ifr)
+
+
+# -----------------------------
+# Project discovery cache
+# -----------------------------
+
+TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
+USER_ID_CACHE: Dict[str, str] = {}
+
+
+def _load_target_cache() -> Dict[str, List[Dict[str, object]]]:
+    try:
+        with open(TARGET_CACHE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_target_cache(data: Dict[str, List[Dict[str, object]]]) -> None:
+    try:
+        directory = os.path.dirname(TARGET_CACHE_PATH)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+        with open(TARGET_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        try:
+            logging.getLogger('gh_task_viewer').warning("Unable to write project cache", exc_info=True)
+        except Exception:
+            pass
 
 
 # -----------------------------
@@ -122,12 +172,31 @@ class TaskRow:
     start_date: str
     focus_field: str
     focus_date: str
-    title: str
-    repo: Optional[str]
-    url: str
-    updated_at: str
+    iteration_field: str = ""
+    iteration_title: str = ""
+    iteration_start: str = ""
+    iteration_duration: int = 0
+    title: str = ""
+    repo_id: str = ""
+    repo: Optional[str] = None
+    url: str = ""
+    updated_at: str = ""
     status: Optional[str] = None  # textual status (eg. In Progress, Done)
     is_done: int = 0              # 1 if done / completed
+    assigned_to_me: int = 0       # 1 if explicitly assigned
+    created_by_me: int = 0        # 1 if authored/created by me
+    item_id: str = ""
+    project_id: str = ""
+    status_field_id: str = ""
+    status_option_id: str = ""
+    status_options: str = "[]"
+    status_dirty: int = 0
+    status_pending_option_id: str = ""
+    start_field_id: str = ""
+    iteration_field_id: str = ""
+    iteration_options: str = "[]"
+    assignee_field_id: str = ""
+    assignee_user_ids: str = "[]"
 
 
 class TaskDB:
@@ -135,7 +204,10 @@ class TaskDB:
         "owner_type","owner","project_number","project_title",
         "start_field","start_date",
         "focus_field","focus_date",
-        "title","repo","url","updated_at","status","is_done"
+        "iteration_field","iteration_title","iteration_start","iteration_duration",
+        "title","repo_id","repo","url","updated_at","status","is_done","assigned_to_me","created_by_me",
+        "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id",
+        "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids"
     ]
     CREATE_TABLE_SQL = """      CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,12 +219,31 @@ class TaskDB:
         start_date TEXT NOT NULL,
         focus_field TEXT NOT NULL,
         focus_date TEXT NOT NULL,
+        iteration_field TEXT,
+        iteration_title TEXT,
+        iteration_start TEXT,
+        iteration_duration INTEGER DEFAULT 0,
         title TEXT NOT NULL,
+        repo_id TEXT,
         repo TEXT,
         url TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         status TEXT,
         is_done INTEGER DEFAULT 0,
+        assigned_to_me INTEGER DEFAULT 0,
+        created_by_me INTEGER DEFAULT 0,
+        item_id TEXT,
+        project_id TEXT,
+        status_field_id TEXT,
+        status_option_id TEXT,
+        status_options TEXT,
+        status_dirty INTEGER DEFAULT 0,
+        status_pending_option_id TEXT,
+        start_field_id TEXT,
+        iteration_field_id TEXT,
+        iteration_options TEXT,
+        assignee_field_id TEXT,
+        assignee_user_ids TEXT,
         UNIQUE(owner_type, owner, project_number, title, url, start_field, start_date)
       )
     """
@@ -195,8 +286,14 @@ class TaskDB:
             "owner_type":"''","owner":"''","project_number":"0","project_title":"''",
             "start_field":"''","start_date":"''",
             "focus_field":"''","focus_date":"''",
-            "title":"''","repo":"NULL","url":"''",
+            "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
+            "title":"''","repo_id":"''","repo":"NULL","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
+            "assigned_to_me":"0","created_by_me":"0",
+            "item_id":"''","project_id":"''","status_field_id":"''","status_option_id":"''",
+            "status_options":"'[]'","status_dirty":"0","status_pending_option_id":"''",
+            "start_field_id":"''","iteration_field_id":"''","iteration_options":"'[]'",
+            "assignee_field_id":"''","assignee_user_ids":"'[]'",
         }
         sel = ", ".join([c if c in cols else defaults[c] for c in self.SCHEMA_COLUMNS])
         cur.execute(
@@ -343,6 +440,24 @@ class TaskDB:
         except Exception:
             return {}
 
+    def recent_repositories(self, limit: int = 20) -> List[Tuple[str, str]]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT repo, repo_id, MAX(updated_at) as u
+                FROM tasks
+                WHERE repo IS NOT NULL AND repo<>'' AND repo_id IS NOT NULL AND repo_id<>''
+                GROUP BY repo, repo_id
+                ORDER BY u DESC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+            return [(row[0], row[1]) for row in cur.fetchall() if row[0] and row[1]]
+        except Exception:
+            return []
+
     # ---- Aggregations for reports ----
     def _period_key(self, d: dt.datetime, granularity: str) -> str:
         if granularity == 'day':
@@ -465,6 +580,30 @@ class TaskDB:
                 cur_dt = seg_end
         return out
 
+    def mark_status_pending(self, url: str, status_text: str, option_id: str, is_done: int) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status=?, is_done=?, status_dirty=1, status_pending_option_id=?, status_option_id=? WHERE url=?",
+            (status_text, int(is_done), option_id or '', option_id or '', url),
+        )
+        self.conn.commit()
+
+    def mark_status_synced(self, url: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status_dirty=0, status_pending_option_id='' WHERE url=?",
+            (url,),
+        )
+        self.conn.commit()
+
+    def reset_status(self, url: str, status_text: str, option_id: str, is_done: int) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status=?, is_done=?, status_option_id=?, status_dirty=0, status_pending_option_id='' WHERE url=?",
+            (status_text, int(is_done), option_id or '', url),
+        )
+        self.conn.commit()
+
     def upsert_many(self, rows: List[TaskRow]):
         if not rows:
             return
@@ -474,14 +613,35 @@ class TaskDB:
               owner_type, owner, project_number, project_title,
               start_field, start_date,
               focus_field, focus_date,
-              title, repo, url, updated_at, status, is_done
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              iteration_field, iteration_title, iteration_start, iteration_duration,
+              title, repo_id, repo, url, updated_at, status, is_done, assigned_to_me, created_by_me,
+              item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
+              start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
                           updated_at=excluded.updated_at,
                           status=excluded.status,
-                          is_done=excluded.is_done
+                          is_done=excluded.is_done,
+                          iteration_field=excluded.iteration_field,
+                          iteration_title=excluded.iteration_title,
+                          iteration_start=excluded.iteration_start,
+                          iteration_duration=excluded.iteration_duration,
+                          assigned_to_me=excluded.assigned_to_me,
+                          created_by_me=excluded.created_by_me,
+                          item_id=excluded.item_id,
+                          project_id=excluded.project_id,
+                          status_field_id=excluded.status_field_id,
+                          status_option_id=excluded.status_option_id,
+                          status_options=excluded.status_options,
+                          status_dirty=excluded.status_dirty,
+                          status_pending_option_id=excluded.status_pending_option_id,
+                          start_field_id=excluded.start_field_id,
+                          iteration_field_id=excluded.iteration_field_id,
+                          iteration_options=excluded.iteration_options,
+                          assignee_field_id=excluded.assignee_field_id,
+                          assignee_user_ids=excluded.assignee_user_ids
             """,
             [
                 (
@@ -493,12 +653,31 @@ class TaskDB:
                     r.start_date,
                     r.focus_field,
                     r.focus_date,
+                    r.iteration_field,
+                    r.iteration_title,
+                    r.iteration_start,
+                    r.iteration_duration,
                     r.title,
+                    r.repo_id,
                     r.repo,
                     r.url,
                     r.updated_at,
                     r.status,
                     r.is_done,
+                    r.assigned_to_me,
+                    r.created_by_me,
+                    r.item_id,
+                    r.project_id,
+                    r.status_field_id,
+                    r.status_option_id,
+                    r.status_options,
+                    int(r.status_dirty),
+                    r.status_pending_option_id,
+                    r.start_field_id,
+                    r.iteration_field_id,
+                    r.iteration_options,
+                    r.assignee_field_id,
+                    r.assignee_user_ids,
                 )
                 for r in rows
             ],
@@ -518,7 +697,11 @@ class TaskDB:
             today = today or dt.date.today().isoformat()
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,title,repo,url,updated_at,status,is_done
+                       start_date,focus_field,focus_date,
+                       iteration_field,iteration_title,iteration_start,iteration_duration,
+                       title,repo_id,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
+                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
                 FROM tasks WHERE focus_date = ?
                 ORDER BY project_title, focus_date, repo, title
                 """,
@@ -527,7 +710,11 @@ class TaskDB:
         else:
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,title,repo,url,updated_at,status,is_done
+                       start_date,focus_field,focus_date,
+                       iteration_field,iteration_title,iteration_start,iteration_duration,
+                       title,repo_id,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
+                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
                 FROM tasks
                 ORDER BY project_title, focus_date, repo, title
                 """
@@ -541,7 +728,7 @@ class TaskDB:
 GQL_LIST_ORG_PROJECTS = """query($login:String!) {
   organization(login:$login){
     projectsV2(first:50, orderBy:{field:UPDATED_AT,direction:DESC}) {
-      nodes { number title url closed }
+      nodes { id number title url closed }
     }
   }
 }
@@ -549,7 +736,7 @@ GQL_LIST_ORG_PROJECTS = """query($login:String!) {
 GQL_LIST_USER_PROJECTS = """query($login:String!) {
   user(login:$login){
     projectsV2(first:50, orderBy:{field:UPDATED_AT,direction:DESC}) {
-      nodes { number title url closed }
+      nodes { id number title url closed }
     }
   }
 }
@@ -560,16 +747,22 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
       items(first:100, after:$after){
         pageInfo{ hasNextPage endCursor }
         nodes{
+          id
           content{
             __typename
-            ... on DraftIssue { title }
+            ... on DraftIssue {
+              title
+              creator { login }
+            }
             ... on Issue {
-              title url repository{ nameWithOwner }
-              assignees(first:50){ nodes{ login } }
+              title url repository{ id nameWithOwner }
+              assignees(first:50){ nodes{ id login } }
+              author { login }
             }
             ... on PullRequest {
-              title url repository{ nameWithOwner }
-              assignees(first:50){ nodes{ login } }
+              title url repository{ id nameWithOwner }
+              assignees(first:50){ nodes{ id login } }
+              author { login }
             }
           }
                     fieldValues(first:50){
@@ -577,19 +770,41 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
                             __typename
                             ... on ProjectV2ItemFieldDateValue {
                                 date
-                                field { ... on ProjectV2FieldCommon { name } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldUserValue {
-                                users(first:50){ nodes{ login } }
-                                field { ... on ProjectV2FieldCommon { name } }
+                                users(first:50){ nodes{ id login } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldSingleSelectValue {
                                 name
-                                field { ... on ProjectV2FieldCommon { name } }
+                                optionId
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                  ... on ProjectV2SingleSelectField {
+                                    id
+                                    name
+                                    options { id name }
+                                  }
+                                }
+                            }
+                            ... on ProjectV2ItemFieldIterationValue {
+                                title
+                                startDate
+                                duration
+                                iterationId
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                  ... on ProjectV2IterationField {
+                                    id
+                                    name
+                                    configuration { iterations { id title startDate duration } }
+                                  }
+                                }
                             }
                         }
                     }
-          project{ title url }
+          project{ title url id }
         }
       }
     }
@@ -602,16 +817,22 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
       items(first:100, after:$after){
         pageInfo{ hasNextPage endCursor }
         nodes{
+          id
           content{
             __typename
-            ... on DraftIssue { title }
+            ... on DraftIssue {
+              title
+              creator { login }
+            }
             ... on Issue {
-              title url repository{ nameWithOwner }
-              assignees(first:50){ nodes{ login } }
+              title url repository{ id nameWithOwner }
+              assignees(first:50){ nodes{ id login } }
+              author { login }
             }
             ... on PullRequest {
-              title url repository{ nameWithOwner }
-              assignees(first:50){ nodes{ login } }
+              title url repository{ id nameWithOwner }
+              assignees(first:50){ nodes{ id login } }
+              author { login }
             }
           }
                     fieldValues(first:50){
@@ -619,25 +840,128 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
                             __typename
                             ... on ProjectV2ItemFieldDateValue {
                                 date
-                                field { ... on ProjectV2FieldCommon { name } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldUserValue {
-                                users(first:50){ nodes{ login } }
-                                field { ... on ProjectV2FieldCommon { name } }
+                                users(first:50){ nodes{ id login } }
+                                field { ... on ProjectV2FieldCommon { id name } }
                             }
                             ... on ProjectV2ItemFieldSingleSelectValue {
                                 name
-                                field { ... on ProjectV2FieldCommon { name } }
+                                optionId
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                  ... on ProjectV2SingleSelectField {
+                                    id
+                                    name
+                                    options { id name }
+                                  }
+                                }
+                            }
+                            ... on ProjectV2ItemFieldIterationValue {
+                                title
+                                startDate
+                                duration
+                                iterationId
+                                field {
+                                  ... on ProjectV2FieldCommon { id name }
+                                  ... on ProjectV2IterationField {
+                                    id
+                                    name
+                                    configuration { iterations { id title startDate duration } }
+                                  }
+                                }
                             }
                         }
                     }
-          project{ title url }
+          project{ title url id }
         }
       }
     }
   }
 }
 """
+
+GQL_MUTATION_SET_STATUS = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{singleSelectOptionId:$optionId}
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
+GQL_MUTATION_CREATE_DRAFT = """mutation($projectId:ID!, $title:String!, $body:String) {
+  addProjectV2DraftIssue(input:{projectId:$projectId, title:$title, body:$body}){
+    projectItem{ id }
+  }
+}
+"""
+
+GQL_MUTATION_SET_DATE = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $date:Date!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{date:$date}
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
+GQL_MUTATION_SET_ITERATION = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $iterationId:ID!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{iterationId:$iterationId}
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
+GQL_MUTATION_SET_USERS = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $userIds:[ID!]!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{userIds:$userIds}
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
+GQL_QUERY_USER_ID = """query($login:String!){ user(login:$login){ id login } }"""
+
+GQL_MUTATION_CREATE_ISSUE = """mutation($repositoryId:ID!, $title:String!, $body:String, $assigneeIds:[ID!]) {
+  createIssue(input:{repositoryId:$repositoryId, title:$title, body:$body, assigneeIds:$assigneeIds}){
+    issue{ id url }
+  }
+}
+"""
+
+GQL_MUTATION_ADD_PROJECT_ITEM = """mutation($projectId:ID!, $contentId:ID!) {
+  addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
+    item{ id }
+  }
+}
+"""
+
+GQL_QUERY_REPO = """query($owner:String!, $name:String!){ repository(owner:$owner, name:$name){ id nameWithOwner } }"""
 
 def _session(token: str) -> requests.Session:
     s = requests.Session()
@@ -747,14 +1071,178 @@ def _graphql_with_backoff(
             continue
         return resp
 
+
+def set_project_status(token: str, project_id: str, item_id: str, field_id: str, option_id: str) -> None:
+    if not token:
+        raise RuntimeError("Cannot update status without GITHUB_TOKEN")
+    if not (project_id and item_id and field_id and option_id):
+        raise RuntimeError("Status update missing required identifiers")
+    session = _session(token)
+    variables = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "optionId": option_id,
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_STATUS, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Status update failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+
+
+def create_project_draft(token: str, project_id: str, title: str, body: str = "") -> str:
+    if not token:
+        raise RuntimeError("Cannot create task without GITHUB_TOKEN")
+    if not (project_id and title.strip()):
+        raise RuntimeError("Project ID and title are required to create a task")
+    session = _session(token)
+    variables = {"projectId": project_id, "title": title.strip(), "body": body or ""}
+    resp = _graphql_with_backoff(session, GQL_MUTATION_CREATE_DRAFT, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Create task failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    try:
+        return ((resp.get("data") or {}).get("addProjectV2DraftIssue") or {}).get("projectItem", {}).get("id") or ""
+    except Exception:
+        return ""
+
+
+def set_project_date(token: str, project_id: str, item_id: str, field_id: str, date_val: str) -> None:
+    if not (project_id and item_id and field_id and date_val):
+        return
+    session = _session(token)
+    variables = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "date": date_val,
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_DATE, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Setting date failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+
+
+def set_project_iteration(token: str, project_id: str, item_id: str, field_id: str, iteration_id: str) -> None:
+    if not (project_id and item_id and field_id and iteration_id):
+        return
+    session = _session(token)
+    variables = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "iterationId": iteration_id,
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_ITERATION, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Setting iteration failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+
+
+def set_project_users(token: str, project_id: str, item_id: str, field_id: str, user_ids: List[str]) -> None:
+    if not user_ids:
+        return
+    session = _session(token)
+    variables = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "userIds": user_ids,
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_USERS, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Setting assignees failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+
+
+def get_user_node_id(token: str, login: str) -> str:
+    login_key = (login or '').lower()
+    if not login_key:
+        return ""
+    cached = USER_ID_CACHE.get(login_key)
+    if cached:
+        return cached
+    session = _session(token)
+    resp = _graphql_with_backoff(session, GQL_QUERY_USER_ID, {"login": login})
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Lookup user id failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    try:
+        user_id = ((resp.get("data") or {}).get("user") or {}).get("id") or ""
+    except Exception:
+        user_id = ""
+    USER_ID_CACHE[login_key] = user_id
+    return user_id
+
+
+def create_issue(token: str, repository_id: str, title: str, body: str, assignee_ids: List[str]) -> Dict[str, str]:
+    session = _session(token)
+    variables = {
+        "repositoryId": repository_id,
+        "title": title,
+        "body": body or "",
+        "assigneeIds": assignee_ids or [],
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_CREATE_ISSUE, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Create issue failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    issue = ((resp.get("data") or {}).get("createIssue") or {}).get("issue") or {}
+    issue_id = issue.get("id")
+    if not issue_id:
+        raise RuntimeError('Create issue succeeded but returned no id')
+    return {"issue_id": issue_id, "url": issue.get("url")}
+
+
+def add_project_item(token: str, project_id: str, content_id: str) -> str:
+    if not content_id:
+        raise RuntimeError('Issue creation did not return id')
+    if not token:
+        raise RuntimeError('GITHUB_TOKEN required')
+    session = _session(token)
+    variables = {"projectId": project_id, "contentId": content_id}
+    resp = _graphql_with_backoff(session, GQL_MUTATION_ADD_PROJECT_ITEM, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Add issue to project failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    item = ((resp.get("data") or {}).get("addProjectV2ItemById") or {}).get("item") or {}
+    return item.get("id") or ""
+
+
+def get_repo_id(token: str, full_name: str) -> Dict[str, str]:
+    if '/' not in (full_name or ''):
+        raise RuntimeError('Repository must be in owner/name format')
+    owner, name = full_name.split('/', 1)
+    session = _session(token)
+    variables = {"owner": owner.strip(), "name": name.strip()}
+    resp = _graphql_with_backoff(session, GQL_QUERY_REPO, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Lookup repository failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    repo = ((resp.get("data") or {}).get("repository")) or {}
+    repo_id = repo.get("id")
+    if not repo_id:
+        raise RuntimeError('Repository not found')
+    return {"repo_id": repo_id, "repo": repo.get("nameWithOwner") or full_name.strip()}
+
 def discover_open_projects(session: requests.Session, owner_type: str, owner: str) -> List[Dict]:
     if owner_type == "org":
-        data = _graphql_with_backoff(session, GQL_LIST_ORG_PROJECTS, {"login": owner})
-        nodes = (((data.get("data") or {}).get("organization") or {}).get("projectsV2") or {}).get("nodes") or []
+        resp = _graphql_with_backoff(session, GQL_LIST_ORG_PROJECTS, {"login": owner})
+        errs = resp.get("errors") or []
+        if errs:
+            raise RuntimeError(
+                f"Project discovery failed for org:{owner}: " + "; ".join(e.get("message", str(e)) for e in errs)
+            )
+        nodes = (((resp.get("data") or {}).get("organization") or {}).get("projectsV2") or {}).get("nodes") or []
     else:
-        data = _graphql_with_backoff(session, GQL_LIST_USER_PROJECTS, {"login": owner})
-        nodes = (((data.get("data") or {}).get("user") or {}).get("projectsV2") or {}).get("nodes") or []
-    return [n for n in nodes if not n.get("closed")]
+        resp = _graphql_with_backoff(session, GQL_LIST_USER_PROJECTS, {"login": owner})
+        errs = resp.get("errors") or []
+        if errs:
+            raise RuntimeError(
+                f"Project discovery failed for user:{owner}: " + "; ".join(e.get("message", str(e)) for e in errs)
+            )
+        nodes = (((resp.get("data") or {}).get("user") or {}).get("projectsV2") or {}).get("nodes") or []
+    return [n for n in nodes if n is not None and isinstance(n, dict) and not n.get("closed")]
 
 
 # -----------------------------
@@ -776,24 +1264,71 @@ def fetch_tasks_github(
 ) -> List[TaskRow]:
     session = _session(token)
     regex = re.compile(cfg.date_field_regex, re.IGNORECASE)
+    iter_regex = re.compile(cfg.iteration_field_regex, re.IGNORECASE) if cfg.iteration_field_regex else None
     me = cfg.user
+    me_login = me.strip().lower()
+    def _norm_login(login: Optional[str]) -> Optional[str]:
+        if isinstance(login, str):
+            return login.strip().lower()
+        return None
     iso_now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
     out: List[TaskRow] = []
 
+    target_cache = _load_target_cache()
+    cache_updated = False
     targets: List[Tuple[str,str,int,str]] = []
     for spec in cfg.projects:
+        cache_key = f"{spec.owner_type}:{spec.owner}"
         if spec.numbers is None:
-            projs = discover_open_projects(session, spec.owner_type, spec.owner)
+            discovered: List[Dict[str, object]] = []
+            projs: List[Dict[str, object]] = []
+            try:
+                projs = discover_open_projects(session, spec.owner_type, spec.owner)
+            except Exception as err:
+                try:
+                    logging.getLogger('gh_task_viewer').warning("Project discovery failed: %s", err)
+                except Exception:
+                    pass
+                projs = []
             for n in projs:
                 num_val = n.get("number")
                 try:
                     num_int = int(num_val) if num_val is not None else -1
                 except (TypeError, ValueError):
                     continue
-                targets.append((spec.owner_type, spec.owner, num_int, n.get("title") or ""))
+                title = n.get("title") or ""
+                project_id_val = n.get("id") or ""
+                targets.append((spec.owner_type, spec.owner, num_int, title))
+                discovered.append({"number": num_int, "title": title, "project_id": project_id_val})
+            if discovered:
+                target_cache[cache_key] = discovered
+                cache_updated = True
+            elif cache_key in target_cache:
+                cached_entries = target_cache.get(cache_key) or []
+                if cached_entries:
+                    try:
+                        logging.getLogger('gh_task_viewer').warning(
+                            "Project discovery empty for %s; using cached project list", cache_key)
+                    except Exception:
+                        pass
+                    for entry in cached_entries:
+                        try:
+                            num_int = int(entry.get("number"))
+                        except Exception:
+                            continue
+                        targets.append((spec.owner_type, spec.owner, num_int, entry.get("title") or ""))
+                else:
+                    target_cache.pop(cache_key, None)
+                    cache_updated = True
         else:
             for num in spec.numbers:
                 targets.append((spec.owner_type, spec.owner, int(num), ""))
+
+    if cache_updated:
+        _save_target_cache(target_cache)
+
+    if not targets:
+        raise RuntimeError("No project targets resolved; check config or specify project numbers")
 
     total = len(targets)
     try:
@@ -855,29 +1390,102 @@ def fetch_tasks_github(
 
             items = (proj_node.get("items") or {}).get("nodes") or []
             for it in items:
+                item_id = it.get("id") or ""
                 content = it.get("content") or {}
                 ctype = content.get("__typename")
                 title = content.get("title") or "(Draft item)"
                 url = content.get("url") or it.get("project", {}).get("url") or ""
+                project_info = it.get("project") or {}
+                project_title = project_info.get("title") or ""
+                project_id = project_info.get("id") or ""
                 repo = None
+                repo_id = ""
                 if ctype in ("Issue","PullRequest"):
                     rep = content.get("repository") or {}
                     repo = rep.get("nameWithOwner")
+                    repo_id = rep.get("id") or ""
 
-                assignees = []
+                assignees_norm: List[str] = []
                 if ctype in ("Issue","PullRequest"):
-                    assignees = [n["login"] for n in (content.get("assignees") or {}).get("nodes") or [] if n and "login" in n]
+                    for node in (content.get("assignees") or {}).get("nodes") or []:
+                        login_norm = _norm_login((node or {}).get("login"))
+                        if login_norm:
+                            assignees_norm.append(login_norm)
                 people_logins: List[str] = []
+                assignee_field_id: str = ""
+                assignee_user_ids: List[str] = []
                 status_text: Optional[str] = None
+                status_field_id: str = ""
+                status_option_id: str = ""
+                status_options_list: List[Dict[str, str]] = []
+                author_login_norm: Optional[str] = None
+                iteration_field: str = ""
+                iteration_title: str = ""
+                iteration_start: str = ""
+                iteration_duration: int = 0
+                iteration_captured = False
+                iteration_field_id: str = ""
+                iteration_options_list: List[Dict[str, object]] = []
+                start_field_id: str = ""
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldUserValue":
-                        people_logins.extend([n["login"] for n in (fv.get("users") or {}).get("nodes") or [] if n and "login" in n])
+                        field_data = fv.get("field") or {}
+                        assignee_field_id = field_data.get("id") or assignee_field_id
+                        for node in (fv.get("users") or {}).get("nodes") or []:
+                            login_norm = _norm_login((node or {}).get("login"))
+                            if login_norm:
+                                people_logins.append(login_norm)
+                            node_id = (node or {}).get("id")
+                            if node_id:
+                                assignee_user_ids.append(node_id)
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldSingleSelectValue":
-                        fname_sel = ((fv.get("field") or {}).get("name") or "").lower()
+                        field_data = fv.get("field") or {}
+                        fname_sel = (field_data.get("name") or "").lower()
+                        option_id_val = fv.get("optionId") or ""
+                        options_raw = field_data.get("options") or []
+                        if options_raw:
+                            status_options_list = [
+                                {"id": opt.get("id"), "name": opt.get("name")}
+                                for opt in options_raw if opt and opt.get("id")
+                            ]
                         if fname_sel in ("status","state","progress"):
                             status_text = (fv.get("name") or "").strip()
-                assigned_to_me = (me in assignees) or (me in people_logins)
-                if (not assigned_to_me) and (not include_unassigned):
+                            status_field_id = field_data.get("id") or ""
+                            status_option_id = option_id_val
+                    if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
+                        field_info = fv.get("field") or {}
+                        start_field_id = field_info.get("id") or start_field_id
+                    if (not iteration_captured) and fv and fv.get("__typename") == "ProjectV2ItemFieldIterationValue":
+                        field_info = fv.get("field") or {}
+                        fname_iter = (field_info.get("name") or "")
+                        if (iter_regex is None) or iter_regex.search(fname_iter):
+                            iteration_field = fname_iter
+                            iteration_title = (fv.get("title") or "")
+                            iteration_start = fv.get("startDate") or ""
+                            iteration_field_id = field_info.get("id") or iteration_field_id
+                            config = (field_info.get("configuration") or {}).get("iterations") or []
+                            if config:
+                                iteration_options_list = [
+                                    {
+                                        "id": it_conf.get("id"),
+                                        "title": it_conf.get("title"),
+                                        "startDate": it_conf.get("startDate"),
+                                        "duration": it_conf.get("duration"),
+                                    }
+                                    for it_conf in config if it_conf and it_conf.get("id")
+                                ]
+                            try:
+                                iteration_duration = int(fv.get("duration") or 0)
+                            except (TypeError, ValueError):
+                                iteration_duration = 0
+                            iteration_captured = True
+                if ctype == "DraftIssue":
+                    author_login_norm = _norm_login(((content.get("creator") or {})).get("login"))
+                elif ctype in ("Issue","PullRequest"):
+                    author_login_norm = _norm_login(((content.get("author") or {})).get("login"))
+                assigned_to_me = (me_login in assignees_norm) or (me_login in people_logins)
+                created_by_me = author_login_norm == me_login if author_login_norm else False
+                if (not assigned_to_me) and (not created_by_me) and (not include_unassigned):
                     continue
 
                 # Extract optional Focus Day for coloring and Today filter
@@ -915,12 +1523,31 @@ def fetch_tasks_github(
                         out.append(
                             TaskRow(
                                 owner_type=owner_type, owner=owner, project_number=number,
-                                project_title=(it.get("project") or {}).get("title") or "",
+                                project_title=project_title,
                                 start_field=fname, start_date=fdate,
                                 focus_field=focus_fname or "",
                                 focus_date=focus_fdate or "",
+                                iteration_field=iteration_field,
+                                iteration_title=iteration_title,
+                                iteration_start=iteration_start,
+                                iteration_duration=iteration_duration,
                                 title=title, repo=repo, url=url, updated_at=iso_now,
-                                status=status_text, is_done=done_flag
+                                status=status_text, is_done=done_flag,
+                                repo_id=repo_id,
+                                assigned_to_me=int(assigned_to_me),
+                                created_by_me=int(created_by_me),
+                                item_id=item_id,
+                                project_id=project_id,
+                                status_field_id=status_field_id,
+                                status_option_id=status_option_id,
+                                status_options=json.dumps(status_options_list, ensure_ascii=False),
+                                status_dirty=0,
+                                status_pending_option_id="",
+                                start_field_id=start_field_id,
+                                iteration_field_id=iteration_field_id,
+                                iteration_options=json.dumps(iteration_options_list, ensure_ascii=False),
+                                assignee_field_id=assignee_field_id,
+                                assignee_user_ids=json.dumps(assignee_user_ids, ensure_ascii=False),
                             )
                         )
                         found_date = True
@@ -934,12 +1561,31 @@ def fetch_tasks_github(
                     out.append(
                         TaskRow(
                             owner_type=owner_type, owner=owner, project_number=number,
-                            project_title=(it.get("project") or {}).get("title") or "",
-                            start_field="(no date)", start_date="",  # empty date -> neutral grey
+                            project_title=project_title,
+                            start_field="(no date)", start_date="",
                             focus_field=focus_fname or "",
                             focus_date=focus_fdate or "",
+                            iteration_field=iteration_field,
+                            iteration_title=iteration_title,
+                            iteration_start=iteration_start,
+                            iteration_duration=iteration_duration,
                             title=title + (" (unassigned)" if not assigned_to_me else ""), repo=repo, url=url, updated_at=iso_now,
-                            status=status_text, is_done=done_flag
+                                status=status_text, is_done=done_flag,
+                                repo_id=repo_id,
+                                assigned_to_me=int(assigned_to_me),
+                                created_by_me=int(created_by_me),
+                            item_id=item_id,
+                            project_id=project_id,
+                            status_field_id=status_field_id,
+                            status_option_id=status_option_id,
+                            status_options=json.dumps(status_options_list, ensure_ascii=False),
+                            status_dirty=0,
+                            status_pending_option_id="",
+                            start_field_id=start_field_id,
+                            iteration_field_id=iteration_field_id,
+                            iteration_options=json.dumps(iteration_options_list, ensure_ascii=False),
+                            assignee_field_id=assignee_field_id,
+                            assignee_user_ids=json.dumps(assignee_user_ids, ensure_ascii=False),
                         )
                     )
 
@@ -955,20 +1601,6 @@ def fetch_tasks_github(
 
     if progress:
         progress(total, total, f"{_ascii_bar(total,total)}  Done")
-    # Ensure each project appears at least once
-    existing = {(r.owner_type, r.owner, r.project_number) for r in out}
-    for owner_type, owner, number, ptitle in targets:
-        key = (owner_type, owner, number)
-        if key not in existing:
-            out.append(
-                TaskRow(
-                    owner_type=owner_type, owner=owner, project_number=number,
-                    project_title=ptitle or "(project)", start_field="(none)", start_date="",
-                    focus_field="", focus_date="",
-                    title="(no assigned items) - press Shift+U to include unassigned", repo=None, url="", updated_at=iso_now,
-                    status=None, is_done=0
-                )
-            )
     return out
 
 
@@ -986,9 +1618,66 @@ def color_for_date(d: str, today: dt.date) -> str:
         return "ansiyellow"
     return "ansigreen"
 
+def _char_width(ch: str) -> int:
+    """Return printable cell width for a single character."""
+    if _pt_get_cwidth is not None:
+        try:
+            return _pt_get_cwidth(ch)
+        except Exception:
+            pass
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.category(ch) == "Cf":  # zero-width formatting chars
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_char_width(ch) for ch in text)
+
+
+def _sanitize_cell_text(s: Optional[str]) -> str:
+    return (s or "").replace("\n", " ").replace("\r", " ")
+
+
 def _truncate(s: str, maxlen: int) -> str:
-    s = (s or "").replace("\n", " ").replace("\r", " ")
-    return s if len(s) <= maxlen else s[: maxlen - 1] + "…"
+    """Truncate string to a maximum display width, preserving whole glyphs."""
+    s = _sanitize_cell_text(s)
+    if maxlen <= 0:
+        return ""
+    if _display_width(s) <= maxlen:
+        return s
+    ellipsis = "…"
+    ell_w = _display_width(ellipsis)
+    out: List[str] = []
+    width = 0
+    for ch in s:
+        ch_w = _char_width(ch)
+        if width + ch_w + ell_w >= maxlen:
+            break
+        out.append(ch)
+        width += ch_w
+    # Ensure ellipsis fits; if not, drop last chars until it does.
+    while out and width + ell_w > maxlen:
+        removed = out.pop()
+        width -= _char_width(removed)
+    if out:
+        return "".join(out) + ellipsis
+    return ellipsis if maxlen >= ell_w else ""
+
+
+def _pad_display(text: Optional[str], width: int, align: str = "left") -> str:
+    """Pad/truncate text to an exact display width using spaces."""
+    align = align.lower()
+    raw = _truncate(_sanitize_cell_text(text), width)
+    pad = max(0, width - _display_width(raw))
+    if align == "right":
+        return " " * pad + raw
+    if align == "center":
+        left = pad // 2
+        right = pad - left
+        return (" " * left) + raw + (" " * right)
+    return raw + (" " * pad)
 
 def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str]]:
     """Return a list of (style, text) tuples for FormattedTextControl."""
@@ -1008,13 +1697,15 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
             frags.append(("bold", header))
             frags.append(("", "\n"))
         col = color_for_date(t.focus_date, today)
-        title = _truncate(t.title, 45)
-        repo  = _truncate(t.repo or "-", 20)
-        url   = _truncate(t.url, 40)
-        status = _truncate(t.status or "-", 10)
-        frags.append((col, f"{t.focus_date or '-':<11}  {t.start_date:<12}"))
+        focus_cell = _pad_display(t.focus_date or '-', 11)
+        start_cell = _pad_display(t.start_date, 12)
+        status_cell = _pad_display(t.status or '-', 10)
+        title_cell = _pad_display(t.title, 45)
+        repo_cell = _pad_display(t.repo or '-', 20)
+        url_cell = _pad_display(t.url, 40)
+        frags.append((col, focus_cell))
         frags.append(("",  "  "))
-        frags.append(("", f"{status:<10}  {title:<45}  {repo:<20}  {url}"))
+        frags.append(("", f"{start_cell}  {status_cell}  {title_cell}  {repo_cell}  {url_cell}"))
         frags.append(("", "\n"))
 
     if frags and frags[-1] == ("", "\n"):
@@ -1041,6 +1732,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     hide_done = False
     hide_no_date = False  # new toggle to hide tasks without any date
     show_unassigned = False
+    include_created = True
+    use_iteration = False
     project_cycle: Optional[str] = None
     search_term: Optional[str] = None
     in_search = False
@@ -1055,6 +1748,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     h_offset = 0
     detail_mode = False
     status_line = ""
+    pending_status_urls: Set[str] = set()
+    add_mode = False
+    add_state: Dict[str, object] = {}
+    add_float: Optional[Float] = None
+    update_in_progress = False
     # Inline search buffer (used when in_search == True)
 
     if state_path is None:
@@ -1094,6 +1792,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'hide_done': hide_done,
             'hide_no_date': hide_no_date,
             'show_unassigned': show_unassigned,
+            'include_created': include_created,
+            'use_iteration': use_iteration,
             'project_cycle': project_cycle,
             'search_term': search_term,
             'date_max': date_max,
@@ -1117,6 +1817,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     hide_done = bool(_st.get('hide_done', hide_done))
     hide_no_date = bool(_st.get('hide_no_date', hide_no_date))
     show_unassigned = bool(_st.get('show_unassigned', show_unassigned))
+    include_created = bool(_st.get('include_created', include_created))
+    use_iteration = bool(_st.get('use_iteration', use_iteration))
     project_cycle = _st.get('project_cycle', project_cycle)
     search_term = _st.get('search_term', search_term)
     date_max = _st.get('date_max', date_max)
@@ -1129,6 +1831,304 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return db.load(today_only=show_today_only, today=today_date.isoformat())
 
     all_rows = load_all()
+
+    def _json_list(raw: str) -> List[Dict[str, object]]:
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        return []
+
+    def build_project_choices() -> List[Dict[str, object]]:
+        meta: Dict[Tuple[str, str, int], Dict[str, object]] = {}
+        for row in all_rows:
+            key = (row.owner_type, row.owner, row.project_number)
+            entry = meta.setdefault(key, {
+                'owner_type': row.owner_type,
+                'owner': row.owner,
+                'project_number': row.project_number,
+                'project_title': row.project_title or "",
+                'project_id': row.project_id or "",
+                'start_field_id': row.start_field_id or "",
+                'start_field_name': row.start_field or "",
+                'iteration_field_id': row.iteration_field_id or "",
+                'iteration_options': _json_list(row.iteration_options),
+                'assignee_field_id': row.assignee_field_id or "",
+                'repos': {}
+            })
+            if not entry['project_title'] and row.project_title:
+                entry['project_title'] = row.project_title
+            if not entry['project_id'] and row.project_id:
+                entry['project_id'] = row.project_id
+            if not entry['start_field_id'] and row.start_field_id:
+                entry['start_field_id'] = row.start_field_id
+                entry['start_field_name'] = row.start_field
+            if (not entry['iteration_field_id']) and row.iteration_field_id:
+                entry['iteration_field_id'] = row.iteration_field_id
+            if not entry['iteration_options'] and row.iteration_options:
+                entry['iteration_options'] = _json_list(row.iteration_options)
+            if not entry['assignee_field_id'] and row.assignee_field_id:
+                entry['assignee_field_id'] = row.assignee_field_id
+            repo_key = (row.repo or '').strip()
+            if repo_key:
+                entry['repos'].setdefault(repo_key, row.repo_id or '')
+
+        cache = _load_target_cache()
+        for spec in cfg.projects:
+            cache_entries = cache.get(f"{spec.owner_type}:{spec.owner}", []) or []
+            for entry in cache_entries:
+                try:
+                    num_int = int(entry.get("number"))
+                except Exception:
+                    continue
+                key = (spec.owner_type, spec.owner, num_int)
+                existing = meta.setdefault(key, {
+                    'owner_type': spec.owner_type,
+                    'owner': spec.owner,
+                    'project_number': num_int,
+                    'project_title': entry.get("title") or "",
+                    'project_id': entry.get("project_id") or "",
+                    'start_field_id': "",
+                    'start_field_name': "",
+                    'iteration_field_id': "",
+                    'iteration_options': [],
+                    'assignee_field_id': entry.get('assignee_field_id') or "",
+                    'repos': {}
+                })
+                if not existing['project_title'] and entry.get("title"):
+                    existing['project_title'] = entry.get("title")
+                if not existing['project_id'] and entry.get("project_id"):
+                    existing['project_id'] = entry.get("project_id")
+
+        choices = []
+        for key, entry in meta.items():
+            if not entry.get('project_id'):
+                continue
+            title = entry.get('project_title') or f"{entry['owner']}/#{entry['project_number']}"
+            entry['project_title'] = title
+            entry['iteration_options'] = entry.get('iteration_options') or []
+            entry['repos'] = entry.get('repos') or {}
+            choices.append(entry)
+        choices.sort(key=lambda e: e.get('project_title', '').lower())
+        return choices
+
+    def _set_project_choices_for_mode(mode: str) -> None:
+        all_choices = add_state.get('project_choices_all') or []
+        if mode == 'issue':
+            filtered = [c for c in all_choices if c.get('repos')]
+            if not filtered:
+                filtered = list(all_choices)
+        else:
+            filtered = list(all_choices)
+        add_state['project_choices'] = filtered
+        add_state['project_index'] = 0
+        project = filtered[0] if filtered else None
+        add_state['repo_choices'] = _build_repo_choices(project) if project else []
+        add_state['repo_index'] = 0
+        add_state['iteration_choices'] = _build_iteration_choices(project) if project else []
+        add_state['iteration_index'] = 0
+        add_state['repo_manual'] = ''
+
+    def _current_add_project() -> Optional[Dict[str, object]]:
+        if not add_state.get('project_choices'):
+            return None
+        idx = add_state.get('project_index', 0)
+        choices = add_state['project_choices']
+        if not choices:
+            return None
+        return choices[max(0, min(idx, len(choices)-1))]
+
+    def _build_iteration_choices(project: Dict[str, object]) -> List[Dict[str, object]]:
+        opts = project.get('iteration_options') or []
+        if not opts:
+            return []
+        return [{'id': '', 'title': '(None)'}] + opts
+
+    def _build_repo_choices(project: Optional[Dict[str, object]]) -> List[Dict[str, str]]:
+        repo_map = (project or {}).get('repos') or {}
+        items = sorted(repo_map.items())
+        choices = [{'repo': name, 'repo_id': rid or ''} for name, rid in items if name]
+        if not choices:
+            recent = db.recent_repositories(limit=20)
+            choices = [{'repo': name, 'repo_id': rid or ''} for name, rid in recent if name]
+        return choices
+
+    def build_add_overlay() -> List[Tuple[str, str]]:
+        if not add_mode:
+            return []
+        lines: List[str] = []
+        step = add_state.get('step', 'project')
+        lines.append("Add Item")
+        lines.append("")
+        if step == 'mode':
+            lines.append("Select type (j/k to move, Enter to choose, Esc cancel):")
+            choices = add_state.get('mode_choices') or []
+            for idx, label in enumerate(choices):
+                prefix = "➤ " if idx == add_state.get('mode_index', 0) else "  "
+                lines.append(f"{prefix}{label}")
+        elif step == 'project':
+            lines.append("Select project (j/k to move, Enter to choose, Esc cancel):")
+            choices = add_state.get('project_choices') or []
+            if not choices:
+                lines.append("  (no projects available)")
+            for idx, proj in enumerate(choices):
+                prefix = "➤ " if idx == add_state.get('project_index', 0) else "  "
+                lines.append(f"{prefix}{proj.get('project_title')} (#{proj.get('project_number')})")
+        elif step == 'repo':
+            choices = add_state.get('repo_choices') or []
+            if choices:
+                lines.append("Select repository (j/k to move, Enter to choose, Esc cancel):")
+                for idx, repo_entry in enumerate(choices):
+                    prefix = "➤ " if idx == add_state.get('repo_index', 0) else "  "
+                    lines.append(f"{prefix}{repo_entry.get('repo')}" )
+            else:
+                lines.append("Enter repository owner/name (Enter to continue, Esc cancel):")
+                lines.append(add_state.get('repo_manual', '') + "_")
+        elif step == 'title':
+            lines.append("Enter task title (Enter to continue, Esc cancel):")
+            title = add_state.get('title', '')
+            lines.append(title + "_")
+        elif step == 'date':
+            lines.append("Enter start date YYYY-MM-DD (Enter to skip, Esc cancel):")
+            lines.append(add_state.get('date', '') + "_")
+        elif step == 'iteration':
+            lines.append("Select iteration (j/k to move, Enter to choose, Esc cancel):")
+            choices = add_state.get('iteration_choices') or []
+            if not choices:
+                lines.append("  (no iterations configured)")
+            for idx, opt in enumerate(choices):
+                prefix = "➤ " if idx == add_state.get('iteration_index', 0) else "  "
+                title = opt.get('title') or '(None)'
+                lines.append(f"{prefix}{title}")
+        elif step == 'confirm':
+            project = _current_add_project()
+            title = add_state.get('title', '').strip()
+            date_val = add_state.get('date', '').strip() or '(none)'
+            iteration_choice = add_state.get('iteration_choices') or []
+            idx = add_state.get('iteration_index', 0)
+            iter_label = '(none)'
+            if iteration_choice:
+                opt = iteration_choice[max(0, min(idx, len(iteration_choice)-1))]
+                iter_label = opt.get('title') or '(none)'
+            repo_label = '(n/a)'
+            if add_state.get('mode', 'issue') == 'issue':
+                repo_choices = add_state.get('repo_choices') or []
+                if repo_choices:
+                    repo_idx = add_state.get('repo_index', 0)
+                    repo_label = repo_choices[max(0, min(repo_idx, len(repo_choices)-1))].get('repo') or '(unknown)'
+                else:
+                    repo_label = add_state.get('repo_manual', '(unknown)') or '(unknown)'
+            lines.append("Confirm new task:")
+            lines.append(f" Project : {project.get('project_title') if project else '(unknown)'}")
+            lines.append(f" Type    : {'Issue' if add_state.get('mode', 'issue') == 'issue' else 'Project Task'}")
+            if add_state.get('mode', 'issue') == 'issue':
+                lines.append(f" Repo    : {repo_label}")
+            lines.append(f" Title   : {title}")
+            lines.append(f" Date    : {date_val}")
+            lines.append(f" Iteration: {iter_label}")
+            lines.append("")
+            lines.append("Enter to create • Backspace to edit title • Esc cancel")
+        text = "\n".join(lines)
+        return [("", text)]
+
+    STATUS_KEYWORDS: Dict[str, List[str]] = {
+        'done': ["done", "complete", "completed", "finished", "closed", "resolved", "merged", "✅", "✔"],
+        'in_progress': ["in progress", "progress", "doing", "active", "working"]
+    }
+
+    def _status_options_map(row: TaskRow) -> Dict[str, Tuple[str, str]]:
+        try:
+            data = json.loads(row.status_options or "[]")
+        except Exception:
+            data = []
+        out: Dict[str, Tuple[str, str]] = {}
+        if isinstance(data, list):
+            for opt in data:
+                if not isinstance(opt, dict):
+                    continue
+                name = (opt.get("name") or "").strip()
+                opt_id = (opt.get("id") or "").strip()
+                if name and opt_id:
+                    out[name.lower()] = (opt_id, name)
+        if row.status and row.status_option_id:
+            low = row.status.strip().lower()
+            out.setdefault(low, (row.status_option_id, row.status))
+        return out
+
+    def _match_status_option(row: TaskRow, target: str) -> Tuple[str, str]:
+        options = _status_options_map(row)
+        keywords = STATUS_KEYWORDS.get(target, [])
+        for kw in keywords:
+            opt = options.get(kw.lower())
+            if opt:
+                return opt
+        for key, opt in options.items():
+            if any(kw in key for kw in keywords):
+                return opt
+        return ("", "")
+
+    def _is_done_name(name: str) -> int:
+        low = (name or "").lower()
+        return int(any(kw in low for kw in STATUS_KEYWORDS['done']))
+
+    async def _apply_status_change(target: str):
+        nonlocal all_rows, status_line
+        if not token:
+            status_line = "GITHUB_TOKEN required for status updates"
+            invalidate(); return
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate(); return
+        row = rows[current_index]
+        if row.url in pending_status_urls:
+            status_line = "Status update already in progress"
+            invalidate(); return
+        if not (row.project_id and row.item_id and row.status_field_id):
+            status_line = "Task missing status metadata"
+            invalidate(); return
+        option_id, display_name = _match_status_option(row, target)
+        if not option_id:
+            status_line = f"No status option matches '{target}'"
+            invalidate(); return
+        if (row.status_option_id == option_id) and not row.status_dirty:
+            status_line = f"Already {display_name}"
+            invalidate(); return
+        new_is_done = _is_done_name(display_name)
+        original_status = row.status or ""
+        original_option = row.status_option_id or ""
+        original_is_done = row.is_done
+        try:
+            db.mark_status_pending(row.url, display_name, option_id, new_is_done)
+        except Exception as exc:
+            status_line = f"Failed to mark pending: {exc}"
+            invalidate(); return
+        pending_status_urls.add(row.url)
+        all_rows = load_all()
+        status_line = f"Updating status to {display_name}…"
+        invalidate()
+
+        loop = asyncio.get_running_loop()
+
+        def _do_update():
+            set_project_status(token, row.project_id, row.item_id, row.status_field_id, option_id)
+
+        try:
+            await loop.run_in_executor(None, _do_update)
+        except Exception as exc:
+            db.reset_status(row.url, original_status, original_option, original_is_done)
+            status_line = f"Status update failed: {exc}"
+        else:
+            db.mark_status_synced(row.url)
+            status_line = f"Status set to {display_name}"
+        finally:
+            pending_status_urls.discard(row.url)
+            all_rows = load_all()
+            invalidate()
 
     def _safe_date(s: str) -> Optional[dt.date]:
         try:
@@ -1145,7 +2145,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if hide_done:
             out = [r for r in out if not r.is_done]
         if hide_no_date:
-            out = [r for r in out if r.focus_date]
+            if use_iteration:
+                out = [r for r in out if r.iteration_title or r.iteration_start]
+            else:
+                out = [r for r in out if r.focus_date]
+        if not include_created:
+            out = [r for r in out if not (r.created_by_me and not r.assigned_to_me)]
         if project_cycle:
             out = [r for r in out if r.project_title == project_cycle]
         active_search = search_buffer if in_search else search_term
@@ -1212,25 +2217,44 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
         frags: List[Tuple[str,str]] = []
-        # Determine dynamic column widths to fully use available space
-        # Layout: marker(2) + Focus(11) + 2 + Start(12) + 2 + Status(10) + 2 + Time(12) + 2 + Title(VAR) + 2 + Project(VAR)
-        # Right side stats window width is fixed at 32 plus a 1-char separator in root_body
+        # Determine column widths; right panel width fixed at 32 + separator.
         right_panel_width = 32 + 1
         avail_cols = max(40, total_cols - right_panel_width)
         time_w = 12  # "mm:ss|HH:MM" (right aligned)
-        fixed = 2 + 11 + 2 + 12 + 2 + 10 + 2 + time_w + 2  # = 55
-        dyn = max(1, avail_cols - fixed)
-        proj_min = 12
-        title_min = 20
-        # split dyn ~70%/30% between title/project
-        title_w = max(title_min, int(dyn * 0.7))
-        proj_w = max(proj_min, dyn - title_w)
-        # Rebalance if rounding starves project
-        if proj_w < proj_min:
-            delta = proj_min - proj_w
-            title_w = max(title_min, title_w - delta)
-            proj_w = proj_min
-        header = f"  {'Focus Day':<11}  {'Start Date':<12}  {'STATUS':<10}  {'TIME':>{time_w}}  {'TITLE':<{title_w}}  {'PROJECT':<{proj_w}}"
+        if use_iteration:
+            iter_min = 15
+            title_min = 20
+            proj_min = 12
+            sum_min = iter_min + title_min + proj_min
+            base_fixed = 2 + 2 + 10 + 2 + time_w + 2 + 2  # marker + spaces + status + time separators
+            dyn_total = max(sum_min, avail_cols - base_fixed)
+            extra = dyn_total - sum_min
+            iter_w = iter_min + extra // 4
+            title_w = title_min + extra // 2
+            proj_w = proj_min + extra - (extra // 4) - (extra // 2)
+            header = (
+                "  " + _pad_display("Iteration", iter_w) +
+                "  " + _pad_display("STATUS", 10) +
+                "  " + _pad_display("TIME", time_w, align='right') +
+                "  " + _pad_display("TITLE", title_w) +
+                "  " + _pad_display("PROJECT", proj_w)
+            )
+        else:
+            proj_min = 12
+            title_min = 20
+            fixed = 2 + 11 + 2 + 12 + 2 + 10 + 2 + time_w + 2  # marker + focus + start + status + time + spaces
+            dyn = max(title_min + proj_min, avail_cols - fixed)
+            extra = dyn - (title_min + proj_min)
+            title_w = title_min + extra // 2
+            proj_w = proj_min + extra - (extra // 2)
+            header = (
+                "  " + _pad_display("Focus Day", 11) +
+                "  " + _pad_display("Start Date", 12) +
+                "  " + _pad_display("STATUS", 10) +
+                "  " + _pad_display("TIME", time_w, align='right') +
+                "  " + _pad_display("TITLE", title_w) +
+                "  " + _pad_display("PROJECT", proj_w)
+            )
         frags.append(("bold", header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
@@ -1252,9 +2276,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 base_style = "ansicyan bold"
             else:
                 base_style = col
-            title = _truncate(t.title, title_w)
-            project = _truncate(t.project_title, proj_w)
-            status_txt = _truncate(t.status or '-', 10)
             marker = '⏱ ' if running else '  '
             # Time column: current run (mm:ss) and total (H:MM)
             cur_s = db.task_current_elapsed_seconds(t.url) if (t.url and running) else 0
@@ -1263,9 +2284,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             # total in H:MM (no leading zeros on hours)
             th, rem = divmod(int(max(0, tot_s)), 3600)
             tm, _ = divmod(rem, 60)
-            time_cell = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else (f"{mm:02d}:{ss:02d}|0:00")
-            time_cell = f"{time_cell:>{time_w}}"
-            line = f"{marker}{(t.focus_date or '-'):<11}  {t.start_date:<12}  {status_txt:<10}  {time_cell}  {title:<{title_w}}  {project:<{proj_w}}"
+            time_text = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else f"{mm:02d}:{ss:02d}|0:00"
+            status_cell = _pad_display(t.status or '-', 10)
+            if t.status_dirty:
+                status_cell = _pad_display((t.status or '-') + '*', 10)
+            time_cell = _pad_display(time_text, time_w, align='right')
+            title_cell = _pad_display(t.title, title_w)
+            project_cell = _pad_display(t.project_title, proj_w)
+            if use_iteration:
+                iter_label = t.iteration_title or t.iteration_start or '-'
+                if t.iteration_title and t.iteration_start:
+                    iter_label = f"{t.iteration_title} ({t.iteration_start})"
+                iteration_cell = _pad_display(iter_label or '-', iter_w)
+                line = f"{marker}{iteration_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
+            else:
+                focus_cell = _pad_display(t.focus_date or '-', 11)
+                start_cell = _pad_display(t.start_date, 12)
+                line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -1314,15 +2349,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         for p,(d,t) in sorted(by_proj.items()):
             pct = 0 if t==0 else int(d*100/t)
             secs = proj_time.get(p or '', 0)
-            lines.append(f"{_truncate(p,12):<12}{d:>2}/{t:<2} {pct:>3}% {_fmt_hm(secs):>6}")
+            proj_cell = _pad_display(p, 12)
+            lines.append(f"{proj_cell}{d:>2}/{t:<2} {pct:>3}% {_fmt_hm(secs):>6}")
         lines.append("")
         lines.append("Filters:")
         active_search = search_buffer if in_search else search_term
-        lines.append(f"HideDone:{'Y' if hide_done else 'N'} HideNoDate:{'Y' if hide_no_date else 'N'} Unassigned:{'Y' if show_unassigned else 'N'}")
+        lines.append(f"HideDone:{'Y' if hide_done else 'N'} HideNoDate:{'Y' if hide_no_date else 'N'} Unassigned:{'Y' if show_unassigned else 'N'} Created:{'Y' if include_created else 'N'}")
         lines.append(f"Proj:{_truncate(project_cycle or 'All',10)}")
         lines.append(f"Today:{'Y' if show_today_only else 'N'}")
         lines.append(f"Date<=:{date_max or '-'}")
         lines.append(f"Search:{_truncate(active_search or '-',12)}")
+        lines.append(f"View:{'Iteration' if use_iteration else 'Dates'}")
         return "\n".join(lines)
 
     table_control = FormattedTextControl(text=lambda: build_table_fragments())
@@ -1353,7 +2390,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             m, s = divmod(r, 60)
             return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
         timers = f" Now:{_fmt_hms(now_s)} Task:{_fmt_hms(task_s)} Proj:{_fmt_hms(proj_s)} Act:{active_count} "
-        txt = f"{timers}| Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
+        view_label = 'Iteration' if use_iteration else 'Dates'
+        txt = f"{timers}| Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | View: {view_label}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
         return [("reverse", txt)]
     top_status_control = FormattedTextControl(text=lambda: build_top_status())
     top_status_window = Window(height=1, content=top_status_control)
@@ -1469,6 +2507,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not rows:
             return [("", "No selection")] 
         t = rows[current_index]
+        iter_parts = []
+        if t.iteration_title:
+            iter_parts.append(t.iteration_title)
+        if t.iteration_start:
+            iter_parts.append(t.iteration_start)
+        iter_display = " | ".join(iter_parts) if iter_parts else "-"
+        iter_suffix = []
+        if t.iteration_field:
+            iter_suffix.append(t.iteration_field)
+        if t.iteration_duration:
+            iter_suffix.append(f"{t.iteration_duration}d")
+        iter_meta = f" ({', '.join(iter_suffix)})" if iter_suffix else ""
         lines = [
             f"Project: {t.project_title}",
             f"Title:   {t.title}",
@@ -1476,8 +2526,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             f"URL:     {t.url}",
             f"Start:   {t.start_date} ({t.start_field})",
             f"Focus:   {t.focus_date or '-'} ({t.focus_field or '-'})",
+            f"Iter:    {iter_display}{iter_meta}",
             f"Status:  {t.status}",
             f"Done:    {'Yes' if t.is_done else 'No'}",
+            f"Pending: {'Yes' if t.status_dirty else 'No'}",
+            f"Assigned:{'Yes' if t.assigned_to_me else 'No'}",
+            f"Created: {'Yes' if t.created_by_me else 'No'}",
+            f"FieldID: {t.status_field_id or '-'}",
             "",
             "Press Enter / q / Esc to close"
         ]
@@ -1504,20 +2559,38 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             "REPORT" if show_report else (
             "HELP" if show_help else "BROWSE"))))
         )
-        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all ?:help q:quit "
+        base = f" {mode} W:timer R:report X:export Z:pdf u:update U:unassigned C:created A:add-task D:mark-done I:mark-progress j/k:nav h/l:←/→ /:search F:date<= Enter:detail p:project P:clear N:hide-no-date d:hide-done t:today a:all V:iteration ?:help q:quit "
     # Keep bottom bar compact; top bar shows Project/Search to avoid overflow
         base += f"[Sort:{'Date' if sort_mode=='date' else 'Project'}] "
         if hide_done:
             base += "[HideDone] "
         if hide_no_date:
             base += "[HideNoDate] "
+        if not include_created:
+            base += "[NoCreated] "
+        if use_iteration:
+            base += "[Iteration] "
     # project and search are shown on the top status bar
         if date_max:
             base += f"[<= {date_max}] "
         return base + status_line
 
     from prompt_toolkit.layout.containers import Float, FloatContainer
+    add_control = FormattedTextControl(text=lambda: build_add_overlay())
+    from prompt_toolkit.layout.dimension import Dimension
+    add_window = Window(width=90, height=Dimension(preferred=24, max=40), content=add_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
     floats = []
+
+    def close_add_mode(message: Optional[str] = None):
+        nonlocal add_mode, add_state, add_float, status_line
+        if add_float and add_float in floats:
+            floats.remove(add_float)
+        add_float = None
+        add_mode = False
+        add_state = {}
+        if message is not None:
+            status_line = message
+        invalidate()
     root_body = VSplit([table_window, Window(width=1, char='│'), stats_window])
     container = FloatContainer(content=HSplit([top_status_window, root_body, status_window]), floats=floats)
 
@@ -1526,17 +2599,145 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_search = Condition(lambda: in_search)
     is_date = Condition(lambda: in_date_filter)
     is_detail = Condition(lambda: detail_mode)
-    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report)
-    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report))
+    is_add_mode = Condition(lambda: add_mode)
+    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode)
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
         stats_control.text = lambda: summarize()
         app.invalidate()
 
+    async def update_worker(status_msg: Optional[str] = None):
+        nonlocal status_line, all_rows, current_index, today_date, update_in_progress
+        if update_in_progress:
+            return
+        update_in_progress = True
+        if status_msg:
+            status_line = status_msg
+        else:
+            status_line = "Updating..."
+        invalidate()
+
+        def progress(done_val: int, total_val: int, line: str):
+            nonlocal status_line
+            status_line = line
+            invalidate()
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            def do_fetch():
+                if os.environ.get('MOCK_FETCH') == '1':
+                    try:
+                        logger.info("MOCK_FETCH enabled; generating mock tasks")
+                    except Exception:
+                        pass
+                    rows = generate_mock_tasks(cfg)
+                    progress(1, 1, '[########################################] 100% Done')
+                    return rows
+                if not token:
+                    raise RuntimeError('TOKEN not set')
+                try:
+                    logger.info("Fetching tasks from GitHub… (cutoff=%s, include_unassigned=%s)", today_date, show_unassigned)
+                except Exception:
+                    pass
+                return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
+
+            fut_rows = await loop.run_in_executor(None, do_fetch)
+            try:
+                logger.info("Fetched %d tasks; replacing DB rows", len(fut_rows))
+            except Exception:
+                pass
+            db.replace_all(fut_rows)
+            try:
+                today_date = dt.date.today()
+                logger.debug("today_date refreshed after update: %s", today_date)
+            except Exception:
+                pass
+            all_rows = load_all()
+            current_index = 0 if all_rows else 0
+            progress(len(fut_rows), len(fut_rows), 'Updated')
+            try:
+                logger.info("Update finished successfully. Cached rows: %d", len(all_rows))
+            except Exception:
+                pass
+        except Exception as e:
+            status_line = f"Error: {e}"
+            try:
+                logger.exception("Update failed")
+            except Exception:
+                pass
+        finally:
+            update_in_progress = False
+            invalidate()
+
+    async def create_task_async(project_choice: Dict[str, object], title: str, date_val: str, iteration_id: str, mode: str, repo_choice: Optional[Dict[str, str]], repo_manual: Optional[str]):
+        nonlocal status_line
+        if not token:
+            status_line = "GITHUB_TOKEN required to add tasks"
+            invalidate()
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            project_id = project_choice.get('project_id') or ''
+            if not project_id:
+                raise RuntimeError('Project metadata missing ID')
+            if mode == 'issue':
+                repo_id = (repo_choice or {}).get('repo_id') or ''
+                repo_label = (repo_choice or {}).get('repo') or ''
+                if not repo_id:
+                    source = repo_manual or ''
+                    if not source:
+                        raise RuntimeError('Repository metadata unavailable')
+                    repo_lookup = await loop.run_in_executor(None, lambda: get_repo_id(token, source))
+                    repo_id = repo_lookup.get('repo_id') or ''
+                    repo_label = repo_lookup.get('repo') or source
+                if not repo_id:
+                    raise RuntimeError('Repository metadata unavailable')
+                assignee_ids: List[str] = []
+                try:
+                    user_id = get_user_node_id(token, cfg.user)
+                    if user_id:
+                        assignee_ids.append(user_id)
+                except Exception as exc:
+                    logger.warning("Could not resolve user id for %s: %s", cfg.user, exc)
+                issue_result = await loop.run_in_executor(None, lambda: create_issue(token, repo_id, title, '', assignee_ids))
+                issue_id = issue_result.get('issue_id')
+                item_id = await loop.run_in_executor(None, lambda: add_project_item(token, project_id, issue_id))
+            else:
+                item_id = await loop.run_in_executor(None, lambda: create_project_draft(token, project_id, title))
+                if not item_id:
+                    raise RuntimeError('GitHub did not return item id')
+            start_field_id = project_choice.get('start_field_id') or ''
+            if date_val and start_field_id:
+                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, date_val))
+            iteration_field_id = project_choice.get('iteration_field_id') or ''
+            if iteration_id and iteration_field_id:
+                await loop.run_in_executor(None, lambda: set_project_iteration(token, project_id, item_id, iteration_field_id, iteration_id))
+            assignee_field_id = project_choice.get('assignee_field_id') or ''
+            if assignee_field_id:
+                try:
+                    user_id = get_user_node_id(token, cfg.user)
+                except Exception as exc:
+                    user_id = ""
+                    logger.warning("Could not resolve user id for %s: %s", cfg.user, exc)
+                if user_id:
+                    await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, [user_id]))
+        except Exception as exc:
+            status_line = f"Create failed: {exc}"
+        else:
+            status_line = "Issue created; refreshing…" if mode == 'issue' else "Task created; refreshing…"
+            asyncio.create_task(update_worker())
+        finally:
+            invalidate()
+
     @kb.add('q')
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
+        if add_mode:
+            close_add_mode('Add cancelled')
+            return
         if detail_mode:
             detail_mode = False
             if floats:
@@ -1714,6 +2915,274 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_index = 0
         invalidate()
 
+    @kb.add('V', filter=is_normal)
+    def _(event):
+        # Toggle date vs iteration layout
+        if detail_mode or in_search:
+            return
+        nonlocal use_iteration, h_offset, status_line
+        use_iteration = not use_iteration
+        h_offset = 0
+        status_line = 'Iteration view ON' if use_iteration else 'Iteration view OFF'
+        invalidate()
+
+    @kb.add('C', filter=is_normal)
+    def _(event):
+        # Toggle inclusion of tasks created-by-me but not assigned
+        if detail_mode or in_search:
+            return
+        nonlocal include_created, status_line, current_index
+        include_created = not include_created
+        current_index = 0
+        status_line = 'Including created tasks' if include_created else 'Hiding created-only tasks'
+        invalidate()
+
+    @kb.add('A', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        choices = build_project_choices()
+        if not choices:
+            status_line = "No projects available to add task"
+            invalidate()
+            return
+        nonlocal add_mode, add_state, add_float
+        add_mode = True
+        mode_choices = ['Create Issue', 'Add Project Task']
+        add_state = {
+            'step': 'mode',
+            'mode_choices': mode_choices,
+            'mode_index': 0,
+            'project_choices_all': choices,
+            'project_choices': [],
+            'project_index': 0,
+            'repo_choices': [],
+            'repo_index': 0,
+            'repo_manual': '',
+            'title': '',
+            'date': '',
+            'iteration_choices': [],
+            'iteration_index': 0,
+            'mode': 'issue',
+        }
+        _set_project_choices_for_mode('issue')
+        if add_float and add_float in floats:
+            floats.remove(add_float)
+        add_float = Float(content=add_window, top=3, left=4)
+        floats.append(add_float)
+        status_line = 'Select item type'
+        invalidate()
+
+    @kb.add('D', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        asyncio.create_task(_apply_status_change('done'))
+
+    @kb.add('I', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        asyncio.create_task(_apply_status_change('in_progress'))
+
+    @kb.add('escape', filter=is_add_mode)
+    def _(event):
+        close_add_mode('Add cancelled')
+
+    @kb.add('backspace', filter=is_add_mode)
+    def _(event):
+        step = add_state.get('step')
+        if step == 'title':
+            title = add_state.get('title', '')
+            add_state['title'] = title[:-1]
+        elif step == 'date':
+            date_buf = add_state.get('date', '')
+            add_state['date'] = date_buf[:-1]
+        elif step == 'confirm':
+            add_state['step'] = 'title'
+        elif step == 'iteration':
+            add_state['step'] = 'date'
+        elif step == 'repo' and not add_state.get('repo_choices'):
+            repo_buf = add_state.get('repo_manual', '')
+            add_state['repo_manual'] = repo_buf[:-1]
+        invalidate()
+
+    def _cycle_add(delta: int):
+        step = add_state.get('step')
+        if step == 'mode':
+            choices = add_state.get('mode_choices') or []
+            if not choices:
+                return
+            idx = (add_state.get('mode_index', 0) + delta) % len(choices)
+            add_state['mode_index'] = idx
+            add_state['mode'] = 'issue' if idx == 0 else 'task'
+            _set_project_choices_for_mode(add_state['mode'])
+        elif step == 'project':
+            choices = add_state.get('project_choices') or []
+            if not choices:
+                return
+            idx = (add_state.get('project_index', 0) + delta) % len(choices)
+            add_state['project_index'] = idx
+            add_state['iteration_choices'] = _build_iteration_choices(choices[idx])
+            add_state['iteration_index'] = 0
+            add_state['repo_choices'] = _build_repo_choices(choices[idx])
+            add_state['repo_index'] = 0
+            add_state['repo_manual'] = ''
+        elif step == 'repo':
+            choices = add_state.get('repo_choices') or []
+            if not choices:
+                return
+            idx = (add_state.get('repo_index', 0) + delta) % len(choices)
+            add_state['repo_index'] = idx
+        elif step == 'iteration':
+            choices = add_state.get('iteration_choices') or []
+            if not choices:
+                return
+            idx = (add_state.get('iteration_index', 0) + delta) % len(choices)
+            add_state['iteration_index'] = idx
+
+    @kb.add('j', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
+    @kb.add('down', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
+    def _(event):
+        _cycle_add(1)
+        invalidate()
+
+    @kb.add('k', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
+    @kb.add('up', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
+    def _(event):
+        _cycle_add(-1)
+        invalidate()
+
+    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'title'))
+    def _(event):
+        ch = event.data or ""
+        if not ch or ch in ('\n', '\r'):
+            return
+        add_state['title'] = add_state.get('title', '') + ch
+        invalidate()
+
+    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'date'))
+    def _(event):
+        ch = event.data or ""
+        if ch and (ch.isdigit() or ch == '-'):
+            if len(add_state.get('date', '')) < 10:
+                add_state['date'] = add_state.get('date', '') + ch
+                invalidate()
+
+    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'repo' and not add_state.get('repo_choices')))
+    def _(event):
+        ch = event.data or ""
+        if not ch or ch in ('\n', '\r'):
+            return
+        add_state['repo_manual'] = add_state.get('repo_manual', '') + ch
+        invalidate()
+
+    @kb.add('enter', filter=is_add_mode)
+    def _(event):
+        step = add_state.get('step')
+        if step == 'mode':
+            idx = add_state.get('mode_index', 0)
+            add_state['mode'] = 'issue' if idx == 0 else 'task'
+            _set_project_choices_for_mode(add_state['mode'])
+            add_state['step'] = 'project'
+            if not add_state.get('project_choices'):
+                status_line = 'No projects available for selected type'
+            else:
+                status_line = 'Select project'
+        elif step == 'project':
+            project = _current_add_project()
+            if not project:
+                status_line = 'No project available; press Esc'
+                invalidate(); return
+            add_state['repo_choices'] = _build_repo_choices(project) if project else []
+            add_state['repo_index'] = 0
+            add_state['iteration_choices'] = _build_iteration_choices(project) if project else []
+            add_state['iteration_index'] = 0
+            add_state['step'] = 'title'
+        elif step == 'title':
+            if not add_state.get('title', '').strip():
+                status_line = 'Title is required'
+            else:
+                add_state['step'] = 'date'
+        elif step == 'date':
+            date_val = add_state.get('date', '').strip()
+            if date_val:
+                try:
+                    dt.date.fromisoformat(date_val)
+                except Exception:
+                    status_line = "Invalid date format"
+                    invalidate(); return
+            project = _current_add_project()
+            if date_val and project and not project.get('start_field_id'):
+                status_line = 'Project has no writable date field; date ignored'
+                add_state['date'] = ''
+                date_val = ''
+            mode = add_state.get('mode', 'issue')
+            if mode == 'issue':
+                repo_choices = add_state.get('repo_choices') or []
+                if not repo_choices:
+                    add_state['repo_manual'] = add_state.get('repo_manual', '')
+                    status_line = 'Enter repository owner/name'
+                add_state['step'] = 'repo'
+            else:
+                choices = _build_iteration_choices(project) if project else []
+                add_state['iteration_choices'] = choices
+                add_state['iteration_index'] = 0
+                add_state['step'] = 'iteration' if choices else 'confirm'
+        elif step == 'repo':
+            choices = add_state.get('repo_choices') or []
+            if choices:
+                project = _current_add_project()
+                iter_choices = _build_iteration_choices(project) if project else []
+                add_state['iteration_choices'] = iter_choices
+                add_state['iteration_index'] = 0
+                add_state['step'] = 'iteration' if iter_choices else 'confirm'
+            else:
+                if not add_state.get('repo_manual', '').strip():
+                    status_line = 'Enter repository owner/name'
+                    invalidate(); return
+                project = _current_add_project()
+                iter_choices = _build_iteration_choices(project) if project else []
+                add_state['iteration_choices'] = iter_choices
+                add_state['iteration_index'] = 0
+                add_state['step'] = 'iteration' if iter_choices else 'confirm'
+        elif step == 'iteration':
+            add_state['step'] = 'confirm'
+        elif step == 'confirm':
+            project = _current_add_project()
+            if not project:
+                close_add_mode('Project metadata unavailable')
+                return
+            title_val = add_state.get('title', '').strip()
+            if not title_val:
+                add_state['step'] = 'title'
+                status_line = 'Title is required'
+                invalidate(); return
+            date_val = add_state.get('date', '').strip()
+            iteration_choices = add_state.get('iteration_choices') or []
+            iteration_id = ''
+            if iteration_choices:
+                idx = add_state.get('iteration_index', 0)
+                opt = iteration_choices[max(0, min(idx, len(iteration_choices)-1))]
+                iteration_id = opt.get('id') or ''
+            repo_choice = None
+            repo_manual = None
+            if add_state.get('mode', 'issue') == 'issue':
+                repo_choices = add_state.get('repo_choices') or []
+                if repo_choices:
+                    repo_idx = add_state.get('repo_index', 0)
+                    repo_choice = repo_choices[max(0, min(repo_idx, len(repo_choices)-1))]
+                else:
+                    repo_manual = add_state.get('repo_manual', '').strip()
+                    if not repo_manual:
+                        status_line = 'Repository is required'
+                        invalidate(); return
+            mode_val = add_state.get('mode', 'issue')
+            close_add_mode('Creating item…')
+            asyncio.create_task(create_task_async(project, title_val, date_val, iteration_id, mode_val, repo_choice, repo_manual))
+            return
+        invalidate()
+
     # search mode
     @kb.add('/')
     def _(event):
@@ -1742,6 +3211,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('escape')
     def _(event):
         nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
+        if add_mode:
+            close_add_mode('Add cancelled')
+            return
         if in_search:
             in_search = False
             search_buffer = ""
@@ -1788,73 +3260,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         if detail_mode or in_search or in_date_filter:
             return
-        nonlocal status_line, all_rows, current_index
-        status_line = "Updating..."; invalidate()
-        try:
-            logger.info("Update triggered via 'u' (include_unassigned=%s, show_today_only=%s)", show_unassigned, show_today_only)
-        except Exception:
-            pass
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        def progress(done:int,total:int,line:str):
-            nonlocal status_line
-            status_line = line
-            invalidate()
-
-        async def worker():
-            try:
-                nonlocal all_rows, current_index, status_line, today_date
-                # Refresh today's date at start of update so colors/filters use current day
-                try:
-                    today_date = dt.date.today()
-                    logger.debug("today_date refreshed at start of update: %s", today_date)
-                except Exception:
-                    pass
-                def do_fetch():
-                    if os.environ.get('MOCK_FETCH')=='1':
-                        try:
-                            logger.info("MOCK_FETCH enabled; generating mock tasks")
-                        except Exception:
-                            pass
-                        rows = generate_mock_tasks(cfg)
-                        progress(1,1,'[########################################] 100% Done')
-                        return rows
-                    if not token:
-                        raise RuntimeError('TOKEN not set')
-                    try:
-                        logger.info("Fetching tasks from GitHub… (cutoff=%s, include_unassigned=%s)", today_date, show_unassigned)
-                    except Exception:
-                        pass
-                    return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
-                fut_rows = await asyncio.get_running_loop().run_in_executor(None, do_fetch)
-                try:
-                    logger.info("Fetched %d tasks; replacing DB rows", len(fut_rows))
-                except Exception:
-                    pass
-                db.replace_all(fut_rows)
-                # After replacing DB, re-evaluate today's date again (midnight rollovers)
-                try:
-                    today_date = dt.date.today()
-                    logger.debug("today_date refreshed after update: %s", today_date)
-                except Exception:
-                    pass
-                all_rows = load_all(); current_index = 0
-                progress(1,1,'Updated')
-                try:
-                    logger.info("Update finished successfully. Cached rows: %d", len(all_rows))
-                except Exception:
-                    pass
-            except Exception as e:
-                status_line = f"Error: {e}"; invalidate()
-                try:
-                    logger.exception("Update failed")
-                except Exception:
-                    pass
-        asyncio.create_task(worker())
+        asyncio.create_task(update_worker())
 
     # Timer toggle
     @kb.add('W', filter=is_normal)
@@ -2145,6 +3551,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  U              Toggle include unassigned (then press u to refetch)",
                 "  d              Toggle done-only filter",
                 "  N              Toggle hide tasks without a date",
+                "  C              Toggle showing created-but-unassigned tasks",
+                "  A              Add a new issue/task",
+                "  V              Toggle iteration/date view",
+                "  D              Mark status as Done",
+                "  I              Mark status as In Progress",
                 "  t / a          Today-only / All dates",
                 "  u              Update (fetch GitHub)",
                 "  ?              Toggle help",
@@ -2221,17 +3632,44 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
     iso_now = dt.datetime.now().isoformat(timespec="seconds")
     projects = ["Alpha", "Beta", "Gamma"]
     statuses = ["Todo", "In Progress", "Done", "Blocked"]
+    status_options = [
+        {"id": "opt-todo", "name": "Todo"},
+        {"id": "opt-in-progress", "name": "In Progress"},
+        {"id": "opt-done", "name": "Done"},
+        {"id": "opt-blocked", "name": "Blocked"},
+    ]
+    iteration_options = [
+        {"id": "iter-1", "title": "Sprint 1", "startDate": today.isoformat(), "duration": 14},
+        {"id": "iter-2", "title": "Sprint 2", "startDate": (today + dt.timedelta(days=14)).isoformat(), "duration": 14},
+    ]
+    assignee_field_id = "assignee-field"
+    assignee_user_ids = json.dumps(["MDQ6VXNlcjEyMzQ1"], ensure_ascii=False)
     for i, proj in enumerate(projects, start=1):
         for d_off in range(-2, 5):
             date_str = (today + dt.timedelta(days=d_off)).isoformat()
             status = statuses[(i + d_off) % len(statuses)]
+            option_id = next((opt["id"] for opt in status_options if opt["name"] == status), "opt-todo")
             rows.append(TaskRow(
                 owner_type="org", owner="example", project_number=i, project_title=proj,
                 start_field="Start date", start_date=date_str,
                 focus_field="Focus Day", focus_date=date_str,
-                title=f"Task {i}-{d_off}", repo="demo/repo",
+                title=f"Task {i}-{d_off}",
+                repo_id=f"repo-{i}",
+                repo="demo/repo",
                 url=f"https://example.com/{i}-{d_off}", updated_at=iso_now, status=status,
-                is_done=1 if status.lower()=="done" else 0
+                is_done=1 if status.lower()=="done" else 0,
+                assigned_to_me=1 if (i + d_off) % 2 == 0 else 0,
+                created_by_me=1 if (i + d_off) % 3 == 0 else 0,
+                item_id=f"item-{i}-{d_off}",
+                project_id=f"proj-{i}",
+                status_field_id="status-field",
+                status_option_id=option_id,
+                status_options=json.dumps(status_options, ensure_ascii=False),
+                start_field_id="start-field",
+                iteration_field_id="iteration-field",
+                iteration_options=json.dumps(iteration_options, ensure_ascii=False),
+                assignee_field_id=assignee_field_id,
+                assignee_user_ids=assignee_user_ids,
             ))
     return rows
 
