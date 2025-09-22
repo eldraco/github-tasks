@@ -182,6 +182,7 @@ class TaskRow:
     title: str = ""
     repo_id: str = ""
     repo: Optional[str] = None
+    labels: str = "[]"
     url: str = ""
     updated_at: str = ""
     status: Optional[str] = None  # textual status (eg. In Progress, Done)
@@ -208,7 +209,7 @@ class TaskDB:
         "start_field","start_date",
         "focus_field","focus_date",
         "iteration_field","iteration_title","iteration_start","iteration_duration",
-        "title","repo_id","repo","url","updated_at","status","is_done","assigned_to_me","created_by_me",
+        "title","repo_id","repo","labels","url","updated_at","status","is_done","assigned_to_me","created_by_me",
         "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id",
         "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids"
     ]
@@ -229,6 +230,7 @@ class TaskDB:
         title TEXT NOT NULL,
         repo_id TEXT,
         repo TEXT,
+        labels TEXT,
         url TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         status TEXT,
@@ -290,7 +292,7 @@ class TaskDB:
             "start_field":"''","start_date":"''",
             "focus_field":"''","focus_date":"''",
             "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
-            "title":"''","repo_id":"''","repo":"NULL","url":"''",
+            "title":"''","repo_id":"''","repo":"NULL","labels":"'[]'","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
             "assigned_to_me":"0","created_by_me":"0",
             "item_id":"''","project_id":"''","status_field_id":"''","status_option_id":"''",
@@ -318,10 +320,15 @@ class TaskDB:
                 task_url TEXT NOT NULL,
                 project_title TEXT,
                 started_at TEXT NOT NULL,
-                ended_at TEXT
+                ended_at TEXT,
+                labels TEXT
             )
             """
         )
+        try:
+            cur.execute("ALTER TABLE work_sessions ADD COLUMN labels TEXT")
+        except sqlite3.OperationalError:
+            pass
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ws_task ON work_sessions(task_url)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ws_open ON work_sessions(ended_at)")
         # Detailed timer events log for later forensics/reports
@@ -351,8 +358,8 @@ class TaskDB:
             return
         now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
         cur.execute(
-            "INSERT INTO work_sessions(task_url, project_title, started_at, ended_at) VALUES (?,?,?,NULL)",
-            (task_url, project_title, now),
+            "INSERT INTO work_sessions(task_url, project_title, started_at, ended_at, labels) VALUES (?,?,?,?,?)",
+            (task_url, project_title, now, None, labels_json or "[]"),
         )
         cur.execute(
             "INSERT INTO timer_events(task_url, project_title, repo, labels, action, at) VALUES (?,?,?,?,?,?)",
@@ -366,8 +373,8 @@ class TaskDB:
         now = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
         cur = self.conn.cursor()
         cur.execute(
-            "UPDATE work_sessions SET ended_at=? WHERE task_url=? AND ended_at IS NULL",
-            (now, task_url),
+            "UPDATE work_sessions SET ended_at=?, labels=? WHERE task_url=? AND ended_at IS NULL",
+            (now, labels_json or "[]", task_url),
         )
         cur.execute(
             "INSERT INTO timer_events(task_url, project_title, repo, labels, action, at) VALUES (?,?,?,?,?,?)",
@@ -426,7 +433,7 @@ class TaskDB:
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT id, project_title, started_at, ended_at
+            SELECT id, project_title, started_at, ended_at, labels
             FROM work_sessions
             WHERE task_url=?
             ORDER BY started_at DESC, id DESC
@@ -434,12 +441,13 @@ class TaskDB:
             (task_url,),
         )
         rows = []
-        for sid, proj, started_at, ended_at in cur.fetchall():
+        for sid, proj, started_at, ended_at, labels in cur.fetchall():
             rows.append({
                 'id': sid,
                 'project_title': proj,
                 'started_at': started_at,
                 'ended_at': ended_at,
+                'labels': labels,
             })
         return rows
 
@@ -648,6 +656,48 @@ class TaskDB:
             out[proj] = out.get(proj, 0) + int((en - st).total_seconds())
         return out
 
+    def aggregate_label_totals(self, since_days: Optional[int] = None,
+                               project_title: Optional[str] = None,
+                               task_url: Optional[str] = None) -> Dict[str, int]:
+        cur = self.conn.cursor()
+        query = "SELECT task_url, project_title, labels, started_at, ended_at FROM work_sessions"
+        params: List[object] = []
+        conditions: List[str] = []
+        if project_title:
+            conditions.append("project_title=?")
+            params.append(project_title)
+        if task_url:
+            conditions.append("task_url=?")
+            params.append(task_url)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
+        out: Dict[str, int] = {}
+        for _, _, labels_json, st_s, en_s in rows:
+            st = self._parse_iso(st_s)
+            en = self._parse_iso(en_s) if en_s else None
+            if not st:
+                continue
+            if en is None:
+                en = now
+            st, en, keep = self._clip_range(st, en, since_dt)
+            if not keep or st >= en:
+                continue
+            duration = int((en - st).total_seconds())
+            try:
+                data = json.loads(labels_json or "[]")
+                names = [str(x) for x in data if isinstance(x, str) and x]
+            except Exception:
+                names = []
+            if not names:
+                names = ['(no label)']
+            for name in set(names):
+                out[name] = out.get(name, 0) + duration
+        return out
+
     def aggregate_project_period_totals(self, granularity: str, since_days: Optional[int] = None) -> Dict[str, Dict[str, int]]:
         cur = self.conn.cursor()
         cur.execute("SELECT project_title, started_at, ended_at FROM work_sessions")
@@ -710,10 +760,10 @@ class TaskDB:
               start_field, start_date,
               focus_field, focus_date,
               iteration_field, iteration_title, iteration_start, iteration_duration,
-              title, repo_id, repo, url, updated_at, status, is_done, assigned_to_me, created_by_me,
+              title, repo_id, repo, labels, url, updated_at, status, is_done, assigned_to_me, created_by_me,
               item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
               start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
@@ -724,6 +774,7 @@ class TaskDB:
                           iteration_title=excluded.iteration_title,
                           iteration_start=excluded.iteration_start,
                           iteration_duration=excluded.iteration_duration,
+                          labels=excluded.labels,
                           assigned_to_me=excluded.assigned_to_me,
                           created_by_me=excluded.created_by_me,
                           item_id=excluded.item_id,
@@ -756,6 +807,7 @@ class TaskDB:
                     r.title,
                     r.repo_id,
                     r.repo,
+                    r.labels,
                     r.url,
                     r.updated_at,
                     r.status,
@@ -795,7 +847,7 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo_id,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       title,repo_id,repo,labels,url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                        start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
                 FROM tasks WHERE focus_date = ?
@@ -808,7 +860,7 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo_id,repo,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       title,repo_id,repo,labels,url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                        start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
                 FROM tasks
@@ -854,11 +906,13 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
               title url repository{ id nameWithOwner }
               assignees(first:50){ nodes{ id login } }
               author { login }
+              labels(first:50){ nodes{ name color } }
             }
             ... on PullRequest {
               title url repository{ id nameWithOwner }
               assignees(first:50){ nodes{ id login } }
               author { login }
+              labels(first:50){ nodes{ name color } }
             }
           }
                     fieldValues(first:50){
@@ -924,11 +978,13 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
               title url repository{ id nameWithOwner }
               assignees(first:50){ nodes{ id login } }
               author { login }
+              labels(first:50){ nodes{ name color } }
             }
             ... on PullRequest {
               title url repository{ id nameWithOwner }
               assignees(first:50){ nodes{ id login } }
               author { login }
+              labels(first:50){ nodes{ name color } }
             }
           }
                     fieldValues(first:50){
@@ -1027,13 +1083,13 @@ GQL_MUTATION_SET_ITERATION = """mutation($projectId:ID!, $itemId:ID!, $fieldId:I
 }
 """
 
-GQL_MUTATION_SET_USERS = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $userIds:[ID!]!) {
+GQL_MUTATION_SET_USERS_TEMPLATE = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!) {
   updateProjectV2ItemFieldValue(
     input:{
       projectId:$projectId,
       itemId:$itemId,
       fieldId:$fieldId,
-      value:{userIds:$userIds}
+      value:{users:{nodes:[__NODES__]}}
     }
   ){
     projectV2Item{ id }
@@ -1300,13 +1356,19 @@ def set_project_users(token: str, project_id: str, item_id: str, field_id: str, 
     if not user_ids:
         return
     session = _session(token)
+    def _escape(uid: str) -> str:
+        return uid.replace('"', '\"')
+
+    nodes = ", ".join(f'{{id:"{_escape(uid)}"}}' for uid in user_ids if uid)
+    if not nodes:
+        return
+    query = GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", nodes)
     variables = {
         "projectId": project_id,
         "itemId": item_id,
         "fieldId": field_id,
-        "userIds": user_ids,
     }
-    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_USERS, variables)
+    resp = _graphql_with_backoff(session, query, variables)
     errs = resp.get("errors") or []
     if errs:
         raise RuntimeError("Setting assignees failed: " + "; ".join(e.get("message", str(e)) for e in errs))
@@ -1583,6 +1645,13 @@ def fetch_tasks_github(
                     repo = rep.get("nameWithOwner")
                     repo_id = rep.get("id") or ""
 
+                label_names: List[str] = []
+                if ctype in ("Issue", "PullRequest"):
+                    for node in (content.get("labels") or {}).get("nodes") or []:
+                        nm = (node or {}).get("name")
+                        if nm:
+                            label_names.append(str(nm))
+
                 assignees_norm: List[str] = []
                 if ctype in ("Issue","PullRequest"):
                     for node in (content.get("assignees") or {}).get("nodes") or []:
@@ -1709,7 +1778,9 @@ def fetch_tasks_github(
                                 iteration_title=iteration_title,
                                 iteration_start=iteration_start,
                                 iteration_duration=iteration_duration,
-                                title=title, repo=repo, url=url, updated_at=iso_now,
+                                title=title, repo=repo,
+                                labels=json.dumps(label_names, ensure_ascii=False),
+                                url=url, updated_at=iso_now,
                                 status=status_text, is_done=done_flag,
                                 repo_id=repo_id,
                                 assigned_to_me=int(assigned_to_me),
@@ -1747,11 +1818,14 @@ def fetch_tasks_github(
                             iteration_title=iteration_title,
                             iteration_start=iteration_start,
                             iteration_duration=iteration_duration,
-                            title=title + (" (unassigned)" if not assigned_to_me else ""), repo=repo, url=url, updated_at=iso_now,
-                                status=status_text, is_done=done_flag,
-                                repo_id=repo_id,
-                                assigned_to_me=int(assigned_to_me),
-                                created_by_me=int(created_by_me),
+                            title=title + (" (unassigned)" if not assigned_to_me else ""),
+                            repo=repo,
+                            labels=json.dumps(label_names, ensure_ascii=False),
+                            url=url, updated_at=iso_now,
+                            status=status_text, is_done=done_flag,
+                            repo_id=repo_id,
+                            assigned_to_me=int(assigned_to_me),
+                            created_by_me=int(created_by_me),
                             item_id=item_id,
                             project_id=project_id,
                             status_field_id=status_field_id,
@@ -2412,6 +2486,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def filtered_rows() -> List[TaskRow]:
         return apply_filters(all_rows)
 
+    def _task_labels(row: TaskRow) -> List[str]:
+        try:
+            data = json.loads(row.labels or "[]")
+            return [str(x) for x in data if isinstance(x, str) and x]
+        except Exception:
+            return []
+
     def build_table_fragments() -> List[Tuple[str,str]]:
         rows = filtered_rows()
         nonlocal current_index
@@ -2442,35 +2523,71 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if use_iteration:
             iter_min = 15
             title_min = 20
+            label_min = 16
             proj_min = 12
-            sum_min = iter_min + title_min + proj_min
-            base_fixed = 2 + 2 + 10 + 2 + time_w + 2 + 2  # marker + spaces + status + time separators
-            dyn_total = max(sum_min, avail_cols - base_fixed)
-            extra = dyn_total - sum_min
-            iter_w = iter_min + extra // 4
-            title_w = title_min + extra // 2
-            proj_w = proj_min + extra - (extra // 4) - (extra // 2)
+            spaces_width = 2 * 5  # gaps between columns
+            fixed_base = 2 + 10 + time_w + spaces_width  # marker + status + time + spaces
+            dyn_total = max(iter_min + title_min + label_min + proj_min, avail_cols - fixed_base)
+            extra = dyn_total - (iter_min + title_min + label_min + proj_min)
+            weights = [1, 2, 1, 1]
+            weight_sum = sum(weights)
+            iter_w = iter_min + (extra * weights[0]) // weight_sum
+            title_w = title_min + (extra * weights[1]) // weight_sum
+            label_w = label_min + (extra * weights[2]) // weight_sum
+            proj_w = dyn_total - iter_w - title_w - label_w
+            if proj_w < proj_min:
+                deficit = proj_min - proj_w
+                take = min(deficit, max(0, label_w - label_min))
+                label_w -= take
+                deficit -= take
+                take = min(deficit, max(0, title_w - title_min))
+                title_w -= take
+                deficit -= take
+                take = min(deficit, max(0, iter_w - iter_min))
+                iter_w -= take
+                deficit -= take
+                proj_w = proj_min
+                if deficit > 0:
+                    title_w += deficit  # best-effort rebalance
             header = (
                 "  " + _pad_display("Iteration", iter_w) +
                 "  " + _pad_display("STATUS", 10) +
                 "  " + _pad_display("TIME", time_w, align='right') +
                 "  " + _pad_display("TITLE", title_w) +
+                "  " + _pad_display("LABELS", label_w) +
                 "  " + _pad_display("PROJECT", proj_w)
             )
         else:
             proj_min = 12
             title_min = 20
-            fixed = 2 + 11 + 2 + 12 + 2 + 10 + 2 + time_w + 2  # marker + focus + start + status + time + spaces
-            dyn = max(title_min + proj_min, avail_cols - fixed)
-            extra = dyn - (title_min + proj_min)
-            title_w = title_min + extra // 2
-            proj_w = proj_min + extra - (extra // 2)
+            label_min = 16
+            spaces_width = 2 * 6  # gaps between columns
+            fixed = 2 + 11 + 12 + 10 + time_w + spaces_width  # marker + focus + start + status + time + spaces
+            dyn = max(title_min + label_min + proj_min, avail_cols - fixed)
+            extra = dyn - (title_min + label_min + proj_min)
+            weights = [2, 1, 1]
+            weight_sum = sum(weights)
+            title_w = title_min + (extra * weights[0]) // weight_sum
+            label_w = label_min + (extra * weights[1]) // weight_sum
+            proj_w = dyn - title_w - label_w
+            if proj_w < proj_min:
+                deficit = proj_min - proj_w
+                take = min(deficit, max(0, label_w - label_min))
+                label_w -= take
+                deficit -= take
+                take = min(deficit, max(0, title_w - title_min))
+                title_w -= take
+                deficit -= take
+                proj_w = proj_min
+                if deficit > 0:
+                    title_w += deficit
             header = (
                 "  " + _pad_display("Focus Day", 11) +
                 "  " + _pad_display("Start Date", 12) +
                 "  " + _pad_display("STATUS", 10) +
                 "  " + _pad_display("TIME", time_w, align='right') +
                 "  " + _pad_display("TITLE", title_w) +
+                "  " + _pad_display("LABELS", label_w) +
                 "  " + _pad_display("PROJECT", proj_w)
             )
         frags.append(("bold", header[h_offset:]))
@@ -2509,16 +2626,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             time_cell = _pad_display(time_text, time_w, align='right')
             title_cell = _pad_display(t.title, title_w)
             project_cell = _pad_display(t.project_title, proj_w)
+            labels_list = _task_labels(t)
+            labels_text = ", ".join(labels_list)
             if use_iteration:
                 iter_label = t.iteration_title or t.iteration_start or '-'
                 if t.iteration_title and t.iteration_start:
                     iter_label = f"{t.iteration_title} ({t.iteration_start})"
                 iteration_cell = _pad_display(iter_label or '-', iter_w)
-                line = f"{marker}{iteration_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
+                labels_cell = _pad_display(labels_text or '-', label_w)
+                line = f"{marker}{iteration_cell}  {status_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
             else:
                 focus_cell = _pad_display(t.focus_date or '-', 11)
                 start_cell = _pad_display(t.start_date, 12)
-                line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {time_cell}  {title_cell}  {project_cell}"
+                labels_cell = _pad_display(labels_text or '-', label_w)
+                line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -2589,6 +2710,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 fr += [("", "\n")]
                 fr += [("bold", "Top Proj (30d)\n")]
                 for name, secs in tops:
+                    fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
+        except Exception:
+            pass
+        try:
+            lt30 = db.aggregate_label_totals(since_days=30)
+            label_tops = sorted(lt30.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            if label_tops:
+                fr += [("", "\n")]
+                fr += [("bold", "Top Labels (30d)\n")]
+                for name, secs in label_tops:
                     fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
         except Exception:
             pass
@@ -3064,6 +3195,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 nm = (name or '-')
                 bar = '█' * max(1, int(30 * secs / maxv))
                 lines.append(f"  {_truncate(nm,20):<20} {_fmt_hms_full(secs):>10}  {bar}")
+        lines.append("")
+        lines.append("Top labels (window):")
+        label_totals = db.aggregate_label_totals(since_days=since_days)
+        label_tops = sorted(label_totals.items(), key=lambda x: x[1], reverse=True)[:10]
+        if not label_tops:
+            lines.append("  (no data)")
+        else:
+            maxv_lab = max(v for _, v in label_tops) or 1
+            for name, secs in label_tops:
+                nm = (name or '-')
+                bar = '█' * max(1, int(30 * secs / maxv_lab))
+                lines.append(f"  {_truncate(nm,20):<20} {_fmt_hms_full(secs):>10}  {bar}")
         # Quick multi-granularity snapshot (recent sums)
         lines.append("")
         lines.append("Quick view (recent sums):")
@@ -3087,6 +3230,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not rows:
             return [("", "No selection")] 
         t = rows[current_index]
+        labels_list = _task_labels(t)
+        labels_display = ", ".join(labels_list) if labels_list else "-"
         iter_parts = []
         if t.iteration_title:
             iter_parts.append(t.iteration_title)
@@ -3103,6 +3248,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             f"Project: {t.project_title}",
             f"Title:   {t.title}",
             f"Repo:    {t.repo}",
+            f"Labels:  {labels_display}",
             f"URL:     {t.url}",
             f"Start:   {t.start_date} ({t.start_field})",
             f"Focus:   {t.focus_date or '-'} ({t.focus_field or '-'})",
@@ -4449,6 +4595,7 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 title=f"Task {i}-{d_off}",
                 repo_id=f"repo-{i}",
                 repo="demo/repo",
+                labels=json.dumps(["Label", f"L{i}"], ensure_ascii=False),
                 url=f"https://example.com/{i}-{d_off}", updated_at=iso_now, status=status,
                 is_done=1 if status.lower()=="done" else 0,
                 assigned_to_me=1 if (i + d_off) % 2 == 0 else 0,
