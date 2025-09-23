@@ -136,6 +136,7 @@ def load_config(path: str) -> Config:
 
 TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
 USER_ID_CACHE: Dict[str, str] = {}
+STATUS_OPTION_CACHE: Dict[str, List[Dict[str, object]]] = {}
 _UNSET = object()
 
 
@@ -752,6 +753,32 @@ class TaskDB:
         )
         self.conn.commit()
 
+    def update_status_options(self, url: str, options: List[Dict[str, object]]) -> None:
+        try:
+            payload = json.dumps(options or [], ensure_ascii=False)
+        except Exception:
+            payload = "[]"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status_options=? WHERE url=?",
+            (payload, url),
+        )
+        self.conn.commit()
+
+    def update_status_options_by_field(self, field_id: str, options: List[Dict[str, object]]) -> None:
+        if not field_id:
+            return
+        try:
+            payload = json.dumps(options or [], ensure_ascii=False)
+        except Exception:
+            payload = "[]"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status_options=? WHERE status_field_id=?",
+            (payload, field_id),
+        )
+        self.conn.commit()
+
     def upsert_many(self, rows: List[TaskRow]):
         if not rows:
             return
@@ -1128,6 +1155,16 @@ GQL_PROJECT_FIELDS = """query($id:ID!){
 }
 """
 
+GQL_FIELD_OPTIONS = """query($id:ID!){
+  node(id:$id){
+    ... on ProjectV2SingleSelectField{
+      name
+      options { id name }
+    }
+  }
+}
+"""
+
 def _session(token: str) -> requests.Session:
     s = requests.Session()
     s.headers["Authorization"] = f"Bearer {token}"
@@ -1487,6 +1524,31 @@ def get_project_field_id_by_name(token: str, project_id: str, name_lower: str) -
     return None
 
 
+def get_project_field_options(token: str, field_id: str) -> List[Dict[str, str]]:
+    if not (token and field_id):
+        return []
+    if field_id in STATUS_OPTION_CACHE:
+        cached = STATUS_OPTION_CACHE.get(field_id) or []
+        return [opt for opt in cached if isinstance(opt, dict)]
+    session = _session(token)
+    resp = _graphql_with_backoff(session, GQL_FIELD_OPTIONS, {"id": field_id})
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Fetch status options failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    node = (resp.get("data") or {}).get("node") or {}
+    options_raw = node.get("options") or []
+    out: List[Dict[str, str]] = []
+    for opt in options_raw:
+        if not isinstance(opt, dict):
+            continue
+        opt_id = (opt.get("id") or "").strip()
+        opt_name = (opt.get("name") or "").strip()
+        if opt_id and opt_name:
+            out.append({"id": opt_id, "name": opt_name})
+    STATUS_OPTION_CACHE[field_id] = out
+    return out
+
+
 # -----------------------------
 # Fetch with progress callback
 # -----------------------------
@@ -1496,6 +1558,31 @@ def _ascii_bar(done:int, total:int, width:int=40)->str:
     pct = 0 if total<=0 else int(done*100/total)
     fill = int(width*pct/100)
     return f"[{'#'*fill}{'.'*(width-fill)}] {pct:3d}%"
+
+
+STATUS_FIELD_HINTS = ("status", "state", "progress", "stage", "column")
+
+
+def _looks_like_status_field(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    norm = name.strip().lower()
+    return bool(norm) and any(hint in norm for hint in STATUS_FIELD_HINTS)
+
+
+def _status_field_priority(name: Optional[str]) -> int:
+    norm = (name or "").strip().lower()
+    if 'status' in norm:
+        return 0
+    if 'state' in norm:
+        return 1
+    if 'progress' in norm:
+        return 2
+    if 'stage' in norm:
+        return 3
+    if 'column' in norm:
+        return 4
+    return 10
 
 
 class _ParallelProgress:
@@ -1725,6 +1812,7 @@ def fetch_tasks_github(
                 assignee_user_ids: List[str] = []
                 status_text: Optional[str] = None
                 status_field_id: str = ""
+                status_field_priority = 999
                 status_option_id: str = ""
                 status_options_list: List[Dict[str, str]] = []
                 author_login_norm: Optional[str] = None
@@ -1749,18 +1837,34 @@ def fetch_tasks_github(
                                 assignee_user_ids.append(node_id)
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldSingleSelectValue":
                         field_data = fv.get("field") or {}
-                        fname_sel = (field_data.get("name") or "").lower()
+                        raw_name = field_data.get("name") or ""
+                        fname_sel = raw_name.strip().lower()
                         option_id_val = fv.get("optionId") or ""
                         options_raw = field_data.get("options") or []
-                        if options_raw:
-                            status_options_list = [
+                        is_status_field = _looks_like_status_field(raw_name)
+                        if is_status_field and options_raw:
+                            new_opts = [
                                 {"id": opt.get("id"), "name": opt.get("name")}
                                 for opt in options_raw if opt and opt.get("id")
                             ]
-                        if fname_sel in ("status", "state", "progress"):
-                            status_text = (fv.get("name") or "").strip()
-                            status_field_id = field_data.get("id") or ""
-                            status_option_id = option_id_val
+                            if status_options_list:
+                                seen_ids = {opt.get("id") for opt in status_options_list if isinstance(opt, dict)}
+                                for opt in new_opts:
+                                    if opt.get("id") not in seen_ids:
+                                        status_options_list.append(opt)
+                            else:
+                                status_options_list = new_opts
+                        if is_status_field:
+                            priority = _status_field_priority(raw_name)
+                            field_id_candidate = field_data.get("id") or ""
+                            if (
+                                priority < status_field_priority
+                                or (field_id_candidate and field_id_candidate == status_field_id)
+                            ):
+                                status_field_id = field_id_candidate or status_field_id
+                                status_field_priority = priority
+                                status_text = (fv.get("name") or "").strip()
+                                status_option_id = option_id_val
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
                         field_info = fv.get("field") or {}
                         start_field_id = field_info.get("id") or start_field_id
@@ -2464,7 +2568,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return int(any(kw in low for kw in STATUS_KEYWORDS['done']))
 
     async def _apply_status_change(target: str):
-        nonlocal all_rows, status_line
+        nonlocal all_rows, status_line, current_index
         if not token:
             status_line = "GITHUB_TOKEN required for status updates"
             invalidate(); return
@@ -2472,7 +2576,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not rows:
             status_line = "No task selected"
             invalidate(); return
+        current_index = max(0, min(len(rows)-1, current_index))
         row = rows[current_index]
+        selected_url = row.url
         if row.url in pending_status_urls:
             status_line = "Status update already in progress"
             invalidate(); return
@@ -2480,6 +2586,35 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = "Task missing status metadata"
             invalidate(); return
         option_id, display_name = _match_status_option(row, target)
+        if not option_id and token and row.status_field_id:
+            try:
+                fetched_opts = get_project_field_options(token, row.status_field_id)
+            except Exception as exc:
+                fetched_opts = []
+                try:
+                    logger.warning("Unable to fetch status options for %s: %s", row.status_field_id, exc)
+                except Exception:
+                    pass
+            if fetched_opts:
+                try:
+                    db.update_status_options_by_field(row.status_field_id, fetched_opts)
+                except Exception:
+                    try:
+                        db.update_status_options(selected_url, fetched_opts)
+                    except Exception:
+                        pass
+                all_rows = load_all()
+                rows = filtered_rows()
+                if rows:
+                    for idx, candidate in enumerate(rows):
+                        if candidate.url == selected_url:
+                            current_index = idx
+                            row = candidate
+                            break
+                    else:
+                        current_index = max(0, min(len(rows)-1, current_index))
+                        row = rows[current_index]
+                option_id, display_name = _match_status_option(row, target)
         if not option_id:
             status_line = f"No status option matches '{target}'"
             invalidate(); return
