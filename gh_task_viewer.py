@@ -42,7 +42,9 @@ import sqlite3
 import sys
 import string
 import json
+import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Iterable, Set
 
@@ -1495,6 +1497,59 @@ def _ascii_bar(done:int, total:int, width:int=40)->str:
     fill = int(width*pct/100)
     return f"[{'#'*fill}{'.'*(width-fill)}] {pct:3d}%"
 
+
+class _ParallelProgress:
+    """Thread-safe progress reporter shared across project fetch workers."""
+
+    def __init__(self, total: int, progress_cb: Optional[ProgressCB]):
+        self._total = max(0, total)
+        self._cb = progress_cb
+        self._lock = threading.Lock()
+        self._done = 0
+        self._message = ""
+
+    def set_message(self, message: str) -> None:
+        if not self._cb:
+            return
+        with self._lock:
+            self._message = message or ""
+            self._emit()
+
+    def advance(self, message: Optional[str] = None) -> None:
+        if not self._cb:
+            return
+        with self._lock:
+            self._done = min(self._total, self._done + 1)
+            if message:
+                self._message = message
+            self._emit()
+
+    def complete(self, message: str) -> None:
+        if not self._cb:
+            return
+        with self._lock:
+            self._done = self._total
+            self._message = message
+            self._emit()
+
+    def _emit(self) -> None:
+        status = f"{_ascii_bar(self._done, self._total)}  {self._message}".rstrip()
+        try:
+            self._cb(self._done, self._total, status)
+        except Exception:
+            try:
+                logging.getLogger('gh_task_viewer').debug('Progress callback failed', exc_info=True)
+            except Exception:
+                pass
+
+
+@dataclass
+class _ProjectFetchResult:
+    rows: List[TaskRow]
+    label: str
+    rate_limited: bool = False
+    message: str = ""
+
 def fetch_tasks_github(
     token: str,
     cfg: Config,
@@ -1571,20 +1626,26 @@ def fetch_tasks_github(
         raise RuntimeError("No project targets resolved; check config or specify project numbers")
 
     total = len(targets)
+    tracker = _ParallelProgress(total, progress)
     try:
         logging.getLogger('gh_task_viewer').info("Fetching from %d project targets", total)
     except Exception:
         pass
-    done = 0
+    if total == 0:
+        return []
 
-    def tick(msg: str):
-        nonlocal done
-        if progress:
-            progress(done, total, f"{_ascii_bar(done,total)}  {msg}")
+    tracker.set_message("Queued project fetch")
 
-    for owner_type, owner, number, ptitle in targets:
-        tick(f"Scanning {owner_type}:{owner} #{number} {('— '+ptitle) if ptitle else ''}")
-        after = None
+    wait_cb: Optional[Callable[[str], None]] = tracker.set_message if progress else None
+
+    def _scan_project(owner_type: str, owner: str, number: int, ptitle: str) -> _ProjectFetchResult:
+        label = f"{owner_type}:{owner} #{number}"
+        if ptitle:
+            label = f"{label} — {ptitle}"
+        local_rows: List[TaskRow] = []
+        session_local = _session(token)
+        after: Optional[str] = None
+        tracker.set_message(f"Scanning {label}")
         while True:
             variables = (
                 {"org": owner, "number": number, "after": after}
@@ -1592,28 +1653,29 @@ def fetch_tasks_github(
                 else {"login": owner, "number": number, "after": after}
             )
             query = GQL_SCAN_ORG if owner_type == "org" else GQL_SCAN_USER
-            resp = _graphql_with_backoff(session, query, variables, on_wait=lambda m: tick(m))
+            resp = _graphql_with_backoff(session_local, query, variables, on_wait=wait_cb)
 
             errs = resp.get("errors") or []
             if errs:
                 nf = any((e.get("type") == "NOT_FOUND") and ("projectV2" in (e.get("path") or [])) for e in errs)
                 if nf:
                     try:
-                        logging.getLogger('gh_task_viewer').warning("Project not found or inaccessible: %s:%s #%s", owner_type, owner, number)
+                        logging.getLogger('gh_task_viewer').warning(
+                            "Project not found or inaccessible: %s:%s #%s", owner_type, owner, number
+                        )
                     except Exception:
                         pass
-                    break  # skip invalid/inaccessible project number
-                # Handle RATE_LIMITED gracefully: keep partial results and return
+                    tracker.set_message(f"Project not found: {label}")
+                    break
                 rate_limited = any((e.get("type") == "RATE_LIMITED") for e in errs)
                 if rate_limited:
-                    if progress:
-                        progress(done, total, f"{_ascii_bar(done,total)}  Rate limited; partial results")
+                    msg = f"{label}: Rate limited; partial results"
+                    tracker.set_message(msg)
                     try:
-                        logging.getLogger('gh_task_viewer').warning("Rate limited; returning partial results")
+                        logging.getLogger('gh_task_viewer').warning("Rate limited during fetch; returning partial results")
                     except Exception:
                         pass
-                    return out
-                # Other errors are considered fatal
+                    return _ProjectFetchResult(rows=local_rows, label=label, rate_limited=True, message=msg)
                 try:
                     logging.getLogger('gh_task_viewer').error("GraphQL errors: %s", errs)
                 except Exception:
@@ -1640,7 +1702,7 @@ def fetch_tasks_github(
                 project_id = project_info.get("id") or ""
                 repo = None
                 repo_id = ""
-                if ctype in ("Issue","PullRequest"):
+                if ctype in ("Issue", "PullRequest"):
                     rep = content.get("repository") or {}
                     repo = rep.get("nameWithOwner")
                     repo_id = rep.get("id") or ""
@@ -1653,7 +1715,7 @@ def fetch_tasks_github(
                             label_names.append(str(nm))
 
                 assignees_norm: List[str] = []
-                if ctype in ("Issue","PullRequest"):
+                if ctype in ("Issue", "PullRequest"):
                     for node in (content.get("assignees") or {}).get("nodes") or []:
                         login_norm = _norm_login((node or {}).get("login"))
                         if login_norm:
@@ -1695,7 +1757,7 @@ def fetch_tasks_github(
                                 {"id": opt.get("id"), "name": opt.get("name")}
                                 for opt in options_raw if opt and opt.get("id")
                             ]
-                        if fname_sel in ("status","state","progress"):
+                        if fname_sel in ("status", "state", "progress"):
                             status_text = (fv.get("name") or "").strip()
                             status_field_id = field_data.get("id") or ""
                             status_option_id = option_id_val
@@ -1728,14 +1790,13 @@ def fetch_tasks_github(
                             iteration_captured = True
                 if ctype == "DraftIssue":
                     author_login_norm = _norm_login(((content.get("creator") or {})).get("login"))
-                elif ctype in ("Issue","PullRequest"):
+                elif ctype in ("Issue", "PullRequest"):
                     author_login_norm = _norm_login(((content.get("author") or {})).get("login"))
                 assigned_to_me = (me_login in assignees_norm) or (me_login in people_logins)
                 created_by_me = author_login_norm == me_login if author_login_norm else False
                 if (not assigned_to_me) and (not created_by_me) and (not include_unassigned):
                     continue
 
-                # Extract optional Focus Day for coloring and Today filter
                 focus_fname: str = ""
                 focus_fdate: str = ""
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
@@ -1758,16 +1819,15 @@ def fetch_tasks_github(
                         if not fdate or not regex.search(fname):
                             continue
                         try:
-                            dt.date.fromisoformat(fdate)  # validate
+                            dt.date.fromisoformat(fdate)
                         except ValueError:
                             continue
-                        # Store all tasks regardless of whether date is past/future so UI can filter.
                         done_flag = 0
                         if status_text:
                             low = status_text.lower()
-                            if any(k in low for k in ("done","complete","closed","merged","finished","✅","✔")):
+                            if any(k in low for k in ("done", "complete", "closed", "merged", "finished", "✅", "✔")):
                                 done_flag = 1
-                        out.append(
+                        local_rows.append(
                             TaskRow(
                                 owner_type=owner_type, owner=owner, project_number=number,
                                 project_title=project_title,
@@ -1800,14 +1860,13 @@ def fetch_tasks_github(
                             )
                         )
                         found_date = True
-                # If no matching date field was found, still include the item so the project shows up.
                 if not found_date:
                     done_flag = 0
                     if status_text:
                         low = status_text.lower()
-                        if any(k in low for k in ("done","complete","closed","merged","finished","✅","✔")):
+                        if any(k in low for k in ("done", "complete", "closed", "merged", "finished", "✅", "✔")):
                             done_flag = 1
-                    out.append(
+                    local_rows.append(
                         TaskRow(
                             owner_type=owner_type, owner=owner, project_number=number,
                             project_title=project_title,
@@ -1844,15 +1903,52 @@ def fetch_tasks_github(
             page = (proj_node.get("items") or {}).get("pageInfo") or {}
             if page.get("hasNextPage"):
                 after = page.get("endCursor")
-                tick(f"Scanning {owner_type}:{owner} #{number} (next page)")
+                tracker.set_message(f"Scanning {label} (next page)")
             else:
                 break
 
-        done += 1
-        tick(f"Finished {owner_type}:{owner} #{number}")
+        return _ProjectFetchResult(rows=local_rows, label=label)
 
-    if progress:
-        progress(total, total, f"{_ascii_bar(total,total)}  Done")
+    results_by_idx: Dict[int, List[TaskRow]] = {}
+    rate_limited_triggered = False
+
+    workers = min(4, max(1, total))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_scan_project, owner_type, owner, number, ptitle): idx
+            for idx, (owner_type, owner, number, ptitle) in enumerate(targets)
+        }
+        for future in as_completed(future_map):
+            idx = future_map[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                tracker.set_message(f"Error: {exc}")
+                raise
+            results_by_idx[idx] = result.rows
+            if result.rate_limited:
+                rate_limited_triggered = True
+                for other_future, other_idx in future_map.items():
+                    if other_future is future:
+                        continue
+                    if other_future.done():
+                        try:
+                            other_result = other_future.result()
+                        except Exception:
+                            continue
+                        results_by_idx[other_idx] = other_result.rows
+                break
+            tracker.advance(f"Finished {result.label}")
+
+    out: List[TaskRow] = []
+    for idx in range(len(targets)):
+        rows = results_by_idx.get(idx)
+        if rows:
+            out.extend(rows)
+
+    if not rate_limited_triggered and progress:
+        tracker.complete("Done")
+
     return out
 
 
