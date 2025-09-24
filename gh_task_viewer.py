@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import datetime as dt
 import os
 import re
@@ -892,7 +893,7 @@ class TaskDB:
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
@@ -2941,6 +2942,33 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _refresh_task_editor_state()
         invalidate()
 
+    def _calendar_adjust(days: int = 0, months: int = 0) -> None:
+        if not edit_task_mode or task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        fields = task_edit_state.get('fields') or []
+        editing = task_edit_state.get('editing') or {}
+        idx = editing.get('field_idx')
+        if idx is None or idx >= len(fields):
+            return
+        iso = editing.get('calendar_date') or fields[idx].get('value') or dt.date.today().isoformat()
+        try:
+            current = dt.date.fromisoformat(iso)
+        except Exception:
+            current = dt.date.today()
+        if months:
+            month = current.month - 1 + months
+            year = current.year + month // 12
+            month = month % 12 + 1
+            day = min(current.day, calendar.monthrange(year, month)[1])
+            current = dt.date(year, month, day)
+        if days:
+            current += dt.timedelta(days=days)
+        editing['calendar_date'] = current.isoformat()
+        fields[idx]['value'] = current.isoformat()
+        task_edit_state['editing'] = editing
+        task_edit_state['message'] = current.isoformat()
+        invalidate()
+
     async def _change_priority(delta: Optional[int] = None, option_id: Optional[str] = None):
         nonlocal all_rows, status_line, current_index
         if not token:
@@ -3199,6 +3227,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return
         sort_index = (sort_index + delta) % count
         status_line = f"Sort: {sort_presets[sort_index]['name']}"
+        if edit_task_mode:
+            _refresh_task_editor_state()
         invalidate()
 
     def _build_task_edit_fields_from_row(row: TaskRow) -> List[Dict[str, object]]:
@@ -3238,7 +3268,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             })
         return fields
 
-    def _refresh_task_editor_state(preserve_cursor: bool = True) -> None:
+    def _refresh_task_editor_state(preserve_cursor: bool = True, do_invalidate: bool = True) -> None:
         if not edit_task_mode:
             return
         rows = filtered_rows()
@@ -3260,6 +3290,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['input'] = ''
             task_edit_state['editing'] = None
         task_edit_state.setdefault('message', 'Use j/k to select, Enter to edit, Esc to close')
+        if do_invalidate:
+            invalidate()
 
     def build_table_fragments() -> List[Tuple[str,str]]:
         rows = filtered_rows()
@@ -3685,6 +3717,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = "Selected task missing URL"
             invalidate()
             return
+        if edit_task_mode:
+            close_task_editor(None)
         edit_sessions_mode = True
         detail_mode = False
         show_report = False
@@ -3902,6 +3936,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return []
         rows = filtered_rows()
         row = rows[current_index] if rows else None
+        if row and task_edit_state.get('task_url') != row.url:
+            _refresh_task_editor_state(preserve_cursor=False, do_invalidate=False)
         fields = task_edit_state.get('fields') or []
         cursor = int(task_edit_state.get('cursor', 0) or 0)
         cursor = max(0, min(cursor, len(fields)-1)) if fields else 0
@@ -3932,9 +3968,31 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 value = value or '-'
                 lines.append(f" {marker} {field.get('name')} : {value}")
         lines.append("")
-        if mode == 'edit-date':
-            lines.append("Editing date (YYYY-MM-DD). Enter=save · Esc=cancel")
-            lines.append(f"Value: {task_edit_state.get('input', '')}")
+        if mode == 'edit-date-calendar':
+            editing = task_edit_state.get('editing') or {}
+            iso = editing.get('calendar_date') or fields[cursor].get('value') or dt.date.today().isoformat()
+            try:
+                cursor_date = dt.date.fromisoformat(iso)
+            except Exception:
+                cursor_date = dt.date.today()
+            cal = calendar.Calendar(firstweekday=0)
+            lines.append(f"Select {fields[cursor].get('name')} (h/l day, j/k week, </> month, t today)")
+            lines.append(cursor_date.strftime("%B %Y"))
+            lines.append(" Mo Tu We Th Fr Sa Su")
+            for week in cal.monthdatescalendar(cursor_date.year, cursor_date.month):
+                row_cells: List[str] = []
+                for day in week:
+                    label = f"{day.day:2d}"
+                    if day == cursor_date:
+                        cell = f"[{label}]"
+                    elif day.month != cursor_date.month:
+                        cell = f"({label})"
+                    else:
+                        cell = f" {label} "
+                    row_cells.append(cell)
+                lines.append("".join(row_cells))
+            lines.append("")
+            lines.append("Enter=save · Esc=cancel")
         elif mode == 'priority-select':
             lines.append("Select priority (j/k move, Enter=save, Esc=cancel)")
             field = fields[cursor] if cursor < len(fields) else None
@@ -4192,6 +4250,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not (row.project_id and row.item_id):
             status_line = "Task missing project metadata"
             invalidate(); return
+        if edit_sessions_mode:
+            close_session_editor(None)
         fields = _build_task_edit_fields_from_row(row)
         if not fields:
             status_line = "No editable fields"
@@ -4224,7 +4284,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         editing = task_edit_state.get('editing') or {}
         fields = task_edit_state.get('fields') or []
         idx = editing.get('field_idx')
-        if mode == 'edit-date' and idx is not None and idx < len(fields):
+        if mode == 'edit-date-calendar' and idx is not None and idx < len(fields):
             prev_val = editing.get('prev_value', fields[idx].get('value', ''))
             fields[idx]['value'] = prev_val
         if mode == 'priority-select' and idx is not None and idx < len(fields):
@@ -4248,10 +4308,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         field = fields[cursor]
         ftype = field.get('type')
         if ftype == 'date':
-            task_edit_state['mode'] = 'edit-date'
-            task_edit_state['input'] = field.get('value', '')
-            task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': field.get('value', '')}
-            task_edit_state['message'] = 'Enter YYYY-MM-DD (Enter=save, Esc=cancel)'
+            raw = field.get('value') or ''
+            try:
+                base_date = dt.date.fromisoformat(raw)
+            except Exception:
+                base_date = dt.date.today()
+            editing_state = {
+                'field_idx': cursor,
+                'prev_value': field.get('value', ''),
+                'calendar_date': base_date.isoformat(),
+            }
+            field['value'] = base_date.isoformat()
+            task_edit_state['mode'] = 'edit-date-calendar'
+            task_edit_state['editing'] = editing_state
+            task_edit_state['message'] = 'Use h/j/k/l to move, </> month, t=Today, Enter=save, Esc=cancel'
         elif ftype == 'priority':
             options = field.get('options') or []
             if not options:
@@ -4275,7 +4345,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
     is_task_edit_mode = Condition(lambda: edit_task_mode)
-    is_task_edit_input = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date', 'priority-select'))
+    is_task_edit_input = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select'))
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode))
@@ -4347,6 +4417,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 pass
         finally:
             update_in_progress = False
+            if edit_task_mode:
+                _refresh_task_editor_state()
             invalidate()
 
     async def create_task_async(project_choice: Dict[str, object], title: str, focus_val: str, iteration_id: str, mode: str, repo_choice: Optional[Dict[str, str]], repo_manual: Optional[str]):
@@ -4430,7 +4502,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
         if edit_task_mode:
-            if task_edit_state.get('mode') in ('edit-date', 'priority-select'):
+            if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select'):
                 _cancel_task_edit('Edit cancelled')
             else:
                 close_task_editor('Field editor closed')
@@ -4472,18 +4544,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             fields = task_edit_state.get('fields') or []
             cursor = int(task_edit_state.get('cursor', 0) or 0)
             cursor = max(0, min(cursor, len(fields)-1)) if fields else 0
-            if mode == 'edit-date':
+            if mode == 'edit-date-calendar':
                 field = fields[cursor] if cursor < len(fields) else None
-                if not field:
+                editing = task_edit_state.get('editing') or {}
+                if not field or editing.get('calendar_date') is None:
                     _cancel_task_edit('Field unavailable')
                     return
-                value = task_edit_state.get('input', '').strip()
+                value = editing.get('calendar_date') or field.get('value', '')
                 if not value:
-                    task_edit_state['message'] = 'Enter a date in YYYY-MM-DD'
+                    task_edit_state['message'] = 'Select a date'
                     invalidate(); return
                 field['value'] = value
                 task_edit_state['mode'] = 'list'
-                task_edit_state['input'] = ''
                 task_edit_state['editing'] = None
                 task_edit_state['message'] = f"Updating {field.get('name')}…"
                 asyncio.create_task(_update_task_date(field.get('field_key', 'start'), value))
@@ -4540,20 +4612,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             v_offset = current_index
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
+        if edit_task_mode:
+            _refresh_task_editor_state()
+        invalidate()
 
     @kb.add('j', filter=is_normal)
     @kb.add('down', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
-        move(1); invalidate()
+        move(1)
 
     @kb.add('k', filter=is_normal)
     @kb.add('up', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
-        move(-1); invalidate()
+        move(-1)
 
     # horizontal scroll
     @kb.add('h', filter=is_normal)
@@ -4692,6 +4767,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         open_task_editor()
 
+    @kb.add('o', filter=is_normal)
+    def _(event):
+        open_task_editor()
+
     @kb.add(']', filter=is_normal)
     def _(event):
         asyncio.create_task(_change_priority(1))
@@ -4725,36 +4804,93 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('j', filter=is_task_edit_input)
     @kb.add('down', filter=is_task_edit_input)
     def _(event):
-        if task_edit_state.get('mode') != 'priority-select':
-            return
-        fields = task_edit_state.get('fields') or []
-        editing = task_edit_state.get('editing') or {}
-        idx = editing.get('field_idx')
-        if idx is None or idx >= len(fields):
-            return
-        options = fields[idx].get('options') or []
-        if not options:
-            return
-        fields[idx]['index'] = (fields[idx].get('index', 0) + 1) % len(options)
-        task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
-        invalidate()
+        mode = task_edit_state.get('mode')
+        if mode == 'priority-select':
+            fields = task_edit_state.get('fields') or []
+            editing = task_edit_state.get('editing') or {}
+            idx = editing.get('field_idx')
+            if idx is None or idx >= len(fields):
+                return
+            options = fields[idx].get('options') or []
+            if not options:
+                return
+            fields[idx]['index'] = (fields[idx].get('index', 0) + 1) % len(options)
+            task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
+            invalidate()
+        elif mode == 'edit-date-calendar':
+            _calendar_adjust(days=7)
 
     @kb.add('k', filter=is_task_edit_input)
     @kb.add('up', filter=is_task_edit_input)
     def _(event):
-        if task_edit_state.get('mode') != 'priority-select':
+        mode = task_edit_state.get('mode')
+        if mode == 'priority-select':
+            fields = task_edit_state.get('fields') or []
+            editing = task_edit_state.get('editing') or {}
+            idx = editing.get('field_idx')
+            if idx is None or idx >= len(fields):
+                return
+            options = fields[idx].get('options') or []
+            if not options:
+                return
+            fields[idx]['index'] = (fields[idx].get('index', 0) - 1) % len(options)
+            task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
+            invalidate()
+        elif mode == 'edit-date-calendar':
+            _calendar_adjust(days=-7)
+
+    @kb.add('h', filter=is_task_edit_input)
+    @kb.add('left', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
             return
-        fields = task_edit_state.get('fields') or []
+        _calendar_adjust(days=-1)
+
+    @kb.add('l', filter=is_task_edit_input)
+    @kb.add('right', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        _calendar_adjust(days=1)
+
+    @kb.add('t', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        today = dt.date.today()
         editing = task_edit_state.get('editing') or {}
+        editing['calendar_date'] = today.isoformat()
+        task_edit_state['editing'] = editing
+        fields = task_edit_state.get('fields') or []
         idx = editing.get('field_idx')
-        if idx is None or idx >= len(fields):
-            return
-        options = fields[idx].get('options') or []
-        if not options:
-            return
-        fields[idx]['index'] = (fields[idx].get('index', 0) - 1) % len(options)
-        task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
+        if idx is not None and idx < len(fields):
+            fields[idx]['value'] = today.isoformat()
+        task_edit_state['message'] = 'Today'
         invalidate()
+
+    @kb.add('<', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        _calendar_adjust(months=-1)
+
+    @kb.add('>', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        _calendar_adjust(months=1)
+
+    @kb.add('pageup', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        _calendar_adjust(months=-1)
+
+    @kb.add('pagedown', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        _calendar_adjust(months=1)
 
     @kb.add('j', filter=is_session_idle)
     @kb.add('down', filter=is_session_idle)
@@ -5206,28 +5342,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = f"Date<= {date_buffer}"
             invalidate()
 
-    @kb.add('backspace', filter=is_task_edit_input)
-    def _(event):
-        if task_edit_state.get('mode') != 'edit-date':
-            return
-        buf = task_edit_state.get('input', '')
-        if buf:
-            task_edit_state['input'] = buf[:-1]
-            invalidate()
-
-    @kb.add(Keys.Any, filter=is_task_edit_input)
-    def _(event):
-        if task_edit_state.get('mode') != 'edit-date':
-            return
-        ch = event.data or ''
-        if not ch or ch not in (string.digits + '-'):
-            return
-        buf = task_edit_state.get('input', '')
-        if len(buf) >= 10:
-            return
-        task_edit_state['input'] = buf + ch
-        invalidate()
-
     # Catch-all printable character input for live search and date filter typing
     @kb.add(Keys.Any, filter=Condition(lambda: in_search or in_date_filter))
     def _(event):
@@ -5520,6 +5634,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal show_help, detail_mode, in_search, show_report
         if in_search:
             return
+        if edit_task_mode:
+            close_task_editor(None)
         detail_mode = False
         show_report = False
         in_search = False
@@ -5679,6 +5795,7 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 owner_type="org", owner="example", project_number=i, project_title=proj,
                 start_field="Start date", start_date=date_str,
                 focus_field="Focus Day", focus_date=date_str,
+                focus_field_id="focus-field",
                 title=f"Task {i}-{d_off}",
                 repo_id=f"repo-{i}",
                 repo="demo/repo",
