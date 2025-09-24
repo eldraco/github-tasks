@@ -10,6 +10,7 @@
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
 #   W  toggle work timer for the selected task (multiple tasks can run)
 #   E  edit work sessions for the selected task
+#   ]/[ cycle priority forward/backward for selected task
 #   R  open timer report (daily/weekly/monthly aggregates)
 #   X  export a JSON report (quick export)
 #   q  quit
@@ -186,6 +187,12 @@ class TaskRow:
     repo_id: str = ""
     repo: Optional[str] = None
     labels: str = "[]"
+    priority: Optional[str] = None
+    priority_field_id: str = ""
+    priority_option_id: str = ""
+    priority_options: str = "[]"
+    priority_dirty: int = 0
+    priority_pending_option_id: str = ""
     url: str = ""
     updated_at: str = ""
     status: Optional[str] = None  # textual status (eg. In Progress, Done)
@@ -212,7 +219,7 @@ class TaskDB:
         "start_field","start_date",
         "focus_field","focus_date",
         "iteration_field","iteration_title","iteration_start","iteration_duration",
-        "title","repo_id","repo","labels","url","updated_at","status","is_done","assigned_to_me","created_by_me",
+        "title","repo_id","repo","labels","priority","priority_field_id","priority_option_id","priority_options","priority_dirty","priority_pending_option_id","url","updated_at","status","is_done","assigned_to_me","created_by_me",
         "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id",
         "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids"
     ]
@@ -234,6 +241,12 @@ class TaskDB:
         repo_id TEXT,
         repo TEXT,
         labels TEXT,
+        priority TEXT,
+        priority_field_id TEXT,
+        priority_option_id TEXT,
+        priority_options TEXT,
+        priority_dirty INTEGER DEFAULT 0,
+        priority_pending_option_id TEXT,
         url TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         status TEXT,
@@ -295,7 +308,7 @@ class TaskDB:
             "start_field":"''","start_date":"''",
             "focus_field":"''","focus_date":"''",
             "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
-            "title":"''","repo_id":"''","repo":"NULL","labels":"'[]'","url":"''",
+            "title":"''","repo_id":"''","repo":"NULL","labels":"'[]'","priority":"NULL","priority_field_id":"''","priority_option_id":"''","priority_options":"'[]'","priority_dirty":"0","priority_pending_option_id":"''","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
             "assigned_to_me":"0","created_by_me":"0",
             "item_id":"''","project_id":"''","status_field_id":"''","status_option_id":"''",
@@ -779,6 +792,56 @@ class TaskDB:
         )
         self.conn.commit()
 
+    def mark_priority_pending(self, url: str, priority_text: str, option_id: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET priority=?, priority_dirty=1, priority_pending_option_id=?, priority_option_id=? WHERE url=?",
+            (priority_text, option_id or '', option_id or '', url),
+        )
+        self.conn.commit()
+
+    def mark_priority_synced(self, url: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET priority_dirty=0, priority_pending_option_id='' WHERE url=?",
+            (url,),
+        )
+        self.conn.commit()
+
+    def reset_priority(self, url: str, priority_text: str, option_id: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET priority=?, priority_option_id=?, priority_dirty=0, priority_pending_option_id='' WHERE url=?",
+            (priority_text, option_id or '', url),
+        )
+        self.conn.commit()
+
+    def update_priority_options(self, url: str, options: List[Dict[str, object]]) -> None:
+        try:
+            payload = json.dumps(options or [], ensure_ascii=False)
+        except Exception:
+            payload = "[]"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET priority_options=? WHERE url=?",
+            (payload, url),
+        )
+        self.conn.commit()
+
+    def update_priority_options_by_field(self, field_id: str, options: List[Dict[str, object]]) -> None:
+        if not field_id:
+            return
+        try:
+            payload = json.dumps(options or [], ensure_ascii=False)
+        except Exception:
+            payload = "[]"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET priority_options=? WHERE priority_field_id=?",
+            (payload, field_id),
+        )
+        self.conn.commit()
+
     def upsert_many(self, rows: List[TaskRow]):
         if not rows:
             return
@@ -789,14 +852,26 @@ class TaskDB:
               start_field, start_date,
               focus_field, focus_date,
               iteration_field, iteration_title, iteration_start, iteration_duration,
-              title, repo_id, repo, labels, url, updated_at, status, is_done, assigned_to_me, created_by_me,
+              title, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
+              url, updated_at, status, is_done, assigned_to_me, created_by_me,
               item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
               start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
                           updated_at=excluded.updated_at,
+                          priority=excluded.priority,
+                          priority_field_id=excluded.priority_field_id,
+                          priority_option_id=excluded.priority_option_id,
+                          priority_options=excluded.priority_options,
+                          priority_dirty=excluded.priority_dirty,
+                          priority_pending_option_id=excluded.priority_pending_option_id,
                           status=excluded.status,
                           is_done=excluded.is_done,
                           iteration_field=excluded.iteration_field,
@@ -837,6 +912,12 @@ class TaskDB:
                     r.repo_id,
                     r.repo,
                     r.labels,
+                    r.priority,
+                    r.priority_field_id,
+                    r.priority_option_id,
+                    r.priority_options,
+                    int(getattr(r, 'priority_dirty', 0)),
+                    getattr(r, 'priority_pending_option_id', ''),
                     r.url,
                     r.updated_at,
                     r.status,
@@ -876,7 +957,8 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo_id,repo,labels,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
+                       url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                        start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
                 FROM tasks WHERE focus_date = ?
@@ -889,7 +971,8 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,focus_field,focus_date,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo_id,repo,labels,url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                       title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
+                       url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                        start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
                 FROM tasks
@@ -1112,13 +1195,27 @@ GQL_MUTATION_SET_ITERATION = """mutation($projectId:ID!, $itemId:ID!, $fieldId:I
 }
 """
 
+GQL_MUTATION_SET_USERS_USERIDS = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $userIds:[ID!]!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{userIds:$userIds}
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
 GQL_MUTATION_SET_USERS_TEMPLATE = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!) {
   updateProjectV2ItemFieldValue(
     input:{
       projectId:$projectId,
       itemId:$itemId,
       fieldId:$fieldId,
-      value:{users:{nodes:[__NODES__]}}
+      value:{users:[__NODES__]}
     }
   ){
     projectV2Item{ id }
@@ -1332,6 +1429,24 @@ def set_project_status(token: str, project_id: str, item_id: str, field_id: str,
         raise RuntimeError("Status update failed: " + "; ".join(e.get("message", str(e)) for e in errs))
 
 
+def set_project_priority(token: str, project_id: str, item_id: str, field_id: str, option_id: str) -> None:
+    if not token:
+        raise RuntimeError("Cannot update priority without GITHUB_TOKEN")
+    if not (project_id and item_id and field_id and option_id):
+        raise RuntimeError("Priority update missing required identifiers")
+    session = _session(token)
+    variables = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "optionId": option_id,
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_STATUS, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Priority update failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+
+
 def create_project_draft(token: str, project_id: str, title: str, body: str = "") -> str:
     if not token:
         raise RuntimeError("Cannot create task without GITHUB_TOKEN")
@@ -1395,22 +1510,38 @@ def set_project_users(token: str, project_id: str, item_id: str, field_id: str, 
     if not user_ids:
         return
     session = _session(token)
-    def _escape(uid: str) -> str:
-        return uid.replace('"', '\"')
+    attempts: List[Tuple[str, Dict[str, object]]] = [
+        (GQL_MUTATION_SET_USERS_USERIDS, {"userIds": [uid for uid in user_ids if uid]})
+    ]
 
-    nodes = ", ".join(f'{{id:"{_escape(uid)}"}}' for uid in user_ids if uid)
-    if not nodes:
-        return
-    query = GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", nodes)
-    variables = {
-        "projectId": project_id,
-        "itemId": item_id,
-        "fieldId": field_id,
-    }
-    resp = _graphql_with_backoff(session, query, variables)
-    errs = resp.get("errors") or []
-    if errs:
-        raise RuntimeError("Setting assignees failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    filtered_ids = [uid for uid in user_ids if uid]
+    if filtered_ids:
+        def _escape(uid: str) -> str:
+            return uid.replace('"', '\"')
+
+        node_payload = ", ".join(f'{{userId:"{_escape(uid)}"}}' for uid in filtered_ids)
+        if node_payload:
+            query_nodes = GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", node_payload)
+            attempts.append((query_nodes, {}))
+
+    last_error = ""
+    for query, extra in attempts:
+        variables = {
+            "projectId": project_id,
+            "itemId": item_id,
+            "fieldId": field_id,
+        }
+        variables.update(extra)
+        try:
+            resp = _graphql_with_backoff(session, query, variables)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        errs = resp.get("errors") or []
+        if not errs:
+            return
+        last_error = "; ".join(e.get("message", str(e)) for e in errs)
+    raise RuntimeError("Setting assignees failed: " + (last_error or "unknown error"))
 
 
 def get_user_node_id(token: str, login: str) -> str:
@@ -1561,6 +1692,7 @@ def _ascii_bar(done:int, total:int, width:int=40)->str:
 
 
 STATUS_FIELD_HINTS = ("status", "state", "progress", "stage", "column")
+PRIORITY_FIELD_HINTS = ("priority", "prio")
 
 
 def _looks_like_status_field(name: Optional[str]) -> bool:
@@ -1568,6 +1700,13 @@ def _looks_like_status_field(name: Optional[str]) -> bool:
         return False
     norm = name.strip().lower()
     return bool(norm) and any(hint in norm for hint in STATUS_FIELD_HINTS)
+
+
+def _looks_like_priority_field(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    norm = name.strip().lower()
+    return bool(norm) and any(hint in norm for hint in PRIORITY_FIELD_HINTS)
 
 
 def _status_field_priority(name: Optional[str]) -> int:
@@ -1815,6 +1954,10 @@ def fetch_tasks_github(
                 status_field_priority = 999
                 status_option_id: str = ""
                 status_options_list: List[Dict[str, str]] = []
+                priority_text: Optional[str] = None
+                priority_field_id: str = ""
+                priority_option_id: str = ""
+                priority_options_list: List[Dict[str, str]] = []
                 author_login_norm: Optional[str] = None
                 iteration_field: str = ""
                 iteration_title: str = ""
@@ -1842,6 +1985,7 @@ def fetch_tasks_github(
                         option_id_val = fv.get("optionId") or ""
                         options_raw = field_data.get("options") or []
                         is_status_field = _looks_like_status_field(raw_name)
+                        is_priority_field = _looks_like_priority_field(raw_name)
                         if is_status_field and options_raw:
                             new_opts = [
                                 {"id": opt.get("id"), "name": opt.get("name")}
@@ -1865,6 +2009,22 @@ def fetch_tasks_github(
                                 status_field_priority = priority
                                 status_text = (fv.get("name") or "").strip()
                                 status_option_id = option_id_val
+                        if is_priority_field and options_raw:
+                            new_priority_opts = [
+                                {"id": opt.get("id"), "name": opt.get("name")}
+                                for opt in options_raw if opt and opt.get("id")
+                            ]
+                            if priority_options_list:
+                                seen_ids = {opt.get("id") for opt in priority_options_list if isinstance(opt, dict)}
+                                for opt in new_priority_opts:
+                                    if opt.get("id") not in seen_ids:
+                                        priority_options_list.append(opt)
+                            else:
+                                priority_options_list = new_priority_opts
+                        if is_priority_field:
+                            priority_field_id = field_data.get("id") or priority_field_id
+                            priority_text = (fv.get("name") or "").strip()
+                            priority_option_id = option_id_val
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
                         field_info = fv.get("field") or {}
                         start_field_id = field_info.get("id") or start_field_id
@@ -1944,6 +2104,10 @@ def fetch_tasks_github(
                                 iteration_duration=iteration_duration,
                                 title=title, repo=repo,
                                 labels=json.dumps(label_names, ensure_ascii=False),
+                                priority=priority_text,
+                                priority_field_id=priority_field_id,
+                                priority_option_id=priority_option_id,
+                                priority_options=json.dumps(priority_options_list, ensure_ascii=False),
                                 url=url, updated_at=iso_now,
                                 status=status_text, is_done=done_flag,
                                 repo_id=repo_id,
@@ -1984,6 +2148,10 @@ def fetch_tasks_github(
                             title=title + (" (unassigned)" if not assigned_to_me else ""),
                             repo=repo,
                             labels=json.dumps(label_names, ensure_ascii=False),
+                            priority=priority_text,
+                            priority_field_id=priority_field_id,
+                            priority_option_id=priority_option_id,
+                            priority_options=json.dumps(priority_options_list, ensure_ascii=False),
                             url=url, updated_at=iso_now,
                             status=status_text, is_done=done_flag,
                             repo_id=repo_id,
@@ -2138,7 +2306,7 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         return [("bold", "Nothing to show."), ("", " Press "), ("bold", "u"), ("", " to fetch.")]
 
     current: Optional[str] = None
-    header = "Focus Day   Start Date   STATUS      TITLE                                     REPO                 URL"
+    header = "Focus Day   Start Date   STATUS   PRIORITY   TITLE                                     REPO                 URL"
     for t in tasks:
         if t.project_title != current:
             current = t.project_title
@@ -2152,12 +2320,13 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         focus_cell = _pad_display(t.focus_date or '-', 11)
         start_cell = _pad_display(t.start_date, 12)
         status_cell = _pad_display(t.status or '-', 10)
+        priority_cell = _pad_display((t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else ''), 10)
         title_cell = _pad_display(t.title, 45)
         repo_cell = _pad_display(t.repo or '-', 20)
         url_cell = _pad_display(t.url, 40)
         frags.append((col, focus_cell))
         frags.append(("",  "  "))
-        frags.append(("", f"{start_cell}  {status_cell}  {title_cell}  {repo_cell}  {url_cell}"))
+        frags.append(("", f"{start_cell}  {status_cell}  {priority_cell}  {title_cell}  {repo_cell}  {url_cell}"))
         frags.append(("", "\n"))
 
     if frags and frags[-1] == ("", "\n"):
@@ -2201,6 +2370,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     detail_mode = False
     status_line = ""
     pending_status_urls: Set[str] = set()
+    pending_priority_urls: Set[str] = set()
     add_mode = False
     add_state: Dict[str, object] = {}
     add_float: Optional[Float] = None
@@ -2653,6 +2823,107 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             all_rows = load_all()
             invalidate()
 
+    async def _change_priority(delta: int):
+        nonlocal all_rows, status_line, current_index
+        if not token:
+            status_line = "GITHUB_TOKEN required for priority updates"
+            invalidate(); return
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate(); return
+        row = rows[current_index]
+        selected_url = row.url
+        if not selected_url:
+            status_line = "Selected task missing URL"
+            invalidate(); return
+        if selected_url in pending_priority_urls:
+            status_line = "Priority update already in progress"
+            invalidate(); return
+        if not (row.project_id and row.item_id and row.priority_field_id):
+            status_line = "Task missing priority metadata"
+            invalidate(); return
+        options = _priority_options(row)
+        if (not options) and token and row.priority_field_id:
+            try:
+                fetched_opts = get_project_field_options(token, row.priority_field_id)
+            except Exception as exc:
+                fetched_opts = []
+                try:
+                    logger.warning("Unable to fetch priority options for %s: %s", row.priority_field_id, exc)
+                except Exception:
+                    pass
+            if fetched_opts:
+                try:
+                    db.update_priority_options_by_field(row.priority_field_id, fetched_opts)
+                except Exception:
+                    try:
+                        db.update_priority_options(selected_url, fetched_opts)
+                    except Exception:
+                        pass
+                all_rows = load_all()
+                rows = filtered_rows()
+                if rows:
+                    for idx, candidate in enumerate(rows):
+                        if candidate.url == selected_url:
+                            current_index = idx
+                            row = candidate
+                            break
+                    else:
+                        current_index = max(0, min(len(rows)-1, current_index))
+                        row = rows[current_index]
+                options = _priority_options(row)
+        if not options:
+            status_line = "No priority options available"
+            invalidate(); return
+        option_map = [opt for opt in options if isinstance(opt, dict) and opt.get('id')]
+        if not option_map:
+            status_line = "Priority options missing ids"
+            invalidate(); return
+        try:
+            current_idx = next((idx for idx, opt in enumerate(option_map) if (opt.get('id') or '') == (row.priority_option_id or '')), 0)
+        except Exception:
+            current_idx = 0
+        new_idx = (current_idx + delta) % len(option_map)
+        new_opt = option_map[new_idx]
+        new_option_id = (new_opt.get('id') or '').strip()
+        display_name = (new_opt.get('name') or '').strip() or '(unset)'
+        if not new_option_id:
+            status_line = "Selected priority option missing id"
+            invalidate(); return
+        if (row.priority_option_id == new_option_id) and not getattr(row, 'priority_dirty', 0):
+            status_line = f"Priority already {display_name}"
+            invalidate(); return
+        original_priority = row.priority or ""
+        original_option = row.priority_option_id or ""
+        try:
+            db.mark_priority_pending(selected_url, display_name, new_option_id)
+        except Exception as exc:
+            status_line = f"Failed to mark priority pending: {exc}"
+            invalidate(); return
+        pending_priority_urls.add(selected_url)
+        all_rows = load_all()
+        status_line = f"Updating priority to {display_name}…"
+        invalidate()
+
+        loop = asyncio.get_running_loop()
+
+        def _do_update():
+            set_project_priority(token, row.project_id, row.item_id, row.priority_field_id, new_option_id)
+
+        try:
+            await loop.run_in_executor(None, _do_update)
+        except Exception as exc:
+            db.reset_priority(selected_url, original_priority, original_option)
+            status_line = f"Priority update failed: {exc}"
+        else:
+            db.mark_priority_synced(selected_url)
+            status_line = f"Priority set to {display_name}"
+        finally:
+            pending_priority_urls.discard(selected_url)
+            all_rows = load_all()
+            invalidate()
+
     def _safe_date(s: str) -> Optional[dt.date]:
         try:
             return dt.date.fromisoformat(s)
@@ -2681,6 +2952,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             needle = active_search.lower()
             out = [r for r in out if needle in (r.title or '').lower() or
                                    needle in (r.repo or '').lower() or
+                                   needle in (r.priority or '').lower() or
                                    needle in (r.status or '').lower() or
                                    needle in (r.project_title or '').lower()]
         if date_max:
@@ -2724,6 +2996,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception:
             return []
 
+    def _priority_options(row: TaskRow) -> List[Dict[str, object]]:
+        try:
+            data = json.loads(row.priority_options or "[]")
+            if isinstance(data, list):
+                return [opt for opt in data if isinstance(opt, dict)]
+        except Exception:
+            pass
+        return []
+
     def build_table_fragments() -> List[Tuple[str,str]]:
         rows = filtered_rows()
         nonlocal current_index
@@ -2751,13 +3032,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         right_panel_width = 32 + 1
         avail_cols = max(40, total_cols - right_panel_width)
         time_w = 12  # "mm:ss|HH:MM" (right aligned)
+        priority_w = 10
         if use_iteration:
             iter_min = 15
             title_min = 20
             label_min = 16
             proj_min = 12
-            spaces_width = 2 * 5  # gaps between columns
-            fixed_base = 2 + 10 + time_w + spaces_width  # marker + status + time + spaces
+            spaces_width = 2 * 6  # gaps between columns
+            fixed_base = 2 + 10 + priority_w + time_w + spaces_width  # marker + status + priority + time + spaces
             dyn_total = max(iter_min + title_min + label_min + proj_min, avail_cols - fixed_base)
             extra = dyn_total - (iter_min + title_min + label_min + proj_min)
             weights = [1, 2, 1, 1]
@@ -2783,6 +3065,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             header = (
                 "  " + _pad_display("Iteration", iter_w) +
                 "  " + _pad_display("STATUS", 10) +
+                "  " + _pad_display("PRIORITY", priority_w) +
                 "  " + _pad_display("TIME", time_w, align='right') +
                 "  " + _pad_display("TITLE", title_w) +
                 "  " + _pad_display("LABELS", label_w) +
@@ -2792,8 +3075,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             proj_min = 12
             title_min = 20
             label_min = 16
-            spaces_width = 2 * 6  # gaps between columns
-            fixed = 2 + 11 + 12 + 10 + time_w + spaces_width  # marker + focus + start + status + time + spaces
+            spaces_width = 2 * 7  # gaps between columns
+            fixed = 2 + 11 + 12 + 10 + priority_w + time_w + spaces_width  # marker + focus + start + status + priority + time + spaces
             dyn = max(title_min + label_min + proj_min, avail_cols - fixed)
             extra = dyn - (title_min + label_min + proj_min)
             weights = [2, 1, 1]
@@ -2816,6 +3099,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  " + _pad_display("Focus Day", 11) +
                 "  " + _pad_display("Start Date", 12) +
                 "  " + _pad_display("STATUS", 10) +
+                "  " + _pad_display("PRIORITY", priority_w) +
                 "  " + _pad_display("TIME", time_w, align='right') +
                 "  " + _pad_display("TITLE", title_w) +
                 "  " + _pad_display("LABELS", label_w) +
@@ -2859,18 +3143,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             project_cell = _pad_display(t.project_title, proj_w)
             labels_list = _task_labels(t)
             labels_text = ", ".join(labels_list)
+            priority_display = (t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else '')
+            priority_cell = _pad_display(priority_display, priority_w)
             if use_iteration:
                 iter_label = t.iteration_title or t.iteration_start or '-'
                 if t.iteration_title and t.iteration_start:
                     iter_label = f"{t.iteration_title} ({t.iteration_start})"
                 iteration_cell = _pad_display(iter_label or '-', iter_w)
                 labels_cell = _pad_display(labels_text or '-', label_w)
-                line = f"{marker}{iteration_cell}  {status_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
+                line = f"{marker}{iteration_cell}  {status_cell}  {priority_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
             else:
                 focus_cell = _pad_display(t.focus_date or '-', 11)
                 start_cell = _pad_display(t.start_date, 12)
                 labels_cell = _pad_display(labels_text or '-', label_w)
-                line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
+                line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {priority_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
             line = line[h_offset:]
             # highlight search term occurrences (live search buffer if active)
             active_search = search_buffer if in_search else search_term
@@ -3463,6 +3749,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         t = rows[current_index]
         labels_list = _task_labels(t)
         labels_display = ", ".join(labels_list) if labels_list else "-"
+        priority_display = (t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else '')
         iter_parts = []
         if t.iteration_title:
             iter_parts.append(t.iteration_title)
@@ -3480,6 +3767,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             f"Title:   {t.title}",
             f"Repo:    {t.repo}",
             f"Labels:  {labels_display}",
+            f"Priority:{priority_display}",
             f"URL:     {t.url}",
             f"Start:   {t.start_date} ({t.start_field})",
             f"Focus:   {t.focus_date or '-'} ({t.focus_field or '-'})",
@@ -3704,7 +3992,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     user_id = ""
                     logger.warning("Could not resolve user id for %s: %s", cfg.user, exc)
                 if user_id:
-                    await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, [user_id]))
+                    try:
+                        await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, [user_id]))
+                    except Exception as exc:
+                        try:
+                            logger.warning("Unable to set project users for %s: %s", assignee_field_id, exc)
+                        except Exception:
+                            pass
         except Exception as exc:
             status_line = f"Create failed: {exc}"
             try:
@@ -3937,6 +4231,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('E', filter=is_normal)
     def _(event):
         open_session_editor()
+
+    @kb.add(']', filter=is_normal)
+    def _(event):
+        asyncio.create_task(_change_priority(1))
+
+    @kb.add('[', filter=is_normal)
+    def _(event):
+        asyncio.create_task(_change_priority(-1))
 
     @kb.add('j', filter=is_session_idle)
     @kb.add('down', filter=is_session_idle)
@@ -4703,6 +5005,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "🛠 Task Actions",
                 "  A                   Add issue / project task",
                 "  D / I               Set status Done / In Progress",
+                "  ] / [               Priority next / previous",
                 "  E                   Edit work sessions",
                 "",
                 "⏱ Timers & Reports",
@@ -4808,6 +5111,12 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
         {"id": "opt-done", "name": "Done"},
         {"id": "opt-blocked", "name": "Blocked"},
     ]
+    priority_field_id = "priority-field"
+    priority_options = [
+        {"id": "prio-high", "name": "High"},
+        {"id": "prio-medium", "name": "Medium"},
+        {"id": "prio-low", "name": "Low"},
+    ]
     iteration_options = [
         {"id": "iter-1", "title": "Sprint 1", "startDate": today.isoformat(), "duration": 14},
         {"id": "iter-2", "title": "Sprint 2", "startDate": (today + dt.timedelta(days=14)).isoformat(), "duration": 14},
@@ -4819,6 +5128,8 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
             date_str = (today + dt.timedelta(days=d_off)).isoformat()
             status = statuses[(i + d_off) % len(statuses)]
             option_id = next((opt["id"] for opt in status_options if opt["name"] == status), "opt-todo")
+            pr_idx = (i + d_off) % len(priority_options)
+            pr_opt = priority_options[pr_idx]
             rows.append(TaskRow(
                 owner_type="org", owner="example", project_number=i, project_title=proj,
                 start_field="Start date", start_date=date_str,
@@ -4827,6 +5138,10 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 repo_id=f"repo-{i}",
                 repo="demo/repo",
                 labels=json.dumps(["Label", f"L{i}"], ensure_ascii=False),
+                priority=pr_opt.get("name"),
+                priority_field_id=priority_field_id,
+                priority_option_id=pr_opt.get("id"),
+                priority_options=json.dumps(priority_options, ensure_ascii=False),
                 url=f"https://example.com/{i}-{d_off}", updated_at=iso_now, status=status,
                 is_done=1 if status.lower()=="done" else 0,
                 assigned_to_me=1 if (i + d_off) % 2 == 0 else 0,
@@ -4836,6 +5151,8 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 status_field_id="status-field",
                 status_option_id=option_id,
                 status_options=json.dumps(status_options, ensure_ascii=False),
+                priority_dirty=0,
+                priority_pending_option_id="",
                 start_field_id="start-field",
                 iteration_field_id="iteration-field",
                 iteration_options=json.dumps(iteration_options, ensure_ascii=False),
