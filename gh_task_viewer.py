@@ -11,6 +11,7 @@
 #   W  toggle work timer for the selected task (multiple tasks can run)
 #   E  edit work sessions for the selected task
 #   ]/[ cycle priority forward/backward for selected task
+#   O  open task field editor (start/focus date, priority)
 #   s/S cycle sort presets forward/backward
 #   R  open timer report (daily/weekly/monthly aggregates)
 #   X  export a JSON report (quick export)
@@ -180,6 +181,7 @@ class TaskRow:
     start_date: str
     focus_field: str
     focus_date: str
+    focus_field_id: str = ""
     iteration_field: str = ""
     iteration_title: str = ""
     iteration_start: str = ""
@@ -218,7 +220,7 @@ class TaskDB:
     SCHEMA_COLUMNS = [
         "owner_type","owner","project_number","project_title",
         "start_field","start_date",
-        "focus_field","focus_date",
+        "focus_field","focus_date","focus_field_id",
         "iteration_field","iteration_title","iteration_start","iteration_duration",
         "title","repo_id","repo","labels","priority","priority_field_id","priority_option_id","priority_options","priority_dirty","priority_pending_option_id","url","updated_at","status","is_done","assigned_to_me","created_by_me",
         "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id",
@@ -234,6 +236,7 @@ class TaskDB:
         start_date TEXT NOT NULL,
         focus_field TEXT NOT NULL,
         focus_date TEXT NOT NULL,
+        focus_field_id TEXT,
         iteration_field TEXT,
         iteration_title TEXT,
         iteration_start TEXT,
@@ -307,7 +310,7 @@ class TaskDB:
         defaults = {
             "owner_type":"''","owner":"''","project_number":"0","project_title":"''",
             "start_field":"''","start_date":"''",
-            "focus_field":"''","focus_date":"''",
+            "focus_field":"''","focus_date":"''","focus_field_id":"''",
             "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
             "title":"''","repo_id":"''","repo":"NULL","labels":"'[]'","priority":"NULL","priority_field_id":"''","priority_option_id":"''","priority_options":"'[]'","priority_dirty":"0","priority_pending_option_id":"''","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
@@ -793,6 +796,34 @@ class TaskDB:
         )
         self.conn.commit()
 
+    def update_start_date(self, url: str, start_date: str, field_id: Optional[str] = None) -> None:
+        cur = self.conn.cursor()
+        if field_id is not None and field_id:
+            cur.execute(
+                "UPDATE tasks SET start_date=?, start_field_id=? WHERE url=?",
+                (start_date, field_id, url),
+            )
+        else:
+            cur.execute(
+                "UPDATE tasks SET start_date=? WHERE url=?",
+                (start_date, url),
+            )
+        self.conn.commit()
+
+    def update_focus_date(self, url: str, focus_date: str, field_id: Optional[str] = None) -> None:
+        cur = self.conn.cursor()
+        if field_id is not None and field_id:
+            cur.execute(
+                "UPDATE tasks SET focus_date=?, focus_field_id=? WHERE url=?",
+                (focus_date, field_id, url),
+            )
+        else:
+            cur.execute(
+                "UPDATE tasks SET focus_date=? WHERE url=?",
+                (focus_date, url),
+            )
+        self.conn.commit()
+
     def mark_priority_pending(self, url: str, priority_text: str, option_id: str) -> None:
         cur = self.conn.cursor()
         cur.execute(
@@ -851,7 +882,7 @@ class TaskDB:
             """            INSERT INTO tasks (
               owner_type, owner, project_number, project_title,
               start_field, start_date,
-              focus_field, focus_date,
+              focus_field, focus_date, focus_field_id,
               iteration_field, iteration_title, iteration_start, iteration_duration,
               title, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
               url, updated_at, status, is_done, assigned_to_me, created_by_me,
@@ -867,6 +898,7 @@ class TaskDB:
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
                           updated_at=excluded.updated_at,
+                          focus_field_id=excluded.focus_field_id,
                           priority=excluded.priority,
                           priority_field_id=excluded.priority_field_id,
                           priority_option_id=excluded.priority_option_id,
@@ -905,6 +937,7 @@ class TaskDB:
                     r.start_date,
                     r.focus_field,
                     r.focus_date,
+                    r.focus_field_id,
                     r.iteration_field,
                     r.iteration_title,
                     r.iteration_start,
@@ -956,7 +989,7 @@ class TaskDB:
             today = today or dt.date.today().isoformat()
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,
+                       start_date,focus_field,focus_date,focus_field_id,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
@@ -970,7 +1003,7 @@ class TaskDB:
         else:
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,
+                       start_date,focus_field,focus_date,focus_field_id,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
@@ -2064,15 +2097,18 @@ def fetch_tasks_github(
 
                 focus_fname: str = ""
                 focus_fdate: str = ""
+                focus_field_id_local: str = ""
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
-                        fname_fd = ((fv.get("field") or {}).get("name") or "")
+                        field_fd = fv.get("field") or {}
+                        fname_fd = (field_fd.get("name") or "")
                         if fname_fd.strip().lower() == "focus day":
                             fdate_fd = fv.get("date")
                             if fdate_fd:
                                 try:
                                     dt.date.fromisoformat(fdate_fd)
                                     focus_fname, focus_fdate = fname_fd, fdate_fd
+                                    focus_field_id_local = field_fd.get("id") or focus_field_id_local
                                 except ValueError:
                                     pass
 
@@ -2122,6 +2158,7 @@ def fetch_tasks_github(
                                 status_dirty=0,
                                 status_pending_option_id="",
                                 start_field_id=start_field_id,
+                                focus_field_id=focus_field_id_local,
                                 iteration_field_id=iteration_field_id,
                                 iteration_options=json.dumps(iteration_options_list, ensure_ascii=False),
                                 assignee_field_id=assignee_field_id,
@@ -2166,6 +2203,7 @@ def fetch_tasks_github(
                             status_dirty=0,
                             status_pending_option_id="",
                             start_field_id=start_field_id,
+                            focus_field_id=focus_field_id_local,
                             iteration_field_id=iteration_field_id,
                             iteration_options=json.dumps(iteration_options_list, ensure_ascii=False),
                             assignee_field_id=assignee_field_id,
@@ -2372,6 +2410,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     status_line = ""
     pending_status_urls: Set[str] = set()
     pending_priority_urls: Set[str] = set()
+    edit_task_mode = False
+    task_edit_state: Dict[str, object] = {}
+    task_edit_float: Optional[Float] = None
     add_mode = False
     add_state: Dict[str, object] = {}
     add_float: Optional[Float] = None
@@ -2824,7 +2865,83 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             all_rows = load_all()
             invalidate()
 
-    async def _change_priority(delta: int):
+    async def _update_task_date(field_type: str, new_value: str):
+        nonlocal all_rows, status_line, current_index
+        label = 'Start Date' if field_type == 'start' else 'Focus Day'
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+            invalidate(); return
+        row = rows[current_index]
+        if not token:
+            msg = "GITHUB_TOKEN required for date updates"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        project_id = row.project_id or ''
+        item_id = row.item_id or ''
+        if not (project_id and item_id):
+            msg = "Task missing project metadata"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        try:
+            if new_value:
+                dt.date.fromisoformat(new_value)
+        except Exception:
+            msg = f"Bad date '{new_value}' (use YYYY-MM-DD)"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        field_id = row.start_field_id if field_type == 'start' else getattr(row, 'focus_field_id', '')
+        field_name = row.start_field if field_type == 'start' else (row.focus_field or 'Focus Day')
+        loop = asyncio.get_running_loop()
+        if not field_id and token:
+            try:
+                lookup_name = (field_name or '').strip() or ('Focus Day' if field_type == 'focus' else 'Start date')
+                field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, lookup_name)) or ''
+            except Exception as exc:
+                field_id = ''
+                try:
+                    logger.warning("Failed to resolve %s field id for %s: %s", field_type, row.project_title, exc)
+                except Exception:
+                    pass
+        if not field_id:
+            msg = f"No {field_name or label} field id"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+
+        def _do_update():
+            set_project_date(token, project_id, item_id, field_id, new_value)
+
+        try:
+            await loop.run_in_executor(None, _do_update)
+        except Exception as exc:
+            msg = f"{label} update failed: {exc}"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+
+        if field_type == 'start':
+            db.update_start_date(row.url, new_value, field_id)
+        else:
+            db.update_focus_date(row.url, new_value, field_id)
+        all_rows = load_all()
+        status_line = f"{label} updated"
+        if edit_task_mode:
+            task_edit_state['message'] = status_line
+            _refresh_task_editor_state()
+        invalidate()
+
+    async def _change_priority(delta: Optional[int] = None, option_id: Optional[str] = None):
         nonlocal all_rows, status_line, current_index
         if not token:
             status_line = "GITHUB_TOKEN required for priority updates"
@@ -2885,8 +3002,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             current_idx = next((idx for idx, opt in enumerate(option_map) if (opt.get('id') or '') == (row.priority_option_id or '')), 0)
         except Exception:
             current_idx = 0
-        new_idx = (current_idx + delta) % len(option_map)
-        new_opt = option_map[new_idx]
+        if option_id is not None:
+            new_opt = next((opt for opt in option_map if (opt.get('id') or '').strip() == option_id.strip()), None)
+            if not new_opt:
+                status_line = "Priority option not found"
+                invalidate(); return
+            new_idx = option_map.index(new_opt)
+        else:
+            if delta is None:
+                status_line = "No priority change provided"
+                invalidate(); return
+            new_idx = (current_idx + delta) % len(option_map)
+            new_opt = option_map[new_idx]
         new_option_id = (new_opt.get('id') or '').strip()
         display_name = (new_opt.get('name') or '').strip() or '(unset)'
         if not new_option_id:
@@ -2923,6 +3050,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         finally:
             pending_priority_urls.discard(selected_url)
             all_rows = load_all()
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+                _refresh_task_editor_state()
             invalidate()
 
     def _safe_date(s: str) -> Optional[dt.date]:
@@ -3070,6 +3200,66 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         sort_index = (sort_index + delta) % count
         status_line = f"Sort: {sort_presets[sort_index]['name']}"
         invalidate()
+
+    def _build_task_edit_fields_from_row(row: TaskRow) -> List[Dict[str, object]]:
+        fields: List[Dict[str, object]] = []
+        fields.append({
+            'name': row.start_field or 'Start Date',
+            'type': 'date',
+            'field_key': 'start',
+            'value': row.start_date or '',
+        })
+        focus_label = row.focus_field or 'Focus Day'
+        fields.append({
+            'name': focus_label,
+            'type': 'date',
+            'field_key': 'focus',
+            'value': row.focus_date or '',
+        })
+        priority_opts = _priority_options(row)
+        if priority_opts:
+            try:
+                current_idx = next((idx for idx, opt in enumerate(priority_opts) if (opt.get('id') or '').strip() == (row.priority_option_id or '').strip()), 0)
+            except Exception:
+                current_idx = 0
+            fields.append({
+                'name': 'Priority',
+                'type': 'priority',
+                'field_key': 'priority',
+                'options': priority_opts,
+                'index': current_idx,
+            })
+        elif (row.priority or '').strip():
+            fields.append({
+                'name': 'Priority',
+                'type': 'priority-text',
+                'field_key': 'priority',
+                'value': row.priority.strip(),
+            })
+        return fields
+
+    def _refresh_task_editor_state(preserve_cursor: bool = True) -> None:
+        if not edit_task_mode:
+            return
+        rows = filtered_rows()
+        if not rows:
+            close_task_editor('No tasks available')
+            return
+        row = rows[current_index]
+        fields = _build_task_edit_fields_from_row(row)
+        if not fields:
+            close_task_editor('No editable fields')
+            return
+        cursor = int(task_edit_state.get('cursor', 0) or 0) if preserve_cursor else 0
+        cursor = max(0, min(cursor, len(fields)-1))
+        task_edit_state['fields'] = fields
+        task_edit_state['cursor'] = cursor
+        task_edit_state['task_url'] = row.url
+        if task_edit_state.get('mode') != 'list':
+            task_edit_state['mode'] = 'list'
+            task_edit_state['input'] = ''
+            task_edit_state['editing'] = None
+        task_edit_state.setdefault('message', 'Use j/k to select, Enter to edit, Esc to close')
 
     def build_table_fragments() -> List[Tuple[str,str]]:
         rows = filtered_rows()
@@ -3707,6 +3897,67 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     session_control = FormattedTextControl(text=lambda: build_session_editor_text())
     session_window = Window(width=96, height=24, content=session_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
 
+    def build_task_edit_text() -> List[Tuple[str, str]]:
+        if not edit_task_mode:
+            return []
+        rows = filtered_rows()
+        row = rows[current_index] if rows else None
+        fields = task_edit_state.get('fields') or []
+        cursor = int(task_edit_state.get('cursor', 0) or 0)
+        cursor = max(0, min(cursor, len(fields)-1)) if fields else 0
+        mode = task_edit_state.get('mode', 'list')
+        lines: List[str] = []
+        header = "Task Field Editor"
+        if row:
+            header = f"Task Field Editor — {row.title or row.url}"
+        lines.append(header)
+        if row:
+            lines.append(f"Project: {row.project_title}")
+            lines.append(f"URL    : {row.url}")
+        lines.append("")
+        if not fields:
+            lines.append("  (no editable fields)")
+        else:
+            for idx, field in enumerate(fields):
+                marker = '➤' if idx == cursor else ' '
+                ftype = field.get('type')
+                if ftype == 'priority':
+                    opts = field.get('options') or []
+                    index = max(0, min(field.get('index', 0), len(opts)-1)) if opts else 0
+                    value = opts[index].get('name') if opts else '(no options)'
+                    if opts and getattr(row, 'priority_dirty', 0):
+                        value = (value or '-') + '*'
+                else:
+                    value = field.get('value', '')
+                value = value or '-'
+                lines.append(f" {marker} {field.get('name')} : {value}")
+        lines.append("")
+        if mode == 'edit-date':
+            lines.append("Editing date (YYYY-MM-DD). Enter=save · Esc=cancel")
+            lines.append(f"Value: {task_edit_state.get('input', '')}")
+        elif mode == 'priority-select':
+            lines.append("Select priority (j/k move, Enter=save, Esc=cancel)")
+            field = fields[cursor] if cursor < len(fields) else None
+            opts = (field or {}).get('options') or []
+            idx = (field or {}).get('index', 0)
+            for i, opt in enumerate(opts):
+                marker = '➤' if i == idx else ' '
+                lines.append(f"   {marker} {opt.get('name')}")
+        else:
+            lines.append("Use j/k to select a field. Enter=edit · Esc/Q=close")
+        message = task_edit_state.get('message') or ''
+        if message:
+            lines.append("")
+            lines.append(message)
+        block = "\n".join(lines)
+        if '\n' in block:
+            head, rest = block.split('\n', 1)
+            return [("bold", head), ("", "\n" + rest)]
+        return [("bold", block)]
+
+    task_edit_control = FormattedTextControl(text=lambda: build_task_edit_text())
+    task_edit_window = Window(width=84, height=20, content=task_edit_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
+
     def build_report_text() -> List[Tuple[str,str]]:
         lines: List[str] = []
         # current selection snapshot
@@ -3919,6 +4170,99 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if message is not None:
             status_line = message
         invalidate()
+
+    def close_task_editor(message: Optional[str] = None) -> None:
+        nonlocal edit_task_mode, task_edit_state, task_edit_float, status_line
+        if task_edit_float and task_edit_float in floats:
+            floats.remove(task_edit_float)
+        task_edit_float = None
+        edit_task_mode = False
+        task_edit_state = {}
+        if message is not None:
+            status_line = message
+        invalidate()
+
+    def open_task_editor() -> None:
+        nonlocal edit_task_mode, task_edit_state, task_edit_float, status_line, detail_mode, show_report, in_search, in_date_filter
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate(); return
+        row = rows[current_index]
+        if not (row.project_id and row.item_id):
+            status_line = "Task missing project metadata"
+            invalidate(); return
+        fields = _build_task_edit_fields_from_row(row)
+        if not fields:
+            status_line = "No editable fields"
+            invalidate(); return
+        edit_task_mode = True
+        detail_mode = False
+        show_report = False
+        in_search = False
+        in_date_filter = False
+        task_edit_state = {
+            'fields': fields,
+            'cursor': 0,
+            'mode': 'list',
+            'input': '',
+            'message': 'Use j/k to select, Enter to edit, Esc to close',
+            'task_url': row.url,
+            'editing': None,
+        }
+        if task_edit_float and task_edit_float in floats:
+            floats.remove(task_edit_float)
+        task_edit_float = Float(content=task_edit_window, top=3, left=4)
+        floats.append(task_edit_float)
+        status_line = 'Field editor open'
+        invalidate()
+
+    def _cancel_task_edit(message: Optional[str] = None) -> None:
+        if not edit_task_mode:
+            return
+        mode = task_edit_state.get('mode')
+        editing = task_edit_state.get('editing') or {}
+        fields = task_edit_state.get('fields') or []
+        idx = editing.get('field_idx')
+        if mode == 'edit-date' and idx is not None and idx < len(fields):
+            prev_val = editing.get('prev_value', fields[idx].get('value', ''))
+            fields[idx]['value'] = prev_val
+        if mode == 'priority-select' and idx is not None and idx < len(fields):
+            prev_idx = editing.get('prev_index', fields[idx].get('index', 0))
+            fields[idx]['index'] = prev_idx
+        task_edit_state['mode'] = 'list'
+        task_edit_state['input'] = ''
+        task_edit_state['editing'] = None
+        task_edit_state['message'] = message or 'Edit cancelled'
+        invalidate()
+
+    def _start_task_field_edit() -> None:
+        if not edit_task_mode:
+            return
+        fields = task_edit_state.get('fields') or []
+        if not fields:
+            task_edit_state['message'] = 'No editable fields'
+            invalidate(); return
+        cursor = int(task_edit_state.get('cursor', 0) or 0)
+        cursor = max(0, min(cursor, len(fields)-1))
+        field = fields[cursor]
+        ftype = field.get('type')
+        if ftype == 'date':
+            task_edit_state['mode'] = 'edit-date'
+            task_edit_state['input'] = field.get('value', '')
+            task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': field.get('value', '')}
+            task_edit_state['message'] = 'Enter YYYY-MM-DD (Enter=save, Esc=cancel)'
+        elif ftype == 'priority':
+            options = field.get('options') or []
+            if not options:
+                task_edit_state['message'] = 'Priority options unavailable'
+                return
+            task_edit_state['mode'] = 'priority-select'
+            task_edit_state['editing'] = {'field_idx': cursor, 'prev_index': field.get('index', 0)}
+            task_edit_state['message'] = 'Use j/k to choose priority (Enter=save, Esc=cancel)'
+        else:
+            task_edit_state['message'] = 'Field not editable'
+        invalidate()
     root_body = VSplit([table_window, Window(width=1, char='│'), stats_window])
     container = FloatContainer(content=HSplit([top_status_window, root_body, status_window]), floats=floats)
 
@@ -3930,8 +4274,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_add_mode = Condition(lambda: add_mode)
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
-    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode)
-    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode))
+    is_task_edit_mode = Condition(lambda: edit_task_mode)
+    is_task_edit_input = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date', 'priority-select'))
+    is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
+    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode)
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -4082,6 +4429,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('q')
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
+        if edit_task_mode:
+            if task_edit_state.get('mode') in ('edit-date', 'priority-select'):
+                _cancel_task_edit('Edit cancelled')
+            else:
+                close_task_editor('Field editor closed')
+            return
         if edit_sessions_mode:
             if session_state.get('edit_field') is not None:
                 _cancel_session_edit('Edit cancelled')
@@ -4114,6 +4467,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('enter')
     def _(event):
         nonlocal detail_mode, show_report
+        if edit_task_mode:
+            mode = task_edit_state.get('mode')
+            fields = task_edit_state.get('fields') or []
+            cursor = int(task_edit_state.get('cursor', 0) or 0)
+            cursor = max(0, min(cursor, len(fields)-1)) if fields else 0
+            if mode == 'edit-date':
+                field = fields[cursor] if cursor < len(fields) else None
+                if not field:
+                    _cancel_task_edit('Field unavailable')
+                    return
+                value = task_edit_state.get('input', '').strip()
+                if not value:
+                    task_edit_state['message'] = 'Enter a date in YYYY-MM-DD'
+                    invalidate(); return
+                field['value'] = value
+                task_edit_state['mode'] = 'list'
+                task_edit_state['input'] = ''
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = f"Updating {field.get('name')}…"
+                asyncio.create_task(_update_task_date(field.get('field_key', 'start'), value))
+            elif mode == 'priority-select':
+                field = fields[cursor] if cursor < len(fields) else None
+                options = (field or {}).get('options') or []
+                if not field or not options:
+                    _cancel_task_edit('Priority options unavailable')
+                    return
+                idx = max(0, min(field.get('index', 0), len(options)-1))
+                option_id = (options[idx].get('id') or '').strip()
+                task_edit_state['mode'] = 'list'
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = f"Updating {field.get('name')}…"
+                asyncio.create_task(_change_priority(option_id=option_id))
+            else:
+                _start_task_field_edit()
+            return
         if edit_sessions_mode:
             if session_state.get('edit_field') is not None:
                 _commit_session_edit()
@@ -4300,6 +4688,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         open_session_editor()
 
+    @kb.add('O', filter=is_normal)
+    def _(event):
+        open_task_editor()
+
     @kb.add(']', filter=is_normal)
     def _(event):
         asyncio.create_task(_change_priority(1))
@@ -4307,6 +4699,62 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('[', filter=is_normal)
     def _(event):
         asyncio.create_task(_change_priority(-1))
+
+    @kb.add('j', filter=is_task_edit_idle)
+    @kb.add('down', filter=is_task_edit_idle)
+    def _(event):
+        fields = task_edit_state.get('fields') or []
+        if not fields:
+            return
+        cursor = (int(task_edit_state.get('cursor', 0) or 0) + 1) % len(fields)
+        task_edit_state['cursor'] = cursor
+        task_edit_state['message'] = 'Enter to edit, Esc/Q to close'
+        invalidate()
+
+    @kb.add('k', filter=is_task_edit_idle)
+    @kb.add('up', filter=is_task_edit_idle)
+    def _(event):
+        fields = task_edit_state.get('fields') or []
+        if not fields:
+            return
+        cursor = (int(task_edit_state.get('cursor', 0) or 0) - 1) % len(fields)
+        task_edit_state['cursor'] = cursor
+        task_edit_state['message'] = 'Enter to edit, Esc/Q to close'
+        invalidate()
+
+    @kb.add('j', filter=is_task_edit_input)
+    @kb.add('down', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'priority-select':
+            return
+        fields = task_edit_state.get('fields') or []
+        editing = task_edit_state.get('editing') or {}
+        idx = editing.get('field_idx')
+        if idx is None or idx >= len(fields):
+            return
+        options = fields[idx].get('options') or []
+        if not options:
+            return
+        fields[idx]['index'] = (fields[idx].get('index', 0) + 1) % len(options)
+        task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
+        invalidate()
+
+    @kb.add('k', filter=is_task_edit_input)
+    @kb.add('up', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'priority-select':
+            return
+        fields = task_edit_state.get('fields') or []
+        editing = task_edit_state.get('editing') or {}
+        idx = editing.get('field_idx')
+        if idx is None or idx >= len(fields):
+            return
+        options = fields[idx].get('options') or []
+        if not options:
+            return
+        fields[idx]['index'] = (fields[idx].get('index', 0) - 1) % len(options)
+        task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
+        invalidate()
 
     @kb.add('j', filter=is_session_idle)
     @kb.add('down', filter=is_session_idle)
@@ -4719,6 +5167,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('escape')
     def _(event):
         nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
+        if edit_task_mode:
+            if task_edit_state.get('mode') in ('edit-date', 'priority-select'):
+                _cancel_task_edit('Edit cancelled')
+            else:
+                close_task_editor('Field editor closed')
+            return
         if edit_sessions_mode:
             if session_state.get('edit_field') is not None:
                 _cancel_session_edit('Edit cancelled')
@@ -4751,6 +5205,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             date_buffer = date_buffer[:-1]
             status_line = f"Date<= {date_buffer}"
             invalidate()
+
+    @kb.add('backspace', filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date':
+            return
+        buf = task_edit_state.get('input', '')
+        if buf:
+            task_edit_state['input'] = buf[:-1]
+            invalidate()
+
+    @kb.add(Keys.Any, filter=is_task_edit_input)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date':
+            return
+        ch = event.data or ''
+        if not ch or ch not in (string.digits + '-'):
+            return
+        buf = task_edit_state.get('input', '')
+        if len(buf) >= 10:
+            return
+        task_edit_state['input'] = buf + ch
+        invalidate()
 
     # Catch-all printable character input for live search and date filter typing
     @kb.add(Keys.Any, filter=Condition(lambda: in_search or in_date_filter))
@@ -5074,6 +5550,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  A                   Add issue / project task",
                 "  D / I               Set status Done / In Progress",
                 "  ] / [               Priority next / previous",
+                "  O                   Edit task fields",
                 "  E                   Edit work sessions",
                 "",
                 "⏱ Timers & Reports",
