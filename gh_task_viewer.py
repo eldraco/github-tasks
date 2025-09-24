@@ -11,6 +11,7 @@
 #   W  toggle work timer for the selected task (multiple tasks can run)
 #   E  edit work sessions for the selected task
 #   ]/[ cycle priority forward/backward for selected task
+#   s/S cycle sort presets forward/backward
 #   R  open timer report (daily/weekly/monthly aggregates)
 #   X  export a JSON report (quick export)
 #   q  quit
@@ -2362,8 +2363,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     in_date_filter = False   # when True, we're typing a date filter (<= date_max)
     date_buffer = ""         # buffer for date filter input
     date_max: Optional[str] = None
-    # Sort mode: 'project' (default) or 'date'
-    sort_mode: str = 'project'
+    # Sort preset index
+    sort_index: int = 0
     current_index = 0
     v_offset = 0  # top row index currently displayed
     h_offset = 0
@@ -2422,7 +2423,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'project_cycle': project_cycle,
             'search_term': search_term,
             'date_max': date_max,
-            'sort_mode': sort_mode,
+            'sort_index': sort_index,
             'current_index': current_index,
             'v_offset': v_offset,
             'h_offset': h_offset,
@@ -2447,7 +2448,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     project_cycle = _st.get('project_cycle', project_cycle)
     search_term = _st.get('search_term', search_term)
     date_max = _st.get('date_max', date_max)
-    sort_mode = _st.get('sort_mode', sort_mode) if _st.get('sort_mode') in ('project','date') else 'project'
+    sort_index = int(_st.get('sort_index', sort_index) or 0)
     current_index = int(_st.get('current_index', current_index) or 0)
     v_offset = int(_st.get('v_offset', v_offset) or 0)
     h_offset = int(_st.get('h_offset', h_offset) or 0)
@@ -2967,16 +2968,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                         tmp.append(r)
                 out = tmp
         # apply sorting last
-        if sort_mode == 'date':
-            def _date_key(r: TaskRow):
-                dd = _safe_date(r.focus_date)
-                return (dd is None, dd or dt.date.max, r.project_title or '', r.title or '')
-            out = sorted(out, key=_date_key)
-        else:  # 'project'
-            def _proj_key(r: TaskRow):
-                dd = _safe_date(r.focus_date) or dt.date.max
-                return (r.project_title or '', dd, r.repo or '', r.title or '')
-            out = sorted(out, key=_proj_key)
+        preset = sort_presets[max(0, min(sort_index, len(sort_presets)-1))]
+        key_func = preset.get('key', lambda r: (r.project_title or '', _safe_date(r.focus_date) or dt.date.max, r.title or ''))
+        reverse = bool(preset.get('reverse'))
+        out = sorted(out, key=key_func, reverse=reverse)
         return out
 
     def projects_list(rows: Iterable[TaskRow]) -> List[str]:
@@ -2985,6 +2980,47 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if r.project_title not in seen:
                 seen.append(r.project_title)
         return seen
+
+    sort_presets: List[Dict[str, object]] = [
+        {
+            'name': 'Project → Focus → Priority',
+            'key': lambda r: (
+                r.project_title or '',
+                _safe_date(r.focus_date) or dt.date.max,
+                _priority_rank(r),
+                r.title or ''
+            ),
+        },
+        {
+            'name': 'Focus Day → Priority → Project',
+            'key': lambda r: (
+                _safe_date(r.focus_date) or dt.date.max,
+                _priority_rank(r),
+                r.project_title or '',
+                r.title or ''
+            ),
+        },
+        {
+            'name': 'Priority → Focus → Project',
+            'key': lambda r: (
+                _priority_rank(r),
+                _safe_date(r.focus_date) or dt.date.max,
+                r.project_title or '',
+                r.title or ''
+            ),
+        },
+        {
+            'name': 'Updated ↓ → Priority',
+            'key': lambda r: (
+                r.updated_at or '',
+                _priority_rank(r)
+            ),
+            'reverse': True,
+        },
+    ]
+
+    if not (0 <= sort_index < len(sort_presets)):
+        sort_index = 0
 
     def filtered_rows() -> List[TaskRow]:
         return apply_filters(all_rows)
@@ -3004,6 +3040,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception:
             pass
         return []
+
+    def _priority_rank(row: TaskRow) -> int:
+        opts = _priority_options(row)
+        if opts:
+            id_lookup = {str(opt.get('id') or ''): idx for idx, opt in enumerate(opts)}
+            opt_id = (row.priority_option_id or '').strip()
+            if opt_id in id_lookup:
+                return id_lookup[opt_id]
+            name_lookup = {(opt.get('name') or '').strip().lower(): idx for idx, opt in enumerate(opts)}
+            pname = (row.priority or '').strip().lower()
+            if pname in name_lookup:
+                return name_lookup[pname]
+            return len(opts)
+        pname = (row.priority or '').strip().lower()
+        if pname in ('urgent', 'highest', 'high'):  # conventional mapping
+            return 0
+        if pname in ('medium', 'normal'):  # mid tier
+            return 1
+        if pname in ('low', 'lowest', 'minor'):
+            return 2
+        return 99
+
+    def _cycle_sort(delta: int) -> None:
+        nonlocal sort_index, status_line
+        count = len(sort_presets)
+        if not count:
+            return
+        sort_index = (sort_index + delta) % count
+        status_line = f"Sort: {sort_presets[sort_index]['name']}"
+        invalidate()
 
     def build_table_fragments() -> List[Tuple[str,str]]:
         rows = filtered_rows()
@@ -3219,6 +3285,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if date_max:
             fr += [("", f"📅 <= {date_max}\n")]
         fr += [("", f"☑️ Done:{'Hide' if hide_done else 'Off'} NoDate:{'Hide' if hide_no_date else 'Off'}\n")]
+        fr += [("", f"↕ Sort: {_truncate(sort_presets[sort_index]['name'],22)}\n")]
         # Top 5 projects by time (30d)
         try:
             pt30 = db.aggregate_project_totals(since_days=30)
@@ -3273,7 +3340,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
         timers = f" Now:{_fmt_hms(now_s)} Task:{_fmt_hms(task_s)} Proj:{_fmt_hms(proj_s)} Act:{active_count} "
         view_label = 'Iteration' if use_iteration else 'Dates'
-        txt = f"{timers}| Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | View: {view_label}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
+        sort_label = _truncate(sort_presets[sort_index]['name'], 20)
+        txt = f"{timers}| Date: {today_date.isoformat()}  | Project: {_truncate(active_proj,30)}  | View: {view_label}  | Sort: {sort_label}  | Shown: {total}  | Search: {_truncate(active_search,30)} "
         return [("reverse", txt)]
     top_status_control = FormattedTextControl(text=lambda: build_top_status())
     top_status_window = Window(height=1, content=top_status_control)
@@ -4928,11 +4996,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     # Sort toggle
     @kb.add('s', filter=is_normal)
     def _(event):
-        nonlocal sort_mode, current_index, v_offset
-        sort_mode = 'date' if sort_mode == 'project' else 'project'
-        current_index = 0
-        v_offset = 0
-        invalidate()
+        _cycle_sort(1)
+
+    @kb.add('S', filter=is_normal)
+    def _(event):
+        _cycle_sort(-1)
     # Date <= filter input
     @kb.add('F')
     def _(event):
@@ -4991,7 +5059,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "",
                 "🔎 Search & Sort",
                 "  /                   Start search (Enter apply, Esc cancel)",
-                "  s                   Toggle sort (Project/Date)",
+                "  s / S               Cycle sort forward / backward",
                 "",
                 "🎛️ Filters",
                 "  p / P               Cycle / Clear project",
