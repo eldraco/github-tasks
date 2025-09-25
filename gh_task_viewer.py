@@ -215,6 +215,8 @@ class TaskRow:
     iteration_options: str = "[]"
     assignee_field_id: str = ""
     assignee_user_ids: str = "[]"
+    assignee_logins: str = "[]"
+    content_node_id: str = ""
 
 
 class TaskDB:
@@ -225,7 +227,7 @@ class TaskDB:
         "iteration_field","iteration_title","iteration_start","iteration_duration",
         "title","repo_id","repo","labels","priority","priority_field_id","priority_option_id","priority_options","priority_dirty","priority_pending_option_id","url","updated_at","status","is_done","assigned_to_me","created_by_me",
         "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id",
-        "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids"
+        "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids","assignee_logins","content_node_id"
     ]
     CREATE_TABLE_SQL = """      CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -270,6 +272,8 @@ class TaskDB:
         iteration_options TEXT,
         assignee_field_id TEXT,
         assignee_user_ids TEXT,
+        assignee_logins TEXT,
+        content_node_id TEXT,
         UNIQUE(owner_type, owner, project_number, title, url, start_field, start_date)
       )
     """
@@ -319,7 +323,7 @@ class TaskDB:
             "item_id":"''","project_id":"''","status_field_id":"''","status_option_id":"''",
             "status_options":"'[]'","status_dirty":"0","status_pending_option_id":"''",
             "start_field_id":"''","iteration_field_id":"''","iteration_options":"'[]'",
-            "assignee_field_id":"''","assignee_user_ids":"'[]'",
+            "assignee_field_id":"''","assignee_user_ids":"'[]'","assignee_logins":"'[]'","content_node_id":"''",
         }
         sel = ", ".join([c if c in cols else defaults[c] for c in self.SCHEMA_COLUMNS])
         cur.execute(
@@ -825,6 +829,34 @@ class TaskDB:
             )
         self.conn.commit()
 
+    def update_assignees(self, url: str, user_ids: List[str], logins: List[str]) -> None:
+        try:
+            user_ids_json = json.dumps(user_ids or [], ensure_ascii=False)
+        except Exception:
+            user_ids_json = "[]"
+        try:
+            logins_json = json.dumps(logins or [], ensure_ascii=False)
+        except Exception:
+            logins_json = "[]"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET assignee_user_ids=?, assignee_logins=? WHERE url=?",
+            (user_ids_json, logins_json, url),
+        )
+        self.conn.commit()
+
+    def update_labels(self, url: str, labels: List[str]) -> None:
+        try:
+            payload = json.dumps(labels or [], ensure_ascii=False)
+        except Exception:
+            payload = "[]"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET labels=? WHERE url=?",
+            (payload, url),
+        )
+        self.conn.commit()
+
     def mark_priority_pending(self, url: str, priority_text: str, option_id: str) -> None:
         cur = self.conn.cursor()
         cur.execute(
@@ -888,12 +920,12 @@ class TaskDB:
               title, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
               url, updated_at, status, is_done, assigned_to_me, created_by_me,
               item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
-              start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids
+              start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids, assignee_logins, content_node_id
             ) VALUES (
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
@@ -926,7 +958,9 @@ class TaskDB:
                           iteration_field_id=excluded.iteration_field_id,
                           iteration_options=excluded.iteration_options,
                           assignee_field_id=excluded.assignee_field_id,
-                          assignee_user_ids=excluded.assignee_user_ids
+                          assignee_user_ids=excluded.assignee_user_ids,
+                          assignee_logins=excluded.assignee_logins,
+                          content_node_id=excluded.content_node_id
             """,
             [
                 (
@@ -971,6 +1005,8 @@ class TaskDB:
                     r.iteration_options,
                     r.assignee_field_id,
                     r.assignee_user_ids,
+                    r.assignee_logins,
+                    r.content_node_id,
                 )
                 for r in rows
             ],
@@ -995,7 +1031,7 @@ class TaskDB:
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
-                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
+                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
                 FROM tasks WHERE focus_date = ?
                 ORDER BY project_title, focus_date, repo, title
                 """,
@@ -1009,7 +1045,7 @@ class TaskDB:
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
-                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids
+                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
                 FROM tasks
                 ORDER BY project_title, focus_date, repo, title
                 """
@@ -1542,8 +1578,8 @@ def set_project_iteration(token: str, project_id: str, item_id: str, field_id: s
 
 
 def set_project_users(token: str, project_id: str, item_id: str, field_id: str, user_ids: List[str]) -> None:
-    if not user_ids:
-        return
+    if user_ids is None:
+        user_ids = []
     session = _session(token)
     attempts: List[Tuple[str, Dict[str, object]]] = [
         (GQL_MUTATION_SET_USERS_USERIDS, {"userIds": [uid for uid in user_ids if uid]})
@@ -1577,6 +1613,66 @@ def set_project_users(token: str, project_id: str, item_id: str, field_id: str, 
             return
         last_error = "; ".join(e.get("message", str(e)) for e in errs)
     raise RuntimeError("Setting assignees failed: " + (last_error or "unknown error"))
+
+
+def set_issue_labels(token: str, issue_url: str, labels: List[str]) -> None:
+    parts = _parse_issue_url(issue_url)
+    if not parts or token is None:
+        raise RuntimeError("Issue URL required for labels")
+    owner, repo, number = parts
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+    }
+    import requests as _rq
+    r = _rq.patch(
+        f'https://api.github.com/repos/{owner}/{repo}/issues/{number}',
+        headers=headers,
+        json={'labels': labels},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Label update failed ({r.status_code}): {r.text}")
+
+
+def set_issue_assignees(token: str, issue_url: str, assignees: List[str]) -> None:
+    parts = _parse_issue_url(issue_url)
+    if not parts or token is None:
+        raise RuntimeError("Issue URL required for assignees")
+    owner, repo, number = parts
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+    }
+    import requests as _rq
+    r = _rq.patch(
+        f'https://api.github.com/repos/{owner}/{repo}/issues/{number}',
+        headers=headers,
+        json={'assignees': assignees},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Assignee update failed ({r.status_code}): {r.text}")
+
+
+def add_issue_comment(token: str, issue_url: str, body: str) -> None:
+    parts = _parse_issue_url(issue_url)
+    if not parts or token is None:
+        raise RuntimeError("Issue URL required for comment")
+    owner, repo, number = parts
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+    }
+    import requests as _rq
+    r = _rq.post(
+        f'https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments',
+        headers=headers,
+        json={'body': body},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Comment failed ({r.status_code}): {r.text}")
 
 
 def get_user_node_id(token: str, login: str) -> str:
@@ -2969,6 +3065,173 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['message'] = current.isoformat()
         invalidate()
 
+    async def _apply_assignees(logins: List[str]) -> None:
+        nonlocal all_rows, status_line
+        rows = filtered_rows()
+        if not rows:
+            msg = "No task selected"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        row = rows[current_index]
+        if not token:
+            msg = "GITHUB_TOKEN required for assignee updates"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        if not row.assignee_field_id:
+            msg = "Task missing People field"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        loop = asyncio.get_running_loop()
+        clean_logins = []
+        seen = set()
+        for login in logins:
+            norm = login.strip().lstrip('@')
+            if not norm:
+                continue
+            if norm.lower() in seen:
+                continue
+            seen.add(norm.lower())
+            clean_logins.append(norm)
+        user_ids: List[str] = []
+        errors: List[str] = []
+        for login in clean_logins:
+            try:
+                node_id = await loop.run_in_executor(None, lambda l=login: get_user_node_id(token, l))
+            except Exception as exc:
+                errors.append(f"{login} ({exc})")
+                continue
+            if not node_id:
+                errors.append(login)
+            else:
+                user_ids.append(node_id)
+        if errors:
+            msg = f"Unknown user(s): {', '.join(errors)}"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        try:
+            await loop.run_in_executor(None, lambda: set_project_users(token, row.project_id, row.item_id, row.assignee_field_id, user_ids))
+        except Exception as exc:
+            msg = f"People field update failed: {exc}"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        try:
+            await loop.run_in_executor(None, lambda: set_issue_assignees(token, row.url, clean_logins))
+        except Exception as exc:
+            try:
+                logger.warning("Issue assignee update failed for %s: %s", row.url, exc)
+            except Exception:
+                pass
+        db.update_assignees(row.url, user_ids, clean_logins)
+        all_rows = load_all()
+        status_line = 'Assignees updated'
+        if edit_task_mode:
+            task_edit_state['message'] = status_line
+            _refresh_task_editor_state()
+        invalidate()
+
+    async def _apply_labels(labels_new: List[str]) -> None:
+        nonlocal all_rows, status_line
+        rows = filtered_rows()
+        if not rows:
+            msg = "No task selected"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        row = rows[current_index]
+        if not token:
+            msg = "GITHUB_TOKEN required for label updates"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        parts = _parse_issue_url(row.url)
+        if not parts:
+            msg = "Labels only supported for issues/PRs"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        loop = asyncio.get_running_loop()
+        clean_labels = []
+        seen = set()
+        for lab in labels_new:
+            nm = lab.strip()
+            if not nm:
+                continue
+            if nm.lower() in seen:
+                continue
+            seen.add(nm.lower())
+            clean_labels.append(nm)
+        try:
+            await loop.run_in_executor(None, lambda: set_issue_labels(token, row.url, clean_labels))
+        except Exception as exc:
+            msg = f"Label update failed: {exc}"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        db.update_labels(row.url, clean_labels)
+        all_rows = load_all()
+        status_line = 'Labels updated'
+        if edit_task_mode:
+            task_edit_state['message'] = status_line
+            _refresh_task_editor_state()
+        invalidate()
+
+    async def _add_comment(comment: str) -> None:
+        nonlocal status_line
+        rows = filtered_rows()
+        if not rows:
+            msg = "No task selected"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        row = rows[current_index]
+        if not token:
+            msg = "GITHUB_TOKEN required for comments"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        if not _parse_issue_url(row.url):
+            msg = "Comments supported only for issues/PRs"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        body = (comment or '').strip()
+        if not body:
+            msg = "Comment cannot be empty"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, lambda: add_issue_comment(token, row.url, body))
+        except Exception as exc:
+            msg = f"Comment failed: {exc}"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        status_line = 'Comment posted'
+        if edit_task_mode:
+            task_edit_state['message'] = status_line
+        invalidate()
+
     async def _change_priority(delta: Optional[int] = None, option_id: Optional[str] = None):
         nonlocal all_rows, status_line, current_index
         if not token:
@@ -3265,6 +3528,39 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'type': 'priority-text',
                 'field_key': 'priority',
                 'value': row.priority.strip(),
+            })
+        try:
+            assignees = json.loads(row.assignee_logins or "[]")
+            if not isinstance(assignees, list):
+                assignees = []
+        except Exception:
+            assignees = []
+        if assignees or (row.assignee_field_id and row.assignee_field_id.strip()):
+            fields.append({
+                'name': 'Assignees',
+                'type': 'assignees',
+                'field_key': 'assignees',
+                'value': assignees,
+            })
+        try:
+            label_values = json.loads(row.labels or "[]")
+            if not isinstance(label_values, list):
+                label_values = []
+        except Exception:
+            label_values = []
+        if label_values or _parse_issue_url(row.url):
+            fields.append({
+                'name': 'Labels',
+                'type': 'labels',
+                'field_key': 'labels',
+                'value': label_values,
+            })
+        if _parse_issue_url(row.url):
+            fields.append({
+                'name': 'Comment',
+                'type': 'comment',
+                'field_key': 'comment',
+                'value': '',
             })
         return fields
 
@@ -3963,6 +4259,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     value = opts[index].get('name') if opts else '(no options)'
                     if opts and getattr(row, 'priority_dirty', 0):
                         value = (value or '-') + '*'
+                elif ftype == 'assignees':
+                    vals = field.get('value') or []
+                    if isinstance(vals, list):
+                        value = ', '.join(vals) or '-'
+                    else:
+                        value = str(vals) or '-'
+                elif ftype == 'labels':
+                    vals = field.get('value') or []
+                    if isinstance(vals, list):
+                        value = ', '.join(vals) or '-'
+                    else:
+                        value = str(vals) or '-'
+                elif ftype == 'priority-text':
+                    value = field.get('value') or '-'  
+                elif ftype == 'comment':
+                    value = '(add comment)'
                 else:
                     value = field.get('value', '')
                 value = value or '-'
@@ -4001,6 +4313,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             for i, opt in enumerate(opts):
                 marker = '➤' if i == idx else ' '
                 lines.append(f"   {marker} {opt.get('name')}")
+        elif mode == 'edit-assignees':
+            lines.append("Assignees (comma-separated GitHub logins). Enter=save · Esc=cancel")
+            lines.append(f"Value: {task_edit_state.get('input', '')}")
+        elif mode == 'edit-labels':
+            lines.append("Labels (comma-separated). Enter=save · Esc=cancel")
+            lines.append(f"Value: {task_edit_state.get('input', '')}")
+        elif mode == 'edit-comment':
+            lines.append("New comment (Enter=post, Esc=cancel)")
+            lines.append(f"Value: {task_edit_state.get('input', '')}")
         else:
             lines.append("Use j/k to select a field. Enter=edit · Esc/Q=close")
         message = task_edit_state.get('message') or ''
@@ -4290,6 +4611,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if mode == 'priority-select' and idx is not None and idx < len(fields):
             prev_idx = editing.get('prev_index', fields[idx].get('index', 0))
             fields[idx]['index'] = prev_idx
+        if mode == 'edit-assignees' and idx is not None and idx < len(fields):
+            prev_list = editing.get('prev_value', fields[idx].get('value', []))
+            fields[idx]['value'] = list(prev_list) if isinstance(prev_list, list) else []
+        if mode == 'edit-labels' and idx is not None and idx < len(fields):
+            prev_list = editing.get('prev_value', fields[idx].get('value', []))
+            fields[idx]['value'] = list(prev_list) if isinstance(prev_list, list) else []
         task_edit_state['mode'] = 'list'
         task_edit_state['input'] = ''
         task_edit_state['editing'] = None
@@ -4330,6 +4657,27 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['mode'] = 'priority-select'
             task_edit_state['editing'] = {'field_idx': cursor, 'prev_index': field.get('index', 0)}
             task_edit_state['message'] = 'Use j/k to choose priority (Enter=save, Esc=cancel)'
+        elif ftype == 'assignees':
+            current = field.get('value') or []
+            if not isinstance(current, list):
+                current = []
+            task_edit_state['mode'] = 'edit-assignees'
+            task_edit_state['input'] = ', '.join(current)
+            task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': list(current)}
+            task_edit_state['message'] = 'Comma-separated GitHub logins (Enter=save, Esc=cancel)'
+        elif ftype == 'labels':
+            current = field.get('value') or []
+            if not isinstance(current, list):
+                current = []
+            task_edit_state['mode'] = 'edit-labels'
+            task_edit_state['input'] = ', '.join(current)
+            task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': list(current)}
+            task_edit_state['message'] = 'Comma-separated labels (Enter=save, Esc=cancel)'
+        elif ftype == 'comment':
+            task_edit_state['mode'] = 'edit-comment'
+            task_edit_state['input'] = ''
+            task_edit_state['editing'] = {'field_idx': cursor}
+            task_edit_state['message'] = 'Type comment text (Enter=post, Esc=cancel)'
         else:
             task_edit_state['message'] = 'Field not editable'
         invalidate()
@@ -4345,7 +4693,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
     is_task_edit_mode = Condition(lambda: edit_task_mode)
-    is_task_edit_input = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select'))
+    is_task_edit_input = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-assignees', 'edit-labels', 'edit-comment'))
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode))
@@ -4571,6 +4919,39 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['editing'] = None
                 task_edit_state['message'] = f"Updating {field.get('name')}…"
                 asyncio.create_task(_change_priority(option_id=option_id))
+            elif mode == 'edit-assignees':
+                field = fields[cursor] if cursor < len(fields) else None
+                value = task_edit_state.get('input', '')
+                logins = [part.strip().lstrip('@') for part in value.replace(';', ',').split(',')]
+                logins = [login for login in logins if login]
+                if field is not None:
+                    field['value'] = logins
+                task_edit_state['mode'] = 'list'
+                task_edit_state['input'] = ''
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = 'Updating assignees…'
+                asyncio.create_task(_apply_assignees(logins))
+            elif mode == 'edit-labels':
+                field = fields[cursor] if cursor < len(fields) else None
+                value = task_edit_state.get('input', '')
+                labels_list = [part.strip() for part in value.replace(';', ',').split(',') if part.strip()]
+                if field is not None:
+                    field['value'] = labels_list
+                task_edit_state['mode'] = 'list'
+                task_edit_state['input'] = ''
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = 'Updating labels…'
+                asyncio.create_task(_apply_labels(labels_list))
+            elif mode == 'edit-comment':
+                comment = (task_edit_state.get('input', '') or '').strip()
+                if not comment:
+                    task_edit_state['message'] = 'Comment cannot be empty'
+                    invalidate(); return
+                task_edit_state['mode'] = 'list'
+                task_edit_state['input'] = ''
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = 'Posting comment…'
+                asyncio.create_task(_add_comment(comment))
             else:
                 _start_task_field_edit()
             return
@@ -5342,6 +5723,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = f"Date<= {date_buffer}"
             invalidate()
 
+    @kb.add('backspace', filter=is_task_edit_input)
+    def _(event):
+        mode = task_edit_state.get('mode')
+        if mode in ('edit-assignees', 'edit-labels', 'edit-comment'):
+            buf = task_edit_state.get('input', '')
+            if buf:
+                task_edit_state['input'] = buf[:-1]
+                invalidate()
+
     # Catch-all printable character input for live search and date filter typing
     @kb.add(Keys.Any, filter=Condition(lambda: in_search or in_date_filter))
     def _(event):
@@ -5359,6 +5749,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 date_buffer += ch
                 status_line = f"Date<= {date_buffer}"
                 invalidate()
+
+    @kb.add(Keys.Any, filter=is_task_edit_input)
+    def _(event):
+        mode = task_edit_state.get('mode')
+        if mode not in ('edit-assignees', 'edit-labels', 'edit-comment'):
+            return
+        ch = event.data or ''
+        if not ch or ch in ('\r', '\n'):
+            return
+        buf = task_edit_state.get('input', '')
+        task_edit_state['input'] = buf + ch
+        invalidate()
 
     @kb.add('u', filter=is_normal)
     def _(event):
@@ -5592,7 +5994,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         _cycle_sort(-1)
     # Date <= filter input
-    @kb.add('F')
+    @kb.add('F', filter=is_normal)
     def _(event):
         if detail_mode:
             return
