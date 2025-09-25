@@ -1379,6 +1379,90 @@ def fetch_labels_for_url(token: Optional[str], url: str) -> List[str]:
             pass
         return []
 
+
+def list_repo_labels(token: Optional[str], full_name: str, max_pages: int = 5) -> List[Dict[str, str]]:
+    if not token or not full_name or '/' not in full_name:
+        return []
+    owner, name = full_name.split('/', 1)
+    session = _session(token)
+    url = f"https://api.github.com/repos/{owner}/{name}/labels"
+    params = {"per_page": 100}
+    labels: List[Dict[str, str]] = []
+    pages = 0
+    while url and pages < max_pages:
+        try:
+            resp = session.get(url, params=params if pages == 0 else None, timeout=30)
+        except Exception as exc:
+            try:
+                logging.getLogger('gh_task_viewer').warning('list_repo_labels request failed: %s', exc)
+            except Exception:
+                pass
+            break
+        if resp.status_code >= 300:
+            try:
+                logging.getLogger('gh_task_viewer').warning('list_repo_labels HTTP %s: %s', resp.status_code, resp.text[:200])
+            except Exception:
+                pass
+            break
+        data = resp.json() or []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name_val = (item.get('name') or '').strip()
+            if not name_val:
+                continue
+            labels.append({
+                'name': name_val,
+                'description': item.get('description') or '',
+                'color': item.get('color') or '',
+            })
+        next_link = (resp.links or {}).get('next', {})
+        url = next_link.get('url')
+        pages += 1
+    return labels
+
+
+def list_repo_assignees(token: Optional[str], full_name: str, max_pages: int = 5) -> List[Dict[str, str]]:
+    if not token or not full_name or '/' not in full_name:
+        return []
+    owner, name = full_name.split('/', 1)
+    session = _session(token)
+    url = f"https://api.github.com/repos/{owner}/{name}/assignees"
+    params = {"per_page": 100}
+    users: List[Dict[str, str]] = []
+    pages = 0
+    while url and pages < max_pages:
+        try:
+            resp = session.get(url, params=params if pages == 0 else None, timeout=30)
+        except Exception as exc:
+            try:
+                logging.getLogger('gh_task_viewer').warning('list_repo_assignees request failed: %s', exc)
+            except Exception:
+                pass
+            break
+        if resp.status_code >= 300:
+            try:
+                logging.getLogger('gh_task_viewer').warning('list_repo_assignees HTTP %s: %s', resp.status_code, resp.text[:200])
+            except Exception:
+                pass
+            break
+        data = resp.json() or []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            login_val = (item.get('login') or '').strip()
+            if not login_val:
+                continue
+            users.append({
+                'login': login_val,
+                'name': item.get('name') or '',
+                'id': item.get('id'),
+            })
+        next_link = (resp.links or {}).get('next', {})
+        url = next_link.get('url')
+        pages += 1
+    return users
+
 def _graphql_raw(session: requests.Session, query: str, variables: Dict[str, object]) -> Dict:
     try:
         r = session.post("https://api.github.com/graphql", json={"query": query, "variables": variables}, timeout=60)
@@ -2619,8 +2703,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'project_id': row.project_id or "",
                 'start_field_id': row.start_field_id or "",
                 'start_field_name': row.start_field or "",
+                'focus_field_id': row.focus_field_id or "",
+                'focus_field_name': row.focus_field or "",
                 'iteration_field_id': row.iteration_field_id or "",
                 'iteration_options': _json_list(row.iteration_options),
+                'priority_field_id': row.priority_field_id or "",
+                'priority_options': _json_list(row.priority_options),
                 'assignee_field_id': row.assignee_field_id or "",
                 'repos': {}
             })
@@ -2631,10 +2719,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if not entry['start_field_id'] and row.start_field_id:
                 entry['start_field_id'] = row.start_field_id
                 entry['start_field_name'] = row.start_field
+            if not entry['focus_field_id'] and row.focus_field_id:
+                entry['focus_field_id'] = row.focus_field_id
+                entry['focus_field_name'] = row.focus_field or entry.get('focus_field_name', '')
             if (not entry['iteration_field_id']) and row.iteration_field_id:
                 entry['iteration_field_id'] = row.iteration_field_id
             if not entry['iteration_options'] and row.iteration_options:
                 entry['iteration_options'] = _json_list(row.iteration_options)
+            if not entry['priority_field_id'] and row.priority_field_id:
+                entry['priority_field_id'] = row.priority_field_id
+            if not entry['priority_options'] and row.priority_options:
+                entry['priority_options'] = _json_list(row.priority_options)
             if not entry['assignee_field_id'] and row.assignee_field_id:
                 entry['assignee_field_id'] = row.assignee_field_id
             repo_key = (row.repo or '').strip()
@@ -2658,8 +2753,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     'project_id': entry.get("project_id") or "",
                     'start_field_id': "",
                     'start_field_name': "",
+                    'focus_field_id': "",
+                    'focus_field_name': "",
                     'iteration_field_id': "",
                     'iteration_options': [],
+                    'priority_field_id': "",
+                    'priority_options': [],
                     'assignee_field_id': entry.get('assignee_field_id') or "",
                     'repos': {}
                 })
@@ -2696,6 +2795,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_state['iteration_choices'] = _build_iteration_choices(project) if project else []
         add_state['iteration_index'] = 0
         add_state['repo_manual'] = ''
+        add_state['priority_options'] = (project.get('priority_options') if project else []) or []
+        _reset_repo_metadata_state()
 
     def _current_add_project() -> Optional[Dict[str, object]]:
         if not add_state.get('project_choices'):
@@ -2721,23 +2822,183 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             choices = [{'repo': name, 'repo_id': rid or ''} for name, rid in recent if name]
         return choices
 
+    def _reset_repo_metadata_state() -> None:
+        add_state['label_choices'] = []
+        add_state['label_index'] = 0
+        add_state['labels_selected'] = set()
+        add_state['priority_choices'] = []
+        add_state['priority_index'] = 0
+        add_state['priority_label'] = ''
+        add_state['assignee_choices'] = []
+        add_state['assignee_index'] = 0
+        add_state['assignees_selected'] = set()
+        add_state['metadata_error'] = ''
+        add_state['loading_repo_metadata'] = False
+        add_state['repo_metadata_source'] = ''
+        add_state['repo_metadata_task'] = None
+
+    async def _fetch_repo_metadata(repo_full_name: str) -> None:
+        nonlocal add_state, status_line
+        if not token:
+            add_state['metadata_error'] = 'GITHUB_TOKEN required to load labels'
+            add_state['loading_repo_metadata'] = False
+            add_state['repo_metadata_task'] = None
+            invalidate()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            add_state['metadata_error'] = 'Unable to access event loop'
+            add_state['loading_repo_metadata'] = False
+            add_state['repo_metadata_task'] = None
+            invalidate()
+            return
+
+        def _do_fetch():
+            return (
+                list_repo_labels(token, repo_full_name),
+                list_repo_assignees(token, repo_full_name),
+            )
+
+        try:
+            labels_raw, assignees_raw = await loop.run_in_executor(None, _do_fetch)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            add_state['metadata_error'] = f'Metadata error: {exc}'
+            add_state['label_choices'] = []
+            add_state['priority_choices'] = []
+            add_state['assignee_choices'] = []
+        else:
+            label_names: List[str] = []
+            seen_labels: Set[str] = set()
+            for item in labels_raw:
+                name_val = (item.get('name') if isinstance(item, dict) else '') or ''
+                name_clean = name_val.strip()
+                if not name_clean:
+                    continue
+                key = name_clean.lower()
+                if key in seen_labels:
+                    continue
+                seen_labels.add(key)
+                label_names.append(name_clean)
+            add_state['label_choices'] = label_names
+            add_state['label_index'] = 0 if label_names else 0
+            add_state['labels_selected'] = set()
+
+            priority_options_local = add_state.get('priority_options') or []
+            priority_names: List[str] = []
+            seen_priority: Set[str] = set()
+            for opt in priority_options_local:
+                if not isinstance(opt, dict):
+                    continue
+                name_val = (opt.get('name') or '').strip()
+                if not name_val:
+                    continue
+                key = name_val.lower()
+                if key in seen_priority:
+                    continue
+                seen_priority.add(key)
+                priority_names.append(name_val)
+            if not priority_names:
+                priority_names = [nm for nm in label_names if 'priority' in nm.lower()]
+            add_state['priority_choices'] = priority_names
+            add_state['priority_index'] = 0 if priority_names else 0
+            # Do not auto-select priority; let the user choose explicitly
+            add_state['priority_label'] = ''
+
+            assignee_entries: List[Dict[str, str]] = []
+            seen_users: Set[str] = set()
+            for item in assignees_raw:
+                if not isinstance(item, dict):
+                    continue
+                login_val = (item.get('login') or '').strip()
+                if not login_val:
+                    continue
+                key = login_val.lower()
+                if key in seen_users:
+                    continue
+                seen_users.add(key)
+                real_name = (item.get('name') or '').strip()
+                if real_name and real_name.lower() != key:
+                    display = f"{login_val} ({real_name})"
+                else:
+                    display = login_val
+                assignee_entries.append({'login': login_val, 'display': display})
+            assignee_entries.sort(key=lambda x: x['display'].lower())
+            add_state['assignee_choices'] = assignee_entries
+            add_state['assignee_index'] = 0 if assignee_entries else 0
+            default_login = (cfg.user or '').strip().lower()
+            selected_assignees: Set[str] = set()
+            if default_login:
+                for entry in assignee_entries:
+                    if entry['login'].strip().lower() == default_login:
+                        selected_assignees.add(entry['login'])
+                        add_state['assignee_index'] = assignee_entries.index(entry)
+                        break
+            add_state['assignees_selected'] = selected_assignees
+            add_state['metadata_error'] = '' if label_names else 'No labels found for repository'
+        finally:
+            add_state['loading_repo_metadata'] = False
+            add_state['repo_metadata_task'] = None
+            invalidate()
+
+    def _start_repo_metadata_fetch(repo_full_name: str) -> None:
+        if not repo_full_name:
+            return
+        if not token:
+            add_state['metadata_error'] = 'GITHUB_TOKEN required to load labels'
+            add_state['loading_repo_metadata'] = False
+            return
+        # Avoid duplicate fetch if already loaded
+        if add_state.get('repo_metadata_source') == repo_full_name and add_state.get('label_choices'):
+            return
+        task = add_state.get('repo_metadata_task')
+        if isinstance(task, asyncio.Task):
+            task.cancel()
+        add_state['repo_metadata_source'] = repo_full_name
+        add_state['loading_repo_metadata'] = True
+        add_state['metadata_error'] = ''
+        add_state['label_choices'] = []
+        add_state['label_index'] = 0
+        add_state['labels_selected'] = set()
+        add_state['priority_choices'] = []
+        add_state['priority_index'] = 0
+        add_state['priority_label'] = ''
+        add_state['assignee_choices'] = []
+        add_state['assignee_index'] = 0
+        add_state['assignees_selected'] = set()
+        invalidate()
+        add_state['repo_metadata_task'] = asyncio.create_task(_fetch_repo_metadata(repo_full_name))
+
     def build_add_overlay() -> List[Tuple[str, str]]:
         if not add_mode:
             return []
         step = add_state.get('step', 'project')
-        body: List[str] = []
-        # Header per step
+        project = _current_add_project()
+        mode_label = 'Issue' if add_state.get('mode', 'issue') == 'issue' else 'Project Task'
+        repo_full = (add_state.get('repo_full_name') or '').strip()
+        metadata_error = add_state.get('metadata_error', '')
+        loading_metadata = bool(add_state.get('loading_repo_metadata'))
+
         headers = {
             'mode': '🧷 Choose Type',
             'project': '📁 Select Project',
             'repo': '📦 Select Repository',
             'title': '📝 Enter Title',
-            'date': '📅 Start Date (YYYY-MM-DD)',
+            'start': '📅 Start Date (YYYY-MM-DD)',
+            'end': '📆 End Date (optional)',
+            'focus': '🎯 Focus Day (YYYY-MM-DD)',
             'iteration': '🔁 Select Iteration',
+            'labels': '🏷️ Select Labels',
+            'priority': '⚡ Select Priority',
+            'assignee': '👥 Choose Assignees',
+            'comment': '💬 Initial Comment',
             'confirm': '✅ Confirm',
         }
         title_head = headers.get(step, '➕ Add Item')
-        # Body lines depending on step
+        body: List[str] = []
+
         if step == 'mode':
             body.append("Use j/k to move, Enter to choose, Esc to cancel")
             choices = add_state.get('mode_choices') or []
@@ -2759,21 +3020,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 for idx, repo_entry in enumerate(choices):
                     prefix = "➤" if idx == add_state.get('repo_index', 0) else " "
                     body.append(f" {prefix} {repo_entry.get('repo')}")
+                if loading_metadata:
+                    body.append("")
+                    body.append(" Loading metadata…")
             else:
                 body.append("Type owner/name, Enter to confirm, Esc to cancel")
                 r = add_state.get('repo_manual', '')
                 cur = max(0, min(len(r), add_state.get('repo_cursor', len(r))))
                 body.append(r[:cur] + "_" + r[cur:])
+                if loading_metadata:
+                    body.append("")
+                    body.append(" Loading metadata…")
+                elif metadata_error:
+                    body.append(f" ⚠️ {metadata_error}")
         elif step == 'title':
             body.append("Type a concise title, Enter to continue, Esc cancel")
-            t = add_state.get('title', '')
-            cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
-            body.append(t[:cur] + "_" + t[cur:])
-        elif step == 'date':
-            body.append("Enter Focus Day (YYYY-MM-DD), Enter to accept")
-            d = add_state.get('date', '')
-            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
-            body.append(d[:cur] + "_" + d[cur:])
+            text = add_state.get('title', '')
+            cur = max(0, min(len(text), add_state.get('title_cursor', len(text))))
+            body.append(text[:cur] + "_" + text[cur:])
+        elif step in ('start', 'end', 'focus'):
+            prompts = {
+                'start': 'Enter Start Date (YYYY-MM-DD)',
+                'end': 'Enter End Date (optional, YYYY-MM-DD)',
+                'focus': 'Enter Focus Day (YYYY-MM-DD)',
+            }
+            field_map = {
+                'start': ('start_date', 'start_cursor'),
+                'end': ('end_date', 'end_cursor'),
+                'focus': ('focus_date', 'focus_cursor'),
+            }
+            prompt = prompts.get(step, 'Enter Date')
+            body.append(f"{prompt}, Enter to continue, Esc cancel")
+            field_key, cursor_key = field_map[step]
+            val = add_state.get(field_key, '')
+            cur = max(0, min(len(val), add_state.get(cursor_key, len(val))))
+            body.append(val[:cur] + "_" + val[cur:])
         elif step == 'iteration':
             body.append("Use j/k to move, Enter to choose, Esc cancel")
             choices = add_state.get('iteration_choices') or []
@@ -2783,38 +3064,107 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 prefix = "➤" if idx == add_state.get('iteration_index', 0) else " "
                 label = opt.get('title') or '(None)'
                 body.append(f" {prefix} {label}")
+        elif step == 'labels':
+            labels = add_state.get('label_choices') or []
+            selected = add_state.get('labels_selected') or set()
+            if not isinstance(selected, set):
+                selected = set(selected)
+            idx = max(0, min(len(labels)-1, add_state.get('label_index', 0))) if labels else 0
+            if loading_metadata:
+                body.append(f"Loading labels for {repo_full or '(repo pending)'}…")
+            elif metadata_error:
+                body.append(f"⚠️ {metadata_error}")
+            body.append("Use j/k to move, Space to toggle, Enter to continue, Esc cancel")
+            if not labels:
+                body.append("  (no labels available)")
+            for i, name in enumerate(labels):
+                prefix = "➤" if i == idx else " "
+                marker = '✔' if name in selected else ' '
+                body.append(f" {prefix} [{marker}] {name}")
+        elif step == 'priority':
+            priorities = add_state.get('priority_choices') or []
+            selected_label = (add_state.get('priority_label') or '').strip()
+            idx = max(0, min(len(priorities)-1, add_state.get('priority_index', 0))) if priorities else 0
+            if loading_metadata:
+                body.append(f"Loading labels for {repo_full or '(repo pending)'}…")
+            elif metadata_error and not priorities:
+                body.append(f"⚠️ {metadata_error}")
+            body.append("Use j/k to move, Space to select, Enter to continue, Esc cancel")
+            if not priorities:
+                body.append("  (no priority candidates; leave blank if not needed)")
+            for i, name in enumerate(priorities):
+                prefix = "➤" if i == idx else " "
+                marker = '●' if name == selected_label else '○'
+                body.append(f" {prefix} {marker} {name}")
+        elif step == 'assignee':
+            assignees = add_state.get('assignee_choices') or []
+            selected = add_state.get('assignees_selected') or set()
+            if not isinstance(selected, set):
+                selected = set(selected)
+            idx = max(0, min(len(assignees)-1, add_state.get('assignee_index', 0))) if assignees else 0
+            if loading_metadata:
+                body.append(f"Loading assignees for {repo_full or '(repo pending)'}…")
+            elif metadata_error and not assignees:
+                body.append(f"⚠️ {metadata_error}")
+            body.append("Use j/k to move, Space to toggle, Enter to continue, Esc cancel")
+            if not assignees:
+                body.append("  (no assignable users found)")
+            for i, entry in enumerate(assignees):
+                prefix = "➤" if i == idx else " "
+                marker = '✔' if entry.get('login') in selected else ' '
+                body.append(f" {prefix} [{marker}] {entry.get('display') or entry.get('login')}")
+        elif step == 'comment':
+            body.append("Type an optional comment, Enter to continue, Esc cancel")
+            comment = add_state.get('comment', '')
+            cur = max(0, min(len(comment), add_state.get('comment_cursor', len(comment))))
+            body.append(comment[:cur] + "_" + comment[cur:])
         elif step == 'confirm':
-            project = _current_add_project()
-            tval = add_state.get('title', '').strip()
-            dval = add_state.get('date', '').strip() or '(none)'
-            iteration_choice = add_state.get('iteration_choices') or []
-            idx = add_state.get('iteration_index', 0)
+            title_val = add_state.get('title', '').strip()
+            start_val = (add_state.get('start_date') or '').strip() or '(auto)'
+            end_val = (add_state.get('end_date') or '').strip() or '(none)'
+            focus_val = (add_state.get('focus_date') or '').strip() or '(none)'
+            iteration_choices = add_state.get('iteration_choices') or []
+            iteration_idx = add_state.get('iteration_index', 0)
             iter_label = '(none)'
-            if iteration_choice:
-                opt = iteration_choice[max(0, min(idx, len(iteration_choice)-1))]
+            if iteration_choices:
+                opt = iteration_choices[max(0, min(iteration_idx, len(iteration_choices)-1))]
                 iter_label = opt.get('title') or '(none)'
-            repo_label = '(n/a)'
-            if add_state.get('mode', 'issue') == 'issue':
-                repo_choices = add_state.get('repo_choices') or []
-                if repo_choices:
-                    repo_idx = add_state.get('repo_index', 0)
-                    repo_label = repo_choices[max(0, min(repo_idx, len(repo_choices)-1))].get('repo') or '(unknown)'
-                else:
-                    repo_label = add_state.get('repo_manual', '(unknown)') or '(unknown)'
+            repo_label = repo_full or '(n/a)'
+            labels_selected = add_state.get('labels_selected') or set()
+            if not isinstance(labels_selected, set):
+                labels_selected = set(labels_selected)
+            label_choices = add_state.get('label_choices') or []
+            label_list = [name for name in label_choices if name in labels_selected]
+            priority_label = (add_state.get('priority_label') or '').strip() or '(none)'
+            assignees_selected = add_state.get('assignees_selected') or set()
+            if not isinstance(assignees_selected, set):
+                assignees_selected = set(assignees_selected)
+            assignee_entries = add_state.get('assignee_choices') or []
+            assignee_display = []
+            for entry in assignee_entries:
+                login = entry.get('login')
+                if login in assignees_selected:
+                    assignee_display.append(entry.get('display') or login)
+            assignee_display.extend(sorted({login for login in assignees_selected if login not in {e.get('login') for e in assignee_entries}}))
+            comment_val = add_state.get('comment', '').strip() or '(none)'
+
             body.append("Review and press Enter to create, Esc cancel")
             body.append("")
             body.append(f"📁 Project  : {project.get('project_title') if project else '(unknown)'}")
-            body.append(f"🧷 Type     : {'Issue' if add_state.get('mode', 'issue') == 'issue' else 'Project Task'}")
+            body.append(f"🧷 Type     : {mode_label}")
             if add_state.get('mode', 'issue') == 'issue':
                 body.append(f"📦 Repo     : {repo_label}")
-            body.append(f"📝 Title    : {tval}")
-            # Clarify that Start is today (auto) and Date is Focus Day
-            today = dt.date.today().isoformat()
-            body.append(f"🗓️ Start    : {today} (auto)")
-            body.append(f"📅 Focus    : {dval}")
+            body.append(f"📝 Title    : {title_val or '(missing)'}")
+            body.append(f"🗓️ Start    : {start_val}")
+            body.append(f"📆 End      : {end_val}")
+            body.append(f"🎯 Focus    : {focus_val}")
             body.append(f"🔁 Iteration: {iter_label}")
+            if add_state.get('mode', 'issue') == 'issue':
+                body.append(f"🏷️ Labels   : {', '.join(label_list) if label_list else '(none)'}")
+                body.append(f"⚡ Priority : {priority_label}")
+                body.append(f"👥 Assignees: {', '.join(assignee_display) if assignee_display else '(none)'}")
+                body.append(f"💬 Comment  : {comment_val}")
 
-        # Box renderer
         def boxed(title: str, lines: List[str], width: int = 92) -> str:
             inner = width - 2
             out = ["╭" + ("─" * (width-2)) + "╮"]
@@ -3188,6 +3538,63 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['message'] = status_line
             _refresh_task_editor_state()
         invalidate()
+
+    async def _load_label_choices_for_editor(repo_full: str, initial_selection: Set[str]) -> None:
+        if not token:
+            if edit_task_mode and task_edit_state.get('labels_repo') == repo_full:
+                task_edit_state['labels_error'] = 'GITHUB_TOKEN required for labels'
+                task_edit_state['labels_loading'] = False
+                task_edit_state['labels_task'] = None
+                invalidate()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            labels_raw = await loop.run_in_executor(None, lambda: list_repo_labels(token, repo_full))
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            if edit_task_mode and task_edit_state.get('labels_repo') == repo_full:
+                task_edit_state['labels_error'] = f'Label fetch failed: {exc}'
+                task_edit_state['labels_loading'] = False
+                task_edit_state['labels_task'] = None
+                invalidate()
+            return
+        names: List[str] = []
+        seen: Set[str] = set()
+        for item in labels_raw:
+            if not isinstance(item, dict):
+                continue
+            name_val = (item.get('name') or '').strip()
+            if not name_val:
+                continue
+            key = name_val.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name_val)
+        # Preserve any existing labels that might not be in the repo list
+        extras = [lab for lab in initial_selection if lab and lab.lower() not in seen]
+        names.extend(extras)
+        selected = {lab for lab in initial_selection if lab}
+        if edit_task_mode and task_edit_state.get('labels_repo') == repo_full and task_edit_state.get('mode') == 'edit-labels':
+            task_edit_state['label_choices'] = names
+            task_edit_state['labels_selected'] = set(selected)
+            if names:
+                task_edit_state['label_index'] = max(0, min(task_edit_state.get('label_index', 0), len(names)-1))
+                task_edit_state['labels_error'] = ''
+            else:
+                task_edit_state['label_index'] = 0
+                task_edit_state['labels_error'] = 'No labels available'
+            task_edit_state['labels_loading'] = False
+            task_edit_state['labels_task'] = None
+            if names:
+                task_edit_state['message'] = 'Labels loaded'
+            else:
+                task_edit_state['message'] = task_edit_state['labels_error']
+            invalidate()
 
     async def _add_comment(comment: str) -> None:
         nonlocal status_line
@@ -4238,18 +4645,29 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         cursor = int(task_edit_state.get('cursor', 0) or 0)
         cursor = max(0, min(cursor, len(fields)-1)) if fields else 0
         mode = task_edit_state.get('mode', 'list')
-        lines: List[str] = []
-        header = "Task Field Editor"
+
+        segments: List[Tuple[str, str]] = []
+
+        def add_line(text: str, style: str = 'class:editor.text') -> None:
+            segments.append((style, text + '\n'))
+
+        def add_blank() -> None:
+            segments.append(('', '\n'))
+
         if row:
-            header = f"Task Field Editor — {row.title or row.url}"
-        lines.append(header)
-        if row:
-            lines.append(f"Project: {row.project_title}")
-            lines.append(f"URL    : {row.url}")
-        lines.append("")
-        if not fields:
-            lines.append("  (no editable fields)")
+            header = f"📋 {row.title or row.url}"
         else:
+            header = "📋 Task Field Editor"
+        add_line(header, 'class:editor.header')
+        if row:
+            add_line(f"🏷️ Project: {row.project_title or '-'}", 'class:editor.meta')
+            add_line(f"🔗 URL: {row.url}", 'class:editor.meta')
+
+        if not fields:
+            add_blank()
+            add_line("No editable fields", 'class:editor.warning')
+        else:
+            add_blank()
             for idx, field in enumerate(fields):
                 marker = '➤' if idx == cursor else ' '
                 ftype = field.get('type')
@@ -4257,7 +4675,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     opts = field.get('options') or []
                     index = max(0, min(field.get('index', 0), len(opts)-1)) if opts else 0
                     value = opts[index].get('name') if opts else '(no options)'
-                    if opts and getattr(row, 'priority_dirty', 0):
+                    if opts and row and getattr(row, 'priority_dirty', 0):
                         value = (value or '-') + '*'
                 elif ftype == 'assignees':
                     vals = field.get('value') or []
@@ -4272,15 +4690,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     else:
                         value = str(vals) or '-'
                 elif ftype == 'priority-text':
-                    value = field.get('value') or '-'  
+                    value = field.get('value') or '-'
                 elif ftype == 'comment':
                     value = '(add comment)'
                 else:
                     value = field.get('value', '')
                 value = value or '-'
-                lines.append(f" {marker} {field.get('name')} : {value}")
-        lines.append("")
-        if mode == 'edit-date-calendar':
+                style = 'class:editor.field.cursor' if idx == cursor else 'class:editor.field'
+                add_line(f" {marker} {field.get('name')} : {value}", style)
+
+        if mode == 'edit-date-calendar' and fields:
             editing = task_edit_state.get('editing') or {}
             iso = editing.get('calendar_date') or fields[cursor].get('value') or dt.date.today().isoformat()
             try:
@@ -4288,9 +4707,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             except Exception:
                 cursor_date = dt.date.today()
             cal = calendar.Calendar(firstweekday=0)
-            lines.append(f"Select {fields[cursor].get('name')} (h/l day, j/k week, </> month, t today)")
-            lines.append(cursor_date.strftime("%B %Y"))
-            lines.append(" Mo Tu We Th Fr Sa Su")
+            add_blank()
+            add_line(f"🗓️ Select {fields[cursor].get('name')} (h/l day, j/k week, </> month, t today)", 'class:editor.instructions')
+            add_line(cursor_date.strftime("%B %Y"), 'class:editor.calendar')
+            add_line(" Mo Tu We Th Fr Sa Su", 'class:editor.calendar')
             for week in cal.monthdatescalendar(cursor_date.year, cursor_date.month):
                 row_cells: List[str] = []
                 for day in week:
@@ -4302,40 +4722,92 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     else:
                         cell = f" {label} "
                     row_cells.append(cell)
-                lines.append("".join(row_cells))
-            lines.append("")
-            lines.append("Enter=save · Esc=cancel")
+                add_line("".join(row_cells), 'class:editor.calendar')
+            add_blank()
+            add_line("Enter=save · Esc=cancel", 'class:editor.instructions')
         elif mode == 'priority-select':
-            lines.append("Select priority (j/k move, Enter=save, Esc=cancel)")
             field = fields[cursor] if cursor < len(fields) else None
             opts = (field or {}).get('options') or []
             idx = (field or {}).get('index', 0)
+            add_blank()
+            add_line("⚡ Select priority (j/k move, Enter=save, Esc=cancel)", 'class:editor.instructions')
             for i, opt in enumerate(opts):
                 marker = '➤' if i == idx else ' '
-                lines.append(f"   {marker} {opt.get('name')}")
+                name = (opt.get('name') if isinstance(opt, dict) else None) or '(option)'
+                style = 'class:editor.priority.cursor' if i == idx else 'class:editor.priority'
+                add_line(f"   {marker} {name}", style)
         elif mode == 'edit-assignees':
-            lines.append("Assignees (comma-separated GitHub logins). Enter=save · Esc=cancel")
-            lines.append(f"Value: {task_edit_state.get('input', '')}")
+            add_blank()
+            add_line("👥 Assignees (comma-separated GitHub logins)", 'class:editor.instructions')
+            add_line(f"✏️  {task_edit_state.get('input', '')}", 'class:editor.entry')
+            add_line("Enter=save · Esc=cancel", 'class:editor.instructions')
         elif mode == 'edit-labels':
-            lines.append("Labels (comma-separated). Enter=save · Esc=cancel")
-            lines.append(f"Value: {task_edit_state.get('input', '')}")
+            repo_label = task_edit_state.get('labels_repo') or '(unknown repo)'
+            add_blank()
+            if task_edit_state.get('labels_loading'):
+                add_line(f"⏳ Loading labels for {repo_label}…", 'class:editor.instructions')
+            else:
+                labels_error = task_edit_state.get('labels_error') or ''
+                choices = task_edit_state.get('label_choices') or []
+                selected = task_edit_state.get('labels_selected') or set()
+                if not isinstance(selected, set):
+                    selected = set(selected)
+                idx = max(0, min(len(choices)-1, task_edit_state.get('label_index', 0))) if choices else 0
+                if labels_error:
+                    add_line(f"⚠️ {labels_error}", 'class:editor.warning')
+                if choices:
+                    add_line("🏷️ Use j/k to move, Space to toggle, Enter=save, Esc=cancel", 'class:editor.instructions')
+                    for i, name in enumerate(choices):
+                        pointer = '➤' if i == idx else ' '
+                        checkbox = '☑' if name in selected else '☐'
+                        if i == idx and name in selected:
+                            style = 'class:editor.label.cursor.selected'
+                        elif i == idx:
+                            style = 'class:editor.label.cursor'
+                        elif name in selected:
+                            style = 'class:editor.label.selected'
+                        else:
+                            style = 'class:editor.label'
+                        add_line(f" {pointer} {checkbox} {name}", style)
+                else:
+                    add_line(f"No labels available for {repo_label}", 'class:editor.warning')
+                    add_line("Enter=save (keep current) · Esc=cancel", 'class:editor.instructions')
+                if selected:
+                    add_blank()
+                    add_line('Selection: ' + ', '.join(sorted(selected)), 'class:editor.meta')
         elif mode == 'edit-comment':
-            lines.append("New comment (Enter=post, Esc=cancel)")
-            lines.append(f"Value: {task_edit_state.get('input', '')}")
+            add_blank()
+            add_line("💬 New comment", 'class:editor.instructions')
+            add_line(f"✏️  {task_edit_state.get('input', '')}", 'class:editor.entry')
+            add_line("Enter=post · Esc=cancel", 'class:editor.instructions')
         else:
-            lines.append("Use j/k to select a field. Enter=edit · Esc/Q=close")
+            add_blank()
+            add_line("🧭 Use j/k to select a field. Enter=edit · Esc/Q=close", 'class:editor.instructions')
+            add_line("Space toggles options when available.", 'class:editor.instructions')
+
         message = task_edit_state.get('message') or ''
         if message:
-            lines.append("")
-            lines.append(message)
-        block = "\n".join(lines)
-        if '\n' in block:
-            head, rest = block.split('\n', 1)
-            return [("bold", head), ("", "\n" + rest)]
-        return [("bold", block)]
+            add_blank()
+            add_line(f"💡 {message}", 'class:editor.message')
+
+        if segments:
+            style_last, text_last = segments[-1]
+            if text_last.endswith('\n'):
+                segments[-1] = (style_last, text_last[:-1])
+                if not segments[-1][1]:
+                    segments.pop()
+        return segments
 
     task_edit_control = FormattedTextControl(text=lambda: build_task_edit_text())
-    task_edit_window = Window(width=84, height=20, content=task_edit_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
+    task_edit_body = Window(
+        width=Dimension(preferred=100, max=120),
+        height=Dimension(preferred=32, max=50),
+        content=task_edit_control,
+        wrap_lines=True,
+        always_hide_cursor=True,
+        style="class:editor.body",
+    )
+    task_edit_window = Frame(body=task_edit_body, title="🛠 Task Field Editor", style="class:editor.frame")
 
     def build_report_text() -> List[Tuple[str,str]]:
         lines: List[str] = []
@@ -4535,7 +5007,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     from prompt_toolkit.layout.containers import Float, FloatContainer
     add_control = FormattedTextControl(text=lambda: build_add_overlay())
-    from prompt_toolkit.layout.dimension import Dimension
     add_window = Window(width=92, height=Dimension(preferred=26, max=44), content=add_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
     floats = []
 
@@ -4544,6 +5015,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if add_float and add_float in floats:
             floats.remove(add_float)
         add_float = None
+        task = add_state.get('repo_metadata_task') if isinstance(add_state, dict) else None
+        if isinstance(task, asyncio.Task):
+            task.cancel()
         add_mode = False
         add_state = {}
         if message is not None:
@@ -4555,6 +5029,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if task_edit_float and task_edit_float in floats:
             floats.remove(task_edit_float)
         task_edit_float = None
+        task = task_edit_state.get('labels_task') if isinstance(task_edit_state, dict) else None
+        if isinstance(task, asyncio.Task):
+            task.cancel()
         edit_task_mode = False
         task_edit_state = {}
         if message is not None:
@@ -4617,6 +5094,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if mode == 'edit-labels' and idx is not None and idx < len(fields):
             prev_list = editing.get('prev_value', fields[idx].get('value', []))
             fields[idx]['value'] = list(prev_list) if isinstance(prev_list, list) else []
+            task = task_edit_state.get('labels_task')
+            if isinstance(task, asyncio.Task):
+                task.cancel()
+            task_edit_state['labels_task'] = None
+            task_edit_state['labels_loading'] = False
+            task_edit_state['labels_error'] = ''
         task_edit_state['mode'] = 'list'
         task_edit_state['input'] = ''
         task_edit_state['editing'] = None
@@ -4666,13 +5149,39 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': list(current)}
             task_edit_state['message'] = 'Comma-separated GitHub logins (Enter=save, Esc=cancel)'
         elif ftype == 'labels':
+            rows = filtered_rows()
+            if not rows:
+                task_edit_state['message'] = 'No task selected'
+                invalidate(); return
+            row = rows[current_index]
+            repo_full = (row.repo or '').strip()
+            parts = _parse_issue_url(row.url)
+            if (not repo_full) and parts:
+                repo_full = f"{parts[0]}/{parts[1]}"
+            if not repo_full:
+                task_edit_state['message'] = 'Repository unknown; cannot edit labels'
+                return
+            if not token:
+                task_edit_state['message'] = 'GITHUB_TOKEN required for labels'
+                return
             current = field.get('value') or []
             if not isinstance(current, list):
                 current = []
+            existing_task = task_edit_state.get('labels_task')
+            if isinstance(existing_task, asyncio.Task):
+                existing_task.cancel()
+            selected = {str(lbl).strip() for lbl in current if str(lbl).strip()}
             task_edit_state['mode'] = 'edit-labels'
-            task_edit_state['input'] = ', '.join(current)
+            task_edit_state['input'] = ''
             task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': list(current)}
-            task_edit_state['message'] = 'Comma-separated labels (Enter=save, Esc=cancel)'
+            task_edit_state['label_choices'] = []
+            task_edit_state['label_index'] = 0
+            task_edit_state['labels_selected'] = set(selected)
+            task_edit_state['labels_loading'] = True
+            task_edit_state['labels_error'] = ''
+            task_edit_state['labels_repo'] = repo_full
+            task_edit_state['labels_task'] = asyncio.create_task(_load_label_choices_for_editor(repo_full, set(selected)))
+            task_edit_state['message'] = f'Loading labels for {repo_full}…'
         elif ftype == 'comment':
             task_edit_state['mode'] = 'edit-comment'
             task_edit_state['input'] = ''
@@ -4693,7 +5202,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
     is_task_edit_mode = Condition(lambda: edit_task_mode)
-    is_task_edit_input = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-assignees', 'edit-labels', 'edit-comment'))
+    is_task_edit_text = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-assignees', 'edit-comment'))
+    is_task_edit_nav = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-labels'))
+    is_task_edit_calendar = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-date-calendar')
+    is_task_edit_priority = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'priority-select')
+    is_task_edit_labels = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-labels')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode))
@@ -4769,71 +5282,155 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 _refresh_task_editor_state()
             invalidate()
 
-    async def create_task_async(project_choice: Dict[str, object], title: str, focus_val: str, iteration_id: str, mode: str, repo_choice: Optional[Dict[str, str]], repo_manual: Optional[str]):
+    async def create_task_async(
+        project_choice: Dict[str, object],
+        title: str,
+        start_val: str,
+        end_val: str,
+        focus_val: str,
+        iteration_id: str,
+        mode: str,
+        repo_choice: Optional[Dict[str, str]],
+        repo_manual: Optional[str],
+        repo_full: str,
+        labels: List[str],
+        priority_label: str,
+        priority_options: List[Dict[str, object]],
+        assignees: List[str],
+        comment: str,
+    ):
         nonlocal status_line
         if not token:
             status_line = "GITHUB_TOKEN required to add tasks"
             invalidate()
             return
         loop = asyncio.get_running_loop()
+        issue_url = ''
         try:
             project_id = project_choice.get('project_id') or ''
             if not project_id:
                 raise RuntimeError('Project metadata missing ID')
+            repo_source = repo_full or (repo_choice or {}).get('repo') or repo_manual or ''
+            repo_id = ''
+            assignee_node_ids: List[str] = []
             if mode == 'issue':
                 repo_id = (repo_choice or {}).get('repo_id') or ''
-                repo_label = (repo_choice or {}).get('repo') or ''
+                repo_label = (repo_choice or {}).get('repo') or repo_source
                 if not repo_id:
-                    source = repo_manual or ''
-                    if not source:
+                    lookup_source = repo_manual or repo_source
+                    if not lookup_source:
                         raise RuntimeError('Repository metadata unavailable')
-                    repo_lookup = await loop.run_in_executor(None, lambda: get_repo_id(token, source))
+                    repo_lookup = await loop.run_in_executor(None, lambda: get_repo_id(token, lookup_source))
                     repo_id = repo_lookup.get('repo_id') or ''
-                    repo_label = repo_lookup.get('repo') or source
+                    repo_label = repo_lookup.get('repo') or lookup_source
                 if not repo_id:
                     raise RuntimeError('Repository metadata unavailable')
-                assignee_ids: List[str] = []
-                try:
-                    user_id = get_user_node_id(token, cfg.user)
-                    if user_id:
-                        assignee_ids.append(user_id)
-                except Exception as exc:
-                    logger.warning("Could not resolve user id for %s: %s", cfg.user, exc)
-                issue_result = await loop.run_in_executor(None, lambda: create_issue(token, repo_id, title, '', assignee_ids))
+                for login in assignees:
+                    try:
+                        user_id = get_user_node_id(token, login)
+                        if user_id and user_id not in assignee_node_ids:
+                            assignee_node_ids.append(user_id)
+                    except Exception as exc:
+                        logger.warning("Could not resolve user id for %s: %s", login, exc)
+                issue_result = await loop.run_in_executor(None, lambda: create_issue(token, repo_id, title, '', assignee_node_ids))
                 issue_id = issue_result.get('issue_id')
+                issue_url = issue_result.get('url') or ''
+                if not issue_id:
+                    raise RuntimeError('Issue creation did not return id')
                 item_id = await loop.run_in_executor(None, lambda: add_project_item(token, project_id, issue_id))
             else:
                 item_id = await loop.run_in_executor(None, lambda: create_project_draft(token, project_id, title))
                 if not item_id:
                     raise RuntimeError('GitHub did not return item id')
-            # Always set start date to today if the project has a date field
-            today_iso = dt.date.today().isoformat()
+            # Dates
             start_field_id = project_choice.get('start_field_id') or ''
             if start_field_id:
-                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, today_iso))
-            # Optionally set Focus Day to requested value
-            if focus_val:
-                focus_field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, 'focus day'))
+                value = start_val.strip() or dt.date.today().isoformat()
+                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, value))
+            if end_val.strip():
+                end_field_id = project_choice.get('end_field_id') or ''
+                if not end_field_id:
+                    for candidate in ('end date', 'due date', 'target date', 'finish date'):
+                        fid = await loop.run_in_executor(None, lambda name=candidate: get_project_field_id_by_name(token, project_id, name))
+                        if fid:
+                            project_choice['end_field_id'] = fid
+                            end_field_id = fid
+                            break
+                if end_field_id:
+                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, end_field_id, end_val.strip()))
+            if focus_val.strip():
+                focus_field_id = project_choice.get('focus_field_id') or ''
+                if not focus_field_id:
+                    focus_field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, 'focus day'))
+                    if focus_field_id:
+                        project_choice['focus_field_id'] = focus_field_id
                 if focus_field_id:
-                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, focus_field_id, focus_val))
+                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, focus_field_id, focus_val.strip()))
             iteration_field_id = project_choice.get('iteration_field_id') or ''
             if iteration_id and iteration_field_id:
                 await loop.run_in_executor(None, lambda: set_project_iteration(token, project_id, item_id, iteration_field_id, iteration_id))
+
+            priority_field_id = project_choice.get('priority_field_id') or ''
+            def _match_priority_option(label: str, options: List[Dict[str, object]]) -> str:
+                if not label:
+                    return ''
+                norm = label.strip().lower()
+                core = norm.split(':', 1)[-1].strip() if ':' in norm else norm
+                for opt in options:
+                    name = (opt.get('name') or '').strip()
+                    if not name:
+                        continue
+                    low = name.lower()
+                    if low == norm or low == core:
+                        return opt.get('id') or ''
+                for opt in options:
+                    name_low = (opt.get('name') or '').strip().lower()
+                    if core and core in name_low:
+                        return opt.get('id') or ''
+                return ''
+
+            if priority_field_id and priority_label.strip():
+                options = priority_options or project_choice.get('priority_options') or []
+                if not options:
+                    options = await loop.run_in_executor(None, lambda: get_project_field_options(token, priority_field_id))
+                    if options:
+                        project_choice['priority_options'] = options
+                option_id = _match_priority_option(priority_label, options or [])
+                if option_id:
+                    await loop.run_in_executor(None, lambda: set_project_priority(token, project_id, item_id, priority_field_id, option_id))
+
             assignee_field_id = project_choice.get('assignee_field_id') or ''
-            if assignee_field_id:
-                try:
-                    user_id = get_user_node_id(token, cfg.user)
-                except Exception as exc:
-                    user_id = ""
-                    logger.warning("Could not resolve user id for %s: %s", cfg.user, exc)
-                if user_id:
+            if assignee_field_id and assignees:
+                project_user_ids: List[str] = []
+                for login in assignees:
                     try:
-                        await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, [user_id]))
+                        uid = get_user_node_id(token, login)
+                        if uid and uid not in project_user_ids:
+                            project_user_ids.append(uid)
                     except Exception as exc:
-                        try:
-                            logger.warning("Unable to set project users for %s: %s", assignee_field_id, exc)
-                        except Exception:
-                            pass
+                        logger.warning("Could not resolve user id for %s: %s", login, exc)
+                if project_user_ids:
+                    try:
+                        await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, project_user_ids))
+                    except Exception as exc:
+                        logger.warning("Unable to set project users for %s: %s", assignee_field_id, exc)
+
+            if mode == 'issue':
+                if labels:
+                    try:
+                        await loop.run_in_executor(None, lambda: set_issue_labels(token, issue_url, labels))
+                    except Exception as exc:
+                        logger.warning("Unable to set labels for %s: %s", issue_url, exc)
+                if assignees:
+                    try:
+                        await loop.run_in_executor(None, lambda: set_issue_assignees(token, issue_url, assignees))
+                    except Exception as exc:
+                        logger.warning("Unable to set assignees for %s: %s", issue_url, exc)
+                if comment.strip():
+                    try:
+                        await loop.run_in_executor(None, lambda: add_issue_comment(token, issue_url, comment.strip()))
+                    except Exception as exc:
+                        logger.warning("Unable to add comment for %s: %s", issue_url, exc)
         except Exception as exc:
             status_line = f"Create failed: {exc}"
             try:
@@ -4932,14 +5529,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = 'Updating assignees…'
                 asyncio.create_task(_apply_assignees(logins))
             elif mode == 'edit-labels':
+                if task_edit_state.get('labels_loading'):
+                    task_edit_state['message'] = 'Labels still loading…'
+                    invalidate(); return
                 field = fields[cursor] if cursor < len(fields) else None
-                value = task_edit_state.get('input', '')
-                labels_list = [part.strip() for part in value.replace(';', ',').split(',') if part.strip()]
+                selected = task_edit_state.get('labels_selected') or set()
+                if not isinstance(selected, set):
+                    selected = set(selected)
+                labels_list = sorted(selected)
                 if field is not None:
                     field['value'] = labels_list
                 task_edit_state['mode'] = 'list'
                 task_edit_state['input'] = ''
                 task_edit_state['editing'] = None
+                task_edit_state['labels_task'] = None
+                task_edit_state['labels_loading'] = False
+                task_edit_state['labels_error'] = ''
                 task_edit_state['message'] = 'Updating labels…'
                 asyncio.create_task(_apply_labels(labels_list))
             elif mode == 'edit-comment':
@@ -5182,8 +5787,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['message'] = 'Enter to edit, Esc/Q to close'
         invalidate()
 
-    @kb.add('j', filter=is_task_edit_input)
-    @kb.add('down', filter=is_task_edit_input)
+    @kb.add('j', filter=is_task_edit_nav)
+    @kb.add('down', filter=is_task_edit_nav)
     def _(event):
         mode = task_edit_state.get('mode')
         if mode == 'priority-select':
@@ -5200,9 +5805,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             invalidate()
         elif mode == 'edit-date-calendar':
             _calendar_adjust(days=7)
+        elif mode == 'edit-labels':
+            if task_edit_state.get('labels_loading'):
+                return
+            choices = task_edit_state.get('label_choices') or []
+            if not choices:
+                return
+            idx = (task_edit_state.get('label_index', 0) + 1) % len(choices)
+            task_edit_state['label_index'] = idx
+            task_edit_state['message'] = choices[idx]
+            invalidate()
 
-    @kb.add('k', filter=is_task_edit_input)
-    @kb.add('up', filter=is_task_edit_input)
+    @kb.add('k', filter=is_task_edit_nav)
+    @kb.add('up', filter=is_task_edit_nav)
     def _(event):
         mode = task_edit_state.get('mode')
         if mode == 'priority-select':
@@ -5219,22 +5834,32 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             invalidate()
         elif mode == 'edit-date-calendar':
             _calendar_adjust(days=-7)
+        elif mode == 'edit-labels':
+            if task_edit_state.get('labels_loading'):
+                return
+            choices = task_edit_state.get('label_choices') or []
+            if not choices:
+                return
+            idx = (task_edit_state.get('label_index', 0) - 1) % len(choices)
+            task_edit_state['label_index'] = idx
+            task_edit_state['message'] = choices[idx]
+            invalidate()
 
-    @kb.add('h', filter=is_task_edit_input)
-    @kb.add('left', filter=is_task_edit_input)
+    @kb.add('h', filter=is_task_edit_calendar)
+    @kb.add('left', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
             return
         _calendar_adjust(days=-1)
 
-    @kb.add('l', filter=is_task_edit_input)
-    @kb.add('right', filter=is_task_edit_input)
+    @kb.add('l', filter=is_task_edit_calendar)
+    @kb.add('right', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
             return
         _calendar_adjust(days=1)
 
-    @kb.add('t', filter=is_task_edit_input)
+    @kb.add('t', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
             return
@@ -5249,25 +5874,25 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['message'] = 'Today'
         invalidate()
 
-    @kb.add('<', filter=is_task_edit_input)
+    @kb.add('<', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
             return
         _calendar_adjust(months=-1)
 
-    @kb.add('>', filter=is_task_edit_input)
+    @kb.add('>', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
             return
         _calendar_adjust(months=1)
 
-    @kb.add('pageup', filter=is_task_edit_input)
+    @kb.add('pageup', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
             return
         _calendar_adjust(months=-1)
 
-    @kb.add('pagedown', filter=is_task_edit_input)
+    @kb.add('pagedown', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
             return
@@ -5345,21 +5970,47 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal add_mode, add_state, add_float
         add_mode = True
         mode_choices = ['Create Issue', 'Add Project Task']
+        today_iso = dt.date.today().isoformat()
         add_state = {
             'step': 'mode',
             'mode_choices': mode_choices,
             'mode_index': 0,
+            'mode': 'issue',
             'project_choices_all': choices,
             'project_choices': [],
             'project_index': 0,
+            'project_meta_cache': {},
             'repo_choices': [],
             'repo_index': 0,
             'repo_manual': '',
+            'repo_cursor': 0,
+            'repo_full_name': '',
             'title': '',
-            'date': '',
+            'title_cursor': 0,
+            'start_date': today_iso,
+            'start_cursor': len(today_iso),
+            'end_date': '',
+            'end_cursor': 0,
+            'focus_date': today_iso,
+            'focus_cursor': len(today_iso),
             'iteration_choices': [],
             'iteration_index': 0,
-            'mode': 'issue',
+            'label_choices': [],
+            'label_index': 0,
+            'labels_selected': set(),
+            'priority_choices': [],
+            'priority_index': 0,
+            'priority_label': '',
+            'priority_options': [],
+            'assignee_choices': [],
+            'assignee_index': 0,
+            'assignees_selected': set(),
+            'comment': '',
+            'comment_cursor': 0,
+            'loading_repo_metadata': False,
+            'metadata_error': '',
+            'repo_metadata_source': '',
+            'repo_metadata_task': None,
         }
         _set_project_choices_for_mode('issue')
         if add_float and add_float in floats:
@@ -5385,27 +6036,29 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         close_add_mode('Add cancelled')
 
-    def _move_cursor(field: str, delta: int):
-        key = f"{field}_cursor"
-        s = add_state.get(field, '')
+    def _move_cursor(field_key: str, delta: int, cursor_key: Optional[str] = None):
+        key = cursor_key or f"{field_key}_cursor"
+        s = add_state.get(field_key, '')
         cur = max(0, min(len(s), add_state.get(key, len(s))))
         cur = max(0, min(len(s), cur + delta))
         add_state[key] = cur
 
     def _add_delete_one():
         step = add_state.get('step')
-        if step == 'title':
-            t = add_state.get('title', '')
-            cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
+        field_map = {
+            'title': ('title', 'title_cursor'),
+            'start': ('start_date', 'start_cursor'),
+            'end': ('end_date', 'end_cursor'),
+            'focus': ('focus_date', 'focus_cursor'),
+            'comment': ('comment', 'comment_cursor'),
+        }
+        if step in field_map:
+            field_key, cursor_key = field_map[step]
+            val = add_state.get(field_key, '')
+            cur = max(0, min(len(val), add_state.get(cursor_key, len(val))))
             if cur > 0:
-                add_state['title'] = t[:cur-1] + t[cur:]
-                add_state['title_cursor'] = cur-1
-        elif step == 'date':
-            d = add_state.get('date', '')
-            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
-            if cur > 0:
-                add_state['date'] = d[:cur-1] + d[cur:]
-                add_state['date_cursor'] = cur-1
+                add_state[field_key] = val[:cur-1] + val[cur:]
+                add_state[cursor_key] = cur-1
         elif step == 'repo' and not add_state.get('repo_choices'):
             r = add_state.get('repo_manual', '')
             cur = max(0, min(len(r), add_state.get('repo_cursor', len(r))))
@@ -5423,17 +6076,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         # Forward delete at cursor
         step = add_state.get('step')
         changed = False
-        if step == 'title':
-            t = add_state.get('title','')
-            cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
-            if cur < len(t):
-                add_state['title'] = t[:cur] + t[cur+1:]
-                changed = True
-        elif step == 'date':
-            d = add_state.get('date','')
-            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
-            if cur < len(d):
-                add_state['date'] = d[:cur] + d[cur+1:]
+        field_map = {
+            'title': ('title', 'title_cursor'),
+            'start': ('start_date', 'start_cursor'),
+            'end': ('end_date', 'end_cursor'),
+            'focus': ('focus_date', 'focus_cursor'),
+            'comment': ('comment', 'comment_cursor'),
+        }
+        if step in field_map:
+            field_key, cursor_key = field_map[step]
+            val = add_state.get(field_key, '')
+            cur = max(0, min(len(val), add_state.get(cursor_key, len(val))))
+            if cur < len(val):
+                add_state[field_key] = val[:cur] + val[cur+1:]
                 changed = True
         elif step == 'repo' and not add_state.get('repo_choices'):
             r = add_state.get('repo_manual','')
@@ -5449,10 +6104,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         step = add_state.get('step')
         if step == 'title':
             _move_cursor('title', -1)
-        elif step == 'date':
-            _move_cursor('date', -1)
+        elif step == 'start':
+            _move_cursor('start_date', -1)
+        elif step == 'end':
+            _move_cursor('end_date', -1)
+        elif step == 'focus':
+            _move_cursor('focus_date', -1)
+        elif step == 'comment':
+            _move_cursor('comment', -1)
         elif step == 'repo' and not add_state.get('repo_choices'):
-            _move_cursor('repo', -1)
+            _move_cursor('repo_manual', -1, 'repo_cursor')
         invalidate()
 
     @kb.add('right', filter=is_add_mode)
@@ -5460,10 +6121,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         step = add_state.get('step')
         if step == 'title':
             _move_cursor('title', 1)
-        elif step == 'date':
-            _move_cursor('date', 1)
+        elif step == 'start':
+            _move_cursor('start_date', 1)
+        elif step == 'end':
+            _move_cursor('end_date', 1)
+        elif step == 'focus':
+            _move_cursor('focus_date', 1)
+        elif step == 'comment':
+            _move_cursor('comment', 1)
         elif step == 'repo' and not add_state.get('repo_choices'):
-            _move_cursor('repo', 1)
+            _move_cursor('repo_manual', 1, 'repo_cursor')
         invalidate()
 
     def _cycle_add(delta: int):
@@ -5482,11 +6149,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 return
             idx = (add_state.get('project_index', 0) + delta) % len(choices)
             add_state['project_index'] = idx
-            add_state['iteration_choices'] = _build_iteration_choices(choices[idx])
+            selected_project = choices[idx]
+            add_state['iteration_choices'] = _build_iteration_choices(selected_project)
             add_state['iteration_index'] = 0
-            add_state['repo_choices'] = _build_repo_choices(choices[idx])
+            add_state['repo_choices'] = _build_repo_choices(selected_project)
             add_state['repo_index'] = 0
             add_state['repo_manual'] = ''
+            add_state['repo_full_name'] = ''
+            add_state['priority_options'] = (selected_project.get('priority_options') if selected_project else []) or []
+            _reset_repo_metadata_state()
         elif step == 'repo':
             choices = add_state.get('repo_choices') or []
             if not choices:
@@ -5499,40 +6170,78 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 return
             idx = (add_state.get('iteration_index', 0) + delta) % len(choices)
             add_state['iteration_index'] = idx
+        elif step == 'labels':
+            choices = add_state.get('label_choices') or []
+            if not choices:
+                return
+            idx = (add_state.get('label_index', 0) + delta) % len(choices)
+            add_state['label_index'] = idx
+        elif step == 'priority':
+            choices = add_state.get('priority_choices') or []
+            if not choices:
+                return
+            idx = (add_state.get('priority_index', 0) + delta) % len(choices)
+            add_state['priority_index'] = idx
+        elif step == 'assignee':
+            choices = add_state.get('assignee_choices') or []
+            if not choices:
+                return
+            idx = (add_state.get('assignee_index', 0) + delta) % len(choices)
+            add_state['assignee_index'] = idx
 
-    @kb.add('j', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
-    @kb.add('down', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
+    @kb.add('j', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee')))
+    @kb.add('down', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee')))
     def _(event):
         _cycle_add(1)
         invalidate()
 
-    @kb.add('k', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
-    @kb.add('up', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration')))
+    @kb.add('k', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee')))
+    @kb.add('up', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee')))
     def _(event):
         _cycle_add(-1)
         invalidate()
 
-    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'title'))
+    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') in ('title','comment')))
     def _(event):
         ch = event.data or ""
         if not ch or ch in ('\n', '\r'):
             return
-        t = add_state.get('title','')
-        cur = max(0, min(len(t), add_state.get('title_cursor', len(t))))
-        add_state['title'] = t[:cur] + ch + t[cur:]
-        add_state['title_cursor'] = cur + len(ch)
+        step = add_state.get('step')
+        field_map = {
+            'title': ('title', 'title_cursor'),
+            'comment': ('comment', 'comment_cursor'),
+        }
+        field_key, cursor_key = field_map.get(step, ('title', 'title_cursor'))
+        text = add_state.get(field_key, '')
+        cur = max(0, min(len(text), add_state.get(cursor_key, len(text))))
+        add_state[field_key] = text[:cur] + ch + text[cur:]
+        add_state[cursor_key] = cur + len(ch)
         invalidate()
 
-    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'date'))
+    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') in ('start','end','focus')))
     def _(event):
         ch = event.data or ""
-        if ch and (ch.isdigit() or ch == '-'):
-            d = add_state.get('date','')
-            cur = max(0, min(len(d), add_state.get('date_cursor', len(d))))
-            if len(d) < 10:
-                add_state['date'] = d[:cur] + ch + d[cur:]
-                add_state['date_cursor'] = cur + 1
-                invalidate()
+        if not ch or (ch not in '0123456789-' and ch.lower() != 't'):
+            return
+        step = add_state.get('step')
+        field_map = {
+            'start': ('start_date', 'start_cursor'),
+            'end': ('end_date', 'end_cursor'),
+            'focus': ('focus_date', 'focus_cursor'),
+        }
+        field_key, cursor_key = field_map.get(step, ('start_date', 'start_cursor'))
+        date_val = add_state.get(field_key, '')
+        cur = max(0, min(len(date_val), add_state.get(cursor_key, len(date_val))))
+        if ch.lower() == 't':
+            today = dt.date.today().isoformat()
+            add_state[field_key] = today
+            add_state[cursor_key] = len(today)
+        else:
+            if len(date_val) >= 10:
+                return
+            add_state[field_key] = date_val[:cur] + ch + date_val[cur:]
+            add_state[cursor_key] = cur + 1
+        invalidate()
 
     @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'repo' and not add_state.get('repo_choices')))
     def _(event):
@@ -5543,6 +6252,50 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         cur = max(0, min(len(r), add_state.get('repo_cursor', len(r))))
         add_state['repo_manual'] = r[:cur] + ch + r[cur:]
         add_state['repo_cursor'] = cur + len(ch)
+        invalidate()
+
+    @kb.add(' ', filter=Condition(lambda: add_mode and add_state.get('step') in ('labels','priority','assignee')))
+    def _(event):
+        step = add_state.get('step')
+        if step == 'labels':
+            choices = add_state.get('label_choices') or []
+            if not choices:
+                return
+            idx = max(0, min(len(choices)-1, add_state.get('label_index', 0)))
+            label = choices[idx]
+            selected = add_state.get('labels_selected') or set()
+            if not isinstance(selected, set):
+                selected = set(selected)
+            if label in selected:
+                selected.remove(label)
+            else:
+                selected.add(label)
+            add_state['labels_selected'] = selected
+        elif step == 'priority':
+            choices = add_state.get('priority_choices') or []
+            if not choices:
+                return
+            idx = max(0, min(len(choices)-1, add_state.get('priority_index', 0)))
+            name = choices[idx]
+            current = (add_state.get('priority_label') or '').strip()
+            add_state['priority_label'] = '' if current == name else name
+        elif step == 'assignee':
+            choices = add_state.get('assignee_choices') or []
+            if not choices:
+                return
+            idx = max(0, min(len(choices)-1, add_state.get('assignee_index', 0)))
+            entry = choices[idx]
+            login = (entry.get('login') or '').strip()
+            if not login:
+                return
+            selected = add_state.get('assignees_selected') or set()
+            if not isinstance(selected, set):
+                selected = set(selected)
+            if login in selected:
+                selected.remove(login)
+            else:
+                selected.add(login)
+            add_state['assignees_selected'] = selected
         invalidate()
 
     @kb.add('enter', filter=is_add_mode)
@@ -5566,59 +6319,156 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_state['repo_index'] = 0
             add_state['iteration_choices'] = _build_iteration_choices(project) if project else []
             add_state['iteration_index'] = 0
-            add_state['step'] = 'title'
-            add_state['title_cursor'] = len(add_state.get('title',''))
+            add_state['priority_options'] = (project.get('priority_options') if project else []) or []
+            add_state['priority_label'] = ''
+            add_state['labels_selected'] = set()
+            add_state['assignees_selected'] = set()
+            add_state['comment'] = add_state.get('comment', '')
+            if add_state.get('mode', 'issue') == 'issue':
+                add_state['step'] = 'repo'
+                if add_state.get('repo_choices'):
+                    status_line = 'Select repository'
+                else:
+                    status_line = 'Enter repository owner/name'
+                    add_state['repo_cursor'] = len(add_state.get('repo_manual', ''))
+            else:
+                add_state['step'] = 'title'
+                add_state['title_cursor'] = len(add_state.get('title', ''))
+                status_line = 'Enter title'
         elif step == 'title':
             if not add_state.get('title', '').strip():
                 status_line = 'Title is required'
             else:
-                # Pre-fill start date = today (used implicitly), and ask for Focus Day (defaults today)
-                today = dt.date.today().isoformat()
-                add_state['date'] = today
-                add_state['date_cursor'] = len(today)
-                add_state['step'] = 'date'
-                add_state['date_cursor'] = len(add_state.get('date',''))
-        elif step == 'date':
-            # 'date' here represents Focus Day; start date is set automatically to today
-            date_val = add_state.get('date', '').strip()
-            if date_val:
+                add_state['step'] = 'start'
+                add_state['start_cursor'] = len(add_state.get('start_date', ''))
+                status_line = 'Set start date'
+        elif step == 'start':
+            start_val = (add_state.get('start_date') or '').strip()
+            if not start_val:
+                start_val = dt.date.today().isoformat()
+                add_state['start_date'] = start_val
+                add_state['start_cursor'] = len(start_val)
+            try:
+                dt.date.fromisoformat(start_val)
+            except Exception:
+                status_line = 'Invalid start date (YYYY-MM-DD)'
+                invalidate(); return
+            add_state['step'] = 'end'
+            add_state['end_cursor'] = len(add_state.get('end_date', ''))
+            status_line = 'Set end date (optional)'
+        elif step == 'end':
+            end_val = (add_state.get('end_date') or '').strip()
+            if end_val:
                 try:
-                    dt.date.fromisoformat(date_val)
+                    dt.date.fromisoformat(end_val)
                 except Exception:
-                    status_line = "Invalid date format"
+                    status_line = 'Invalid end date (YYYY-MM-DD)'
+                    invalidate(); return
+            add_state['step'] = 'focus'
+            add_state['focus_cursor'] = len(add_state.get('focus_date', ''))
+            status_line = 'Set focus day'
+        elif step == 'focus':
+            focus_val = (add_state.get('focus_date') or '').strip()
+            if focus_val:
+                try:
+                    dt.date.fromisoformat(focus_val)
+                except Exception:
+                    status_line = 'Invalid focus day (YYYY-MM-DD)'
                     invalidate(); return
             project = _current_add_project()
-            mode = add_state.get('mode', 'issue')
-            if mode == 'issue':
-                repo_choices = add_state.get('repo_choices') or []
-                if not repo_choices:
-                    add_state['repo_manual'] = add_state.get('repo_manual', '')
-                    status_line = 'Enter repository owner/name'
-                add_state['step'] = 'repo'
-                if not repo_choices:
-                    add_state['repo_cursor'] = len(add_state.get('repo_manual',''))
+            iter_choices = _build_iteration_choices(project) if project else []
+            add_state['iteration_choices'] = iter_choices
+            add_state['iteration_index'] = 0
+            if iter_choices:
+                add_state['step'] = 'iteration'
+                status_line = 'Select iteration (Enter to confirm)'
             else:
-                choices = _build_iteration_choices(project) if project else []
-                add_state['iteration_choices'] = choices
-                add_state['iteration_index'] = 0
-                add_state['step'] = 'iteration' if choices else 'confirm'
+                if add_state.get('mode', 'issue') == 'issue':
+                    add_state['step'] = 'labels'
+                    status_line = 'Select labels (space to toggle)'
+                else:
+                    add_state['step'] = 'confirm'
+                    status_line = 'Review and confirm'
         elif step == 'repo':
-            choices = add_state.get('repo_choices') or []
-            if choices:
-                project = _current_add_project()
-                iter_choices = _build_iteration_choices(project) if project else []
-                add_state['iteration_choices'] = iter_choices
-                add_state['iteration_index'] = 0
-                add_state['step'] = 'iteration' if iter_choices else 'confirm'
-            else:
-                if not add_state.get('repo_manual', '').strip():
-                    status_line = 'Enter repository owner/name'
+            repo_choices = add_state.get('repo_choices') or []
+            if repo_choices:
+                idx = max(0, min(len(repo_choices)-1, add_state.get('repo_index', 0)))
+                repo_choice = repo_choices[idx]
+                repo_full = (repo_choice.get('repo') or '').strip()
+                if not repo_full or '/' not in repo_full:
+                    status_line = 'Repository metadata missing owner/name'
                     invalidate(); return
-                project = _current_add_project()
-                iter_choices = _build_iteration_choices(project) if project else []
-                add_state['iteration_choices'] = iter_choices
-                add_state['iteration_index'] = 0
-                add_state['step'] = 'iteration' if iter_choices else 'confirm'
+                add_state['repo_full_name'] = repo_full
+                _start_repo_metadata_fetch(repo_full)
+            else:
+                manual = (add_state.get('repo_manual') or '').strip()
+                if '/' not in manual:
+                    status_line = 'Repository must be owner/name'
+                    invalidate(); return
+                add_state['repo_full_name'] = manual
+                _start_repo_metadata_fetch(manual)
+            add_state['step'] = 'title'
+            add_state['title_cursor'] = len(add_state.get('title', ''))
+            status_line = 'Enter title'
+        elif step == 'iteration':
+            if add_state.get('mode', 'issue') == 'issue':
+                add_state['step'] = 'labels'
+                status_line = 'Select labels (space to toggle)'
+            else:
+                add_state['step'] = 'confirm'
+                status_line = 'Review and confirm'
+        elif step == 'labels':
+            if add_state.get('loading_repo_metadata'):
+                status_line = 'Labels still loading…'
+                invalidate(); return
+            labels = add_state.get('label_choices') or []
+            if not labels:
+                status_line = 'No labels available yet'
+                invalidate(); return
+            selected = add_state.get('labels_selected') or set()
+            if not isinstance(selected, set):
+                selected = set(selected)
+            if not selected:
+                status_line = 'Select at least one label (space to toggle)'
+                invalidate(); return
+            add_state['labels_selected'] = selected
+            add_state['step'] = 'priority'
+            status_line = 'Select priority (space to choose)'
+        elif step == 'priority':
+            if add_state.get('loading_repo_metadata'):
+                status_line = 'Priority options still loading…'
+                invalidate(); return
+            priorities = add_state.get('priority_choices') or []
+            if not priorities:
+                add_state['step'] = 'assignee'
+                status_line = 'No priority options available; continuing'
+                invalidate(); return
+            if not (add_state.get('priority_label') or '').strip():
+                status_line = 'Pick a priority (space to choose)'
+                invalidate(); return
+            add_state['step'] = 'assignee'
+            status_line = 'Choose assignees (space to toggle)'
+        elif step == 'assignee':
+            if add_state.get('loading_repo_metadata'):
+                status_line = 'Assignees still loading…'
+                invalidate(); return
+            choices = add_state.get('assignee_choices') or []
+            if not choices:
+                status_line = 'No assignable users found'
+                invalidate(); return
+            selected = add_state.get('assignees_selected') or set()
+            if not isinstance(selected, set):
+                selected = set(selected)
+            if not selected:
+                status_line = 'Select at least one assignee'
+                invalidate(); return
+            add_state['assignees_selected'] = selected
+            add_state['step'] = 'comment'
+            add_state['comment_cursor'] = len(add_state.get('comment', ''))
+            status_line = 'Add optional comment'
+        elif step == 'comment':
+            add_state['step'] = 'confirm'
+            status_line = 'Review and confirm'
         elif step == 'iteration':
             add_state['step'] = 'confirm'
         elif step == 'confirm':
@@ -5631,7 +6481,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 add_state['step'] = 'title'
                 status_line = 'Title is required'
                 invalidate(); return
-            date_val = add_state.get('date', '').strip()
+            start_val = (add_state.get('start_date') or '').strip()
+            end_val = (add_state.get('end_date') or '').strip()
+            focus_val = (add_state.get('focus_date') or '').strip()
             iteration_choices = add_state.get('iteration_choices') or []
             iteration_id = ''
             if iteration_choices:
@@ -5640,19 +6492,55 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 iteration_id = opt.get('id') or ''
             repo_choice = None
             repo_manual = None
+            repo_full = (add_state.get('repo_full_name') or '').strip()
             if add_state.get('mode', 'issue') == 'issue':
                 repo_choices = add_state.get('repo_choices') or []
                 if repo_choices:
                     repo_idx = add_state.get('repo_index', 0)
                     repo_choice = repo_choices[max(0, min(repo_idx, len(repo_choices)-1))]
                 else:
-                    repo_manual = add_state.get('repo_manual', '').strip()
+                    repo_manual = repo_full or add_state.get('repo_manual', '').strip()
                     if not repo_manual:
                         status_line = 'Repository is required'
                         invalidate(); return
+            labels_selected = add_state.get('labels_selected') or set()
+            if not isinstance(labels_selected, set):
+                labels_selected = set(labels_selected)
+            label_choices = add_state.get('label_choices') or []
+            ordered_labels = [name for name in label_choices if name in labels_selected]
+            priority_label = (add_state.get('priority_label') or '').strip()
+            assignees_selected = add_state.get('assignees_selected') or set()
+            if not isinstance(assignees_selected, set):
+                assignees_selected = set(assignees_selected)
+            assignees_ordered: List[str] = []
+            for entry in add_state.get('assignee_choices') or []:
+                login = (entry.get('login') or '').strip()
+                if login and login in assignees_selected:
+                    assignees_ordered.append(login)
+            for login in sorted(assignees_selected):
+                if login not in assignees_ordered:
+                    assignees_ordered.append(login)
+            comment_val = add_state.get('comment', '').strip()
             mode_val = add_state.get('mode', 'issue')
+            priority_options = (add_state.get('priority_options') or [])
             close_add_mode('Creating item…')
-            asyncio.create_task(create_task_async(project, title_val, date_val, iteration_id, mode_val, repo_choice, repo_manual))
+            asyncio.create_task(create_task_async(
+                project,
+                title_val,
+                start_val,
+                end_val,
+                focus_val,
+                iteration_id,
+                mode_val,
+                repo_choice,
+                repo_manual,
+                repo_full,
+                ordered_labels,
+                priority_label,
+                priority_options,
+                assignees_ordered,
+                comment_val,
+            ))
             return
         invalidate()
 
@@ -5723,10 +6611,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = f"Date<= {date_buffer}"
             invalidate()
 
-    @kb.add('backspace', filter=is_task_edit_input)
+    @kb.add('backspace', filter=is_task_edit_text)
     def _(event):
         mode = task_edit_state.get('mode')
-        if mode in ('edit-assignees', 'edit-labels', 'edit-comment'):
+        if mode in ('edit-assignees', 'edit-comment'):
             buf = task_edit_state.get('input', '')
             if buf:
                 task_edit_state['input'] = buf[:-1]
@@ -5750,16 +6638,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 status_line = f"Date<= {date_buffer}"
                 invalidate()
 
-    @kb.add(Keys.Any, filter=is_task_edit_input)
+    @kb.add(Keys.Any, filter=is_task_edit_text)
     def _(event):
         mode = task_edit_state.get('mode')
-        if mode not in ('edit-assignees', 'edit-labels', 'edit-comment'):
+        if mode not in ('edit-assignees', 'edit-comment'):
             return
         ch = event.data or ''
         if not ch or ch in ('\r', '\n'):
             return
         buf = task_edit_state.get('input', '')
         task_edit_state['input'] = buf + ch
+        invalidate()
+
+    @kb.add(' ', filter=is_task_edit_labels)
+    def _(event):
+        if task_edit_state.get('labels_loading'):
+            return
+        choices = task_edit_state.get('label_choices') or []
+        if not choices:
+            return
+        idx = max(0, min(len(choices)-1, task_edit_state.get('label_index', 0)))
+        label_name = choices[idx]
+        selected = task_edit_state.get('labels_selected') or set()
+        if not isinstance(selected, set):
+            selected = set(selected)
+        if label_name in selected:
+            selected.remove(label_name)
+        else:
+            selected.add(label_name)
+        task_edit_state['labels_selected'] = selected
+        task_edit_state['message'] = ', '.join(sorted(selected)) or '(none)'
         invalidate()
 
     @kb.add('u', filter=is_normal)
@@ -6091,7 +6999,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             ]
             txt = "\n".join(help_lines)
             hl_control = FormattedTextControl(text=txt)
-            from prompt_toolkit.layout.dimension import Dimension
             # Compute size based on terminal
             try:
                 from prompt_toolkit.application.current import get_app
@@ -6132,7 +7039,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         report_granularity = 'month'; invalidate()
 
     # refresh loop timer to update status bar (search typing etc.)
-    style = Style.from_dict({})
+    style = Style.from_dict({
+        'editor.frame': 'bg:#1c1c1c #f0f0f0',
+        'editor.frame.border': '#5f5f5f',
+        'editor.frame.title': 'bold #ffd75f',
+        'editor.body': 'bg:#1c1c1c #f0f0f0',
+        'editor.header': 'bold #ffd75f',
+        'editor.meta': '#87d7ff',
+        'editor.text': '#f0f0f0',
+        'editor.field': '#d7d7d7',
+        'editor.field.cursor': 'bold #ffffff bg:#444444',
+        'editor.instructions': '#5fd7af',
+        'editor.priority': '#f0f0f0',
+        'editor.priority.cursor': 'bold #ffffff bg:#875f00',
+        'editor.label': '#d0d0d0',
+        'editor.label.selected': 'bold #87ff5f',
+        'editor.label.cursor': 'reverse #ffffaf',
+        'editor.label.cursor.selected': 'reverse bold #ffffff',
+        'editor.message': '#ffd787',
+        'editor.warning': 'bold #ff8787',
+        'editor.calendar': '#87afff',
+        'editor.entry': '#ffffff bg:#303030',
+    })
     app = Application(layout=Layout(container), key_bindings=kb, full_screen=True, mouse_support=True, style=style, editing_mode=EditingMode.VI)
 
     # Background ticker to refresh timers & status once per second
