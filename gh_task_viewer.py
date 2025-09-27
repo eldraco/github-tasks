@@ -2774,6 +2774,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     session_float: Optional[Float] = None
     update_in_progress = False
     task_duration_cache: Dict[str, Dict[str, int]] = {}
+    SUMMARY_CACHE_TTL = 5.0  # seconds; avoid recomputing heavy aggregates on every repaint
+    summary_cache: Dict[str, Dict[str, object]] = {
+        'project': {'ts': 0.0, 'data': {}, 'tops': []},
+        'label': {'ts': 0.0, 'data': {}, 'tops': []},
+    }
     # Inline search buffer (used when in_search == True)
 
     if state_path is None:
@@ -4354,6 +4359,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         rows = filtered_rows()
         total = len(rows)
         done_ct = sum(1 for r in rows if r.is_done)
+        now_mon = time.monotonic()
         def _fmt_hm(ts: int) -> str:
             s = int(max(0, ts)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
         def _fmt_mmss(ts: int) -> str:
@@ -4397,26 +4403,39 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         fr += [("", f"☑️ Done:{'Hide' if hide_done else 'Off'} NoDate:{'Hide' if hide_no_date else 'Off'}\n")]
         fr += [("", f"↕ Sort: {_truncate(sort_presets[sort_index]['name'],22)}\n")]
         # Top 5 projects by time (30d)
-        try:
-            pt30 = db.aggregate_project_totals(since_days=30)
-            tops = sorted(pt30.items(), key=lambda kv: kv[1], reverse=True)[:5]
-            if tops:
-                fr += [("", "\n")]
-                fr += [("bold", "Top Proj (30d)\n")]
-                for name, secs in tops:
-                    fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
-        except Exception:
-            pass
-        try:
-            lt30 = db.aggregate_label_totals(since_days=30)
-            label_tops = sorted(lt30.items(), key=lambda kv: kv[1], reverse=True)[:5]
-            if label_tops:
-                fr += [("", "\n")]
-                fr += [("bold", "Top Labels (30d)\n")]
-                for name, secs in label_tops:
-                    fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
-        except Exception:
-            pass
+        proj_cache_entry = summary_cache['project']
+        if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not proj_cache_entry.get('tops'):
+            try:
+                proj_data = db.aggregate_project_totals(since_days=30)
+            except Exception:
+                proj_data = proj_cache_entry.get('data', {}) or {}
+            else:
+                proj_cache_entry['data'] = proj_data
+                proj_cache_entry['tops'] = sorted(proj_data.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            proj_cache_entry['ts'] = now_mon
+        project_tops = proj_cache_entry.get('tops', []) or []
+        if project_tops:
+            fr += [("", "\n")]
+            fr += [("bold", "Top Proj (30d)\n")]
+            for name, secs in project_tops:
+                fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
+
+        label_cache_entry = summary_cache['label']
+        if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not label_cache_entry.get('tops'):
+            try:
+                label_data = db.aggregate_label_totals(since_days=30)
+            except Exception:
+                label_data = label_cache_entry.get('data', {}) or {}
+            else:
+                label_cache_entry['data'] = label_data
+                label_cache_entry['tops'] = sorted(label_data.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            label_cache_entry['ts'] = now_mon
+        label_tops = label_cache_entry.get('tops', []) or []
+        if label_tops:
+            fr += [("", "\n")]
+            fr += [("bold", "Top Labels (30d)\n")]
+            for name, secs in label_tops:
+                fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
         if fr and fr[-1][1].endswith("\n"):
             fr[-1] = (fr[-1][0], fr[-1][1][:-1])
         return fr
@@ -4435,8 +4454,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if rows:
             t = rows[current_index]
             if t.url:
-                now_s = db.task_current_elapsed_seconds(t.url)
-                task_s = db.task_total_seconds(t.url)
+                snapshot = task_duration_cache.get(t.url)
+                if snapshot is None:
+                    extra = db.task_duration_snapshot([t.url])
+                    snapshot = extra.get(t.url)
+                    if snapshot is not None:
+                        task_duration_cache[t.url] = snapshot
+                if snapshot:
+                    now_s = snapshot.get('current', 0)
+                    task_s = snapshot.get('total', 0)
             if t.project_title:
                 proj_s = db.project_total_seconds(t.project_title)
         try:
@@ -4696,6 +4722,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     return
                 iso_val = new_start.astimezone(dt.timezone.utc).isoformat(timespec='seconds')
                 db.update_session_times(session_id_int, started_at=iso_val)
+                _reset_timer_caches()
                 msg = 'Start updated'
             else:
                 if not raw_input.strip():
@@ -4707,6 +4734,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     return
                 iso_val = new_end.astimezone(dt.timezone.utc).isoformat(timespec='seconds') if new_end else None
                 db.update_session_times(session_id_int, ended_at=iso_val)
+                _reset_timer_caches()
                 msg = 'End updated' if new_end else 'End cleared'
             _cancel_session_edit()
             _refresh_session_editor(preserve_id=session_id_int)
@@ -4741,6 +4769,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception as exc:
             _set_session_message(f'Adjust failed: {exc}')
             return
+        _reset_timer_caches()
         _refresh_session_editor(preserve_id=session_id_int)
         msg = f'End adjusted by {minutes:+d} min'
         _set_session_message(msg)
@@ -4766,6 +4795,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception as exc:
             _set_session_message(f'Delete failed: {exc}')
             return
+        _reset_timer_caches()
         _refresh_session_editor()
         _set_session_message('Session deleted')
         status_line = 'Session deleted'
@@ -5401,8 +5431,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         stats_control.text = lambda: summarize()
         app.invalidate()
 
+    def _invalidate_summary_cache() -> None:
+        summary_cache['project'].update({'ts': 0.0, 'data': {}, 'tops': []})
+        summary_cache['label'].update({'ts': 0.0, 'data': {}, 'tops': []})
+
+    def _reset_timer_caches() -> None:
+        nonlocal task_duration_cache
+        task_duration_cache = {}
+        _invalidate_summary_cache()
+
     async def update_worker(status_msg: Optional[str] = None):
-        nonlocal status_line, all_rows, current_index, today_date, update_in_progress
+        nonlocal status_line, all_rows, current_index, today_date, update_in_progress, task_duration_cache
         if update_in_progress:
             return
         update_in_progress = True
@@ -5461,6 +5500,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             except Exception:
                 pass
             all_rows = load_all()
+            _reset_timer_caches()
             current_index = 0 if all_rows else 0
             if replaced_cache:
                 progress(len(rows), len(rows), 'Updated')
@@ -6898,6 +6938,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 logger.info("Started timer for %s labels=%s", t.url, labels)
             except Exception:
                 pass
+        _reset_timer_caches()
         invalidate()
 
     # Quick export from UI: writes a JSON report next to DB with timestamp
