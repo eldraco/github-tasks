@@ -539,6 +539,56 @@ class TaskDB:
         now = dt.datetime.now(dt.timezone.utc).astimezone()
         return max(0, int((now - st).total_seconds()))
 
+    def task_duration_snapshot(self, task_urls: Iterable[str]) -> Dict[str, Dict[str, int]]:
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for url in task_urls:
+            if not url:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            ordered.append(url)
+        if not ordered:
+            return {}
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        totals: Dict[str, int] = {url: 0 for url in ordered}
+        running: Dict[str, Tuple[int, dt.datetime]] = {}
+        cur = self.conn.cursor()
+        chunk_size = 200
+        for idx in range(0, len(ordered), chunk_size):
+            subset = ordered[idx:idx + chunk_size]
+            placeholders = ",".join(["?"] * len(subset))
+            cur.execute(
+                f"SELECT id, task_url, started_at, ended_at "
+                f"FROM work_sessions WHERE task_url IN ({placeholders}) ORDER BY id",
+                subset,
+            )
+            for sid, url, started_at, ended_at in cur.fetchall():
+                if not url:
+                    continue
+                st = self._parse_iso(started_at)
+                if not st:
+                    continue
+                en = self._parse_iso(ended_at) if ended_at else None
+                if en is None:
+                    en = now
+                    prev = running.get(url)
+                    if (prev is None) or (sid > prev[0]):
+                        running[url] = (sid, st)
+                totals[url] = totals.get(url, 0) + max(0, int((en - st).total_seconds()))
+        result: Dict[str, Dict[str, int]] = {}
+        for url in ordered:
+            cur_entry = running.get(url)
+            current_secs = 0
+            if cur_entry:
+                current_secs = max(0, int((now - cur_entry[1]).total_seconds()))
+            result[url] = {
+                'current': current_secs,
+                'total': totals.get(url, 0),
+            }
+        return result
+
     def aggregate_task_totals(self, since_days: Optional[int] = None) -> Dict[str, int]:
         cur = self.conn.cursor()
         cur.execute("SELECT task_url, started_at, ended_at FROM work_sessions")
@@ -2723,6 +2773,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     session_state: Dict[str, object] = {}
     session_float: Optional[Float] = None
     update_in_progress = False
+    task_duration_cache: Dict[str, Dict[str, int]] = {}
     # Inline search buffer (used when in_search == True)
 
     if state_path is None:
@@ -4119,9 +4170,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             invalidate()
 
     def build_table_fragments() -> List[Tuple[str,str]]:
+        nonlocal task_duration_cache, current_index, v_offset
         rows = filtered_rows()
-        nonlocal current_index
-        nonlocal v_offset
         if current_index >= len(rows):
             current_index = max(0, len(rows)-1)
         # Determine available vertical space (rough estimate: terminal rows - status bar - maybe 0 extra)
@@ -4226,6 +4276,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         today = today_date
         active_urls = db.active_task_urls()
         display_slice = rows[v_offset:v_offset+visible_rows]
+        duration_urls = [t.url for t in display_slice if t.url]
+        task_duration_cache = db.task_duration_snapshot(duration_urls)
         for rel_idx, t in enumerate(display_slice):
             idx = v_offset + rel_idx
             is_sel = (idx == current_index)
@@ -4241,8 +4293,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 base_style = col
             marker = '⏱ ' if running else '  '
             # Time column: current run (mm:ss) and total (H:MM)
-            cur_s = db.task_current_elapsed_seconds(t.url) if (t.url and running) else 0
-            tot_s = db.task_total_seconds(t.url) if t.url else 0
+            snapshot = task_duration_cache.get(t.url) if t.url else None
+            tot_s = snapshot.get('total', 0) if snapshot else 0
+            cur_s = snapshot.get('current', 0) if snapshot else 0
+            if not running:
+                cur_s = 0
             mm, ss = divmod(int(max(0, cur_s)), 60)
             # total in H:MM (no leading zeros on hours)
             th, rem = divmod(int(max(0, tot_s)), 3600)
@@ -4295,6 +4350,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return frags
 
     def summarize() -> List[Tuple[str,str]]:
+        nonlocal task_duration_cache
         rows = filtered_rows()
         total = len(rows)
         done_ct = sum(1 for r in rows if r.is_done)
@@ -4312,8 +4368,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if rows:
             cur = rows[current_index]
             if cur.url:
-                now_s = db.task_current_elapsed_seconds(cur.url)
-                task_s = db.task_total_seconds(cur.url)
+                snapshot = task_duration_cache.get(cur.url)
+                if snapshot is None:
+                    extra = db.task_duration_snapshot([cur.url])
+                    snapshot = extra.get(cur.url)
+                    if snapshot is not None:
+                        task_duration_cache[cur.url] = snapshot
+                if snapshot:
+                    now_s = snapshot.get('current', 0)
+                    task_s = snapshot.get('total', 0)
             if cur.project_title:
                 proj_s = db.project_total_seconds(cur.project_title)
         active_search_val = (search_buffer if in_search else search_term) or '-'
