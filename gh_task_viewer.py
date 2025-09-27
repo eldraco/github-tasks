@@ -2533,16 +2533,26 @@ def color_for_date(d: str, today: dt.date) -> str:
 
 def _char_width(ch: str) -> int:
     """Return printable cell width for a single character."""
+    # Heuristic fallback based on Unicode metadata; keeps wide glyphs wide even if
+    # prompt_toolkit is stubbed in tests.
+    if unicodedata.combining(ch) or unicodedata.category(ch) == "Cf":
+        fallback = 0
+    else:
+        fallback = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
     if _pt_get_cwidth is not None:
         try:
-            return _pt_get_cwidth(ch)
+            width = int(_pt_get_cwidth(ch))
         except Exception:
-            pass
-    if unicodedata.combining(ch):
-        return 0
-    if unicodedata.category(ch) == "Cf":  # zero-width formatting chars
-        return 0
-    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            width = None
+        else:
+            if width <= 0:
+                return fallback
+            if fallback == 0:
+                return 0
+            return width if width > fallback else fallback
+
+    return fallback
 
 
 def _display_width(text: str) -> int:
@@ -2590,6 +2600,9 @@ def _pad_display(text: Optional[str], width: int, align: str = "left") -> str:
         left = pad // 2
         right = pad - left
         return (" " * left) + raw + (" " * right)
+    if pad and raw and _char_width(raw[-1]) == 2:
+        # Keep wide glyphs flush with the right edge so they don't trail spaces.
+        return (" " * pad) + raw
     return raw + (" " * pad)
 
 def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str]]:
