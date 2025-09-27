@@ -539,6 +539,56 @@ class TaskDB:
         now = dt.datetime.now(dt.timezone.utc).astimezone()
         return max(0, int((now - st).total_seconds()))
 
+    def task_duration_snapshot(self, task_urls: Iterable[str]) -> Dict[str, Dict[str, int]]:
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for url in task_urls:
+            if not url:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            ordered.append(url)
+        if not ordered:
+            return {}
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        totals: Dict[str, int] = {url: 0 for url in ordered}
+        running: Dict[str, Tuple[int, dt.datetime]] = {}
+        cur = self.conn.cursor()
+        chunk_size = 200
+        for idx in range(0, len(ordered), chunk_size):
+            subset = ordered[idx:idx + chunk_size]
+            placeholders = ",".join(["?"] * len(subset))
+            cur.execute(
+                f"SELECT id, task_url, started_at, ended_at "
+                f"FROM work_sessions WHERE task_url IN ({placeholders}) ORDER BY id",
+                subset,
+            )
+            for sid, url, started_at, ended_at in cur.fetchall():
+                if not url:
+                    continue
+                st = self._parse_iso(started_at)
+                if not st:
+                    continue
+                en = self._parse_iso(ended_at) if ended_at else None
+                if en is None:
+                    en = now
+                    prev = running.get(url)
+                    if (prev is None) or (sid > prev[0]):
+                        running[url] = (sid, st)
+                totals[url] = totals.get(url, 0) + max(0, int((en - st).total_seconds()))
+        result: Dict[str, Dict[str, int]] = {}
+        for url in ordered:
+            cur_entry = running.get(url)
+            current_secs = 0
+            if cur_entry:
+                current_secs = max(0, int((now - cur_entry[1]).total_seconds()))
+            result[url] = {
+                'current': current_secs,
+                'total': totals.get(url, 0),
+            }
+        return result
+
     def aggregate_task_totals(self, since_days: Optional[int] = None) -> Dict[str, int]:
         cur = self.conn.cursor()
         cur.execute("SELECT task_url, started_at, ended_at FROM work_sessions")
@@ -907,7 +957,7 @@ class TaskDB:
         )
         self.conn.commit()
 
-    def upsert_many(self, rows: List[TaskRow]):
+    def upsert_many(self, rows: List[TaskRow], *, commit: bool = True):
         if not rows:
             return
         cur = self.conn.cursor()
@@ -1011,14 +1061,24 @@ class TaskDB:
                 for r in rows
             ],
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def replace_all(self, rows: List[TaskRow]):
         """Replace all existing tasks with new list (ensures deletions reflected)."""
         cur = self.conn.cursor()
-        cur.execute("DELETE FROM tasks")
-        self.conn.commit()
-        self.upsert_many(rows)
+        try:
+            cur.execute("BEGIN")
+            cur.execute("DELETE FROM tasks")
+            if rows:
+                self.upsert_many(rows, commit=False)
+            cur.execute("COMMIT")
+        except Exception:
+            try:
+                cur.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def load(self, today_only=False, today: Optional[str]=None) -> List[TaskRow]:
         cur = self.conn.cursor()
@@ -1991,13 +2051,20 @@ class _ProjectFetchResult:
     rate_limited: bool = False
     message: str = ""
 
+
+@dataclass
+class FetchTasksResult:
+    rows: List[TaskRow]
+    partial: bool = False
+    message: str = ""
+
 def fetch_tasks_github(
     token: str,
     cfg: Config,
     date_cutoff: dt.date,
     include_unassigned: bool = False,
     progress: Optional[ProgressCB] = None,
-) -> List[TaskRow]:
+) -> FetchTasksResult:
     session = _session(token)
     regex = re.compile(cfg.date_field_regex, re.IGNORECASE)
     iter_regex = re.compile(cfg.iteration_field_regex, re.IGNORECASE) if cfg.iteration_field_regex else None
@@ -2403,6 +2470,7 @@ def fetch_tasks_github(
 
     results_by_idx: Dict[int, List[TaskRow]] = {}
     rate_limited_triggered = False
+    partial_message: str = ""
 
     workers = min(4, max(1, total))
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -2420,6 +2488,8 @@ def fetch_tasks_github(
             results_by_idx[idx] = result.rows
             if result.rate_limited:
                 rate_limited_triggered = True
+                if not partial_message:
+                    partial_message = result.message or "Rate limited; fetching incomplete"
                 for other_future, other_idx in future_map.items():
                     if other_future is future:
                         continue
@@ -2441,7 +2511,10 @@ def fetch_tasks_github(
     if not rate_limited_triggered and progress:
         tracker.complete("Done")
 
-    return out
+    if rate_limited_triggered and not partial_message:
+        partial_message = "Rate limited; keeping existing cache"
+
+    return FetchTasksResult(rows=out, partial=rate_limited_triggered, message=partial_message)
 
 
 # -----------------------------
@@ -2601,6 +2674,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     session_state: Dict[str, object] = {}
     session_float: Optional[Float] = None
     update_in_progress = False
+    task_duration_cache: Dict[str, Dict[str, int]] = {}
+    SUMMARY_CACHE_TTL = 5.0  # seconds; avoid recomputing heavy aggregates on every repaint
+    summary_cache: Dict[str, Dict[str, object]] = {
+        'project': {'ts': 0.0, 'data': {}, 'tops': []},
+        'label': {'ts': 0.0, 'data': {}, 'tops': []},
+    }
     # Inline search buffer (used when in_search == True)
 
     if state_path is None:
@@ -3997,9 +4076,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             invalidate()
 
     def build_table_fragments() -> List[Tuple[str,str]]:
-        rows = filtered_rows()
+        nonlocal task_duration_cache
         nonlocal current_index
         nonlocal v_offset
+        rows = filtered_rows()
         if current_index >= len(rows):
             current_index = max(0, len(rows)-1)
         # Determine available vertical space (rough estimate: terminal rows - status bar - maybe 0 extra)
@@ -4104,6 +4184,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         today = today_date
         active_urls = db.active_task_urls()
         display_slice = rows[v_offset:v_offset+visible_rows]
+        duration_urls = [t.url for t in display_slice if t.url]
+        task_duration_cache = db.task_duration_snapshot(duration_urls)
         for rel_idx, t in enumerate(display_slice):
             idx = v_offset + rel_idx
             is_sel = (idx == current_index)
@@ -4119,8 +4201,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 base_style = col
             marker = '⏱ ' if running else '  '
             # Time column: current run (mm:ss) and total (H:MM)
-            cur_s = db.task_current_elapsed_seconds(t.url) if (t.url and running) else 0
-            tot_s = db.task_total_seconds(t.url) if t.url else 0
+            snapshot = task_duration_cache.get(t.url) if t.url else None
+            tot_s = snapshot.get('total', 0) if snapshot else 0
+            cur_s = snapshot.get('current', 0) if snapshot else 0
+            if not running:
+                cur_s = 0
             mm, ss = divmod(int(max(0, cur_s)), 60)
             # total in H:MM (no leading zeros on hours)
             th, rem = divmod(int(max(0, tot_s)), 3600)
@@ -4173,9 +4258,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return frags
 
     def summarize() -> List[Tuple[str,str]]:
+        nonlocal task_duration_cache
         rows = filtered_rows()
         total = len(rows)
         done_ct = sum(1 for r in rows if r.is_done)
+        now_mon = time.monotonic()
         def _fmt_hm(ts: int) -> str:
             s = int(max(0, ts)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
         def _fmt_mmss(ts: int) -> str:
@@ -4190,8 +4277,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if rows:
             cur = rows[current_index]
             if cur.url:
-                now_s = db.task_current_elapsed_seconds(cur.url)
-                task_s = db.task_total_seconds(cur.url)
+                snapshot = task_duration_cache.get(cur.url)
+                if snapshot is None:
+                    extra = db.task_duration_snapshot([cur.url])
+                    snapshot = extra.get(cur.url)
+                    if snapshot is not None:
+                        task_duration_cache[cur.url] = snapshot
+                if snapshot:
+                    now_s = snapshot.get('current', 0)
+                    task_s = snapshot.get('total', 0)
             if cur.project_title:
                 proj_s = db.project_total_seconds(cur.project_title)
         active_search_val = (search_buffer if in_search else search_term) or '-'
@@ -4212,26 +4306,39 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         fr += [("", f"☑️ Done:{'Hide' if hide_done else 'Off'} NoDate:{'Hide' if hide_no_date else 'Off'}\n")]
         fr += [("", f"↕ Sort: {_truncate(sort_presets[sort_index]['name'],22)}\n")]
         # Top 5 projects by time (30d)
-        try:
-            pt30 = db.aggregate_project_totals(since_days=30)
-            tops = sorted(pt30.items(), key=lambda kv: kv[1], reverse=True)[:5]
-            if tops:
-                fr += [("", "\n")]
-                fr += [("bold", "Top Proj (30d)\n")]
-                for name, secs in tops:
-                    fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
-        except Exception:
-            pass
-        try:
-            lt30 = db.aggregate_label_totals(since_days=30)
-            label_tops = sorted(lt30.items(), key=lambda kv: kv[1], reverse=True)[:5]
-            if label_tops:
-                fr += [("", "\n")]
-                fr += [("bold", "Top Labels (30d)\n")]
-                for name, secs in label_tops:
-                    fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
-        except Exception:
-            pass
+        proj_cache_entry = summary_cache['project']
+        if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not proj_cache_entry.get('tops'):
+            try:
+                proj_data = db.aggregate_project_totals(since_days=30)
+            except Exception:
+                proj_data = proj_cache_entry.get('data', {}) or {}
+            else:
+                proj_cache_entry['data'] = proj_data
+                proj_cache_entry['tops'] = sorted(proj_data.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            proj_cache_entry['ts'] = now_mon
+        project_tops = proj_cache_entry.get('tops', []) or []
+        if project_tops:
+            fr += [("", "\n")]
+            fr += [("bold", "Top Proj (30d)\n")]
+            for name, secs in project_tops:
+                fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
+
+        label_cache_entry = summary_cache['label']
+        if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not label_cache_entry.get('tops'):
+            try:
+                label_data = db.aggregate_label_totals(since_days=30)
+            except Exception:
+                label_data = label_cache_entry.get('data', {}) or {}
+            else:
+                label_cache_entry['data'] = label_data
+                label_cache_entry['tops'] = sorted(label_data.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            label_cache_entry['ts'] = now_mon
+        label_tops = label_cache_entry.get('tops', []) or []
+        if label_tops:
+            fr += [("", "\n")]
+            fr += [("bold", "Top Labels (30d)\n")]
+            for name, secs in label_tops:
+                fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
         if fr and fr[-1][1].endswith("\n"):
             fr[-1] = (fr[-1][0], fr[-1][1][:-1])
         return fr
@@ -4250,8 +4357,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if rows:
             t = rows[current_index]
             if t.url:
-                now_s = db.task_current_elapsed_seconds(t.url)
-                task_s = db.task_total_seconds(t.url)
+                snapshot = task_duration_cache.get(t.url)
+                if snapshot is None:
+                    extra = db.task_duration_snapshot([t.url])
+                    snapshot = extra.get(t.url)
+                    if snapshot is not None:
+                        task_duration_cache[t.url] = snapshot
+                if snapshot:
+                    now_s = snapshot.get('current', 0)
+                    task_s = snapshot.get('total', 0)
             if t.project_title:
                 proj_s = db.project_total_seconds(t.project_title)
         try:
@@ -4511,6 +4625,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     return
                 iso_val = new_start.astimezone(dt.timezone.utc).isoformat(timespec='seconds')
                 db.update_session_times(session_id_int, started_at=iso_val)
+                _reset_timer_caches()
                 msg = 'Start updated'
             else:
                 if not raw_input.strip():
@@ -4522,6 +4637,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     return
                 iso_val = new_end.astimezone(dt.timezone.utc).isoformat(timespec='seconds') if new_end else None
                 db.update_session_times(session_id_int, ended_at=iso_val)
+                _reset_timer_caches()
                 msg = 'End updated' if new_end else 'End cleared'
             _cancel_session_edit()
             _refresh_session_editor(preserve_id=session_id_int)
@@ -4556,6 +4672,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception as exc:
             _set_session_message(f'Adjust failed: {exc}')
             return
+        _reset_timer_caches()
         _refresh_session_editor(preserve_id=session_id_int)
         msg = f'End adjusted by {minutes:+d} min'
         _set_session_message(msg)
@@ -4581,6 +4698,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception as exc:
             _set_session_message(f'Delete failed: {exc}')
             return
+        _reset_timer_caches()
         _refresh_session_editor()
         _set_session_message('Session deleted')
         status_line = 'Session deleted'
@@ -5216,8 +5334,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         stats_control.text = lambda: summarize()
         app.invalidate()
 
+    def _invalidate_summary_cache() -> None:
+        summary_cache['project'].update({'ts': 0.0, 'data': {}, 'tops': []})
+        summary_cache['label'].update({'ts': 0.0, 'data': {}, 'tops': []})
+
+    def _reset_timer_caches() -> None:
+        nonlocal task_duration_cache
+        task_duration_cache = {}
+        _invalidate_summary_cache()
+
     async def update_worker(status_msg: Optional[str] = None):
-        nonlocal status_line, all_rows, current_index, today_date, update_in_progress
+        nonlocal status_line, all_rows, current_index, today_date, update_in_progress, task_duration_cache
         if update_in_progress:
             return
         update_in_progress = True
@@ -5243,7 +5370,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                         pass
                     rows = generate_mock_tasks(cfg)
                     progress(1, 1, '[########################################] 100% Done')
-                    return rows
+                    return FetchTasksResult(rows=rows, partial=False, message='Mock data loaded')
                 if not token:
                     raise RuntimeError('TOKEN not set')
                 try:
@@ -5252,24 +5379,38 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     pass
                 return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
 
-            fut_rows = await loop.run_in_executor(None, do_fetch)
-            try:
-                logger.info("Fetched %d tasks; replacing DB rows", len(fut_rows))
-            except Exception:
-                pass
-            db.replace_all(fut_rows)
+            fetch_result = await loop.run_in_executor(None, do_fetch)
+            replaced_cache = False
+            if fetch_result.partial:
+                msg = fetch_result.message or 'Fetch returned partial results; cache kept'
+                try:
+                    logger.warning("Fetch returned partial results (%d rows); cache unchanged", len(fetch_result.rows))
+                except Exception:
+                    pass
+                progress(len(fetch_result.rows), max(1, len(fetch_result.rows)), msg)
+                status_line = msg
+            else:
+                rows = fetch_result.rows
+                try:
+                    logger.info("Fetched %d tasks; replacing DB rows", len(rows))
+                except Exception:
+                    pass
+                db.replace_all(rows)
+                replaced_cache = True
             try:
                 today_date = dt.date.today()
                 logger.debug("today_date refreshed after update: %s", today_date)
             except Exception:
                 pass
             all_rows = load_all()
+            _reset_timer_caches()
             current_index = 0 if all_rows else 0
-            progress(len(fut_rows), len(fut_rows), 'Updated')
-            try:
-                logger.info("Update finished successfully. Cached rows: %d", len(all_rows))
-            except Exception:
-                pass
+            if replaced_cache:
+                progress(len(rows), len(rows), 'Updated')
+                try:
+                    logger.info("Update finished successfully. Cached rows: %d", len(all_rows))
+                except Exception:
+                    pass
         except Exception as e:
             status_line = f"Error: {e}"
             try:
@@ -6700,6 +6841,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 logger.info("Started timer for %s labels=%s", t.url, labels)
             except Exception:
                 pass
+        _reset_timer_caches()
         invalidate()
 
     # Quick export from UI: writes a JSON report next to DB with timestamp
