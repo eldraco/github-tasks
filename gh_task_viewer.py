@@ -4575,7 +4575,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         overview_rows = [
             ('👤', 'User', cfg.user),
             ('📝', 'Tasks', f"{total} • Done {done_ct}"),
-            ('⏱', 'Now', _fmt_mmss(now_s)),
+            ('⏲️ ', 'Now', _fmt_mmss(now_s)),
             ('🧩', 'Task', _fmt_hm(task_s)),
             ('📦', 'Project', _fmt_hm(proj_s)),
             ('⚡', 'Active', str(active_count)),
