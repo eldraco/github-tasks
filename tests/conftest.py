@@ -1,7 +1,12 @@
+import os
 import sys
 import types
 
 import pytest
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 
 def _install_prompt_toolkit_stub() -> None:
