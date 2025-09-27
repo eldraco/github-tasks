@@ -2533,16 +2533,26 @@ def color_for_date(d: str, today: dt.date) -> str:
 
 def _char_width(ch: str) -> int:
     """Return printable cell width for a single character."""
+    # Heuristic fallback based on Unicode metadata; keeps wide glyphs wide even if
+    # prompt_toolkit is stubbed in tests.
+    if unicodedata.combining(ch) or unicodedata.category(ch) == "Cf":
+        fallback = 0
+    else:
+        fallback = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
     if _pt_get_cwidth is not None:
         try:
-            return _pt_get_cwidth(ch)
+            width = int(_pt_get_cwidth(ch))
         except Exception:
-            pass
-    if unicodedata.combining(ch):
-        return 0
-    if unicodedata.category(ch) == "Cf":  # zero-width formatting chars
-        return 0
-    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            width = None
+        else:
+            if width <= 0:
+                return fallback
+            if fallback == 0:
+                return 0
+            return width if width > fallback else fallback
+
+    return fallback
 
 
 def _display_width(text: str) -> int:
@@ -2590,6 +2600,9 @@ def _pad_display(text: Optional[str], width: int, align: str = "left") -> str:
         left = pad // 2
         right = pad - left
         return (" " * left) + raw + (" " * right)
+    if pad and raw and _char_width(raw[-1]) == 2:
+        # Keep wide glyphs flush with the right edge so they don't trail spaces.
+        return (" " * pad) + raw
     return raw + (" " * pad)
 
 def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str]]:
@@ -5678,8 +5691,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if not isinstance(selected, set):
                     selected = set(selected)
                 labels_list = sorted(selected)
+                labels_copy = list(labels_list)
+                editing_meta = task_edit_state.get('editing') or {}
+                target_idx = editing_meta.get('field_idx', cursor)
+                if fields:
+                    target_idx = max(0, min(target_idx, len(fields)-1))
+                stored_fields = task_edit_state.get('fields')
+                field = fields[target_idx] if target_idx < len(fields) else None
                 if field is not None:
-                    field['value'] = labels_list
+                    field['value'] = labels_copy
+                if target_idx < len(fields):
+                    fields[target_idx]['value'] = labels_copy
+                if isinstance(stored_fields, list) and target_idx < len(stored_fields):
+                    stored_fields[target_idx]['value'] = labels_copy
+                task_edit_state['cursor'] = target_idx
                 task_edit_state['mode'] = 'list'
                 task_edit_state['input'] = ''
                 task_edit_state['editing'] = None

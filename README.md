@@ -177,6 +177,20 @@ python gh_task_viewer.py \
   [--export-project "Project Title"] [--export-task-url "https://github.com/org/repo/issues/123"]
 ```
 
+## Tests
+
+Run the automated suite with pytest (activate your virtualenv first if you created one):
+
+```
+pytest
+```
+
+While iterating, scope pytest to an individual module:
+
+```
+pytest tests/test_fetch_pipeline.py
+```
+
 Payload includes:
 - overall totals per period (day/week/month)
 - per-project totals (window)
