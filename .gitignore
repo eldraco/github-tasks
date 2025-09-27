@@ -10,3 +10,5 @@ config.yaml
 *.db-shm
 .gitignore
 *.db-wal
+tests/__pycache__
+__pycache__
