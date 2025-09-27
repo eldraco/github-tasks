@@ -4076,7 +4076,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             invalidate()
 
     def build_table_fragments() -> List[Tuple[str,str]]:
-        nonlocal task_duration_cache, current_index, v_offset
+        nonlocal task_duration_cache
+        nonlocal current_index
+        nonlocal v_offset
         rows = filtered_rows()
         if current_index >= len(rows):
             current_index = max(0, len(rows)-1)
