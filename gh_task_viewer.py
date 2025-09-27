@@ -4537,37 +4537,62 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         fr: List[Tuple[str, str]] = []
 
+        is_horizontal_layout = current_layout_name == 'horizontal'
+
         def add_heading(text: str, *, leading_blank: bool = False) -> None:
             if leading_blank and fr and not fr[-1][1].endswith("\n\n"):
                 fr.append(("", "\n"))
             fr.append((heading_style, f"{text}\n"))
 
-        def add_stat(icon: str, label: str, value: str) -> None:
-            label_block = f"{icon} {label:<10}: "
-            fr.append((label_style, label_block))
-            fr.append((value_style, f"{value}\n"))
+        def value_limit(columns: int, requested: Optional[int] = None) -> int:
+            if requested is not None:
+                return requested
+            return 30 if columns > 1 else 24
 
-        def add_list_item(name: str, value: str) -> None:
-            label_block = f"• {_truncate(name or '-', 18):<18}"
-            fr.append((accent_style, label_block))
-            fr.append((value_style, f" {value}\n"))
+        def render_rows(entries: List[Tuple[str, str, str]], *, label_width: int, value_cap: Optional[int] = None, label_style_override: Optional[str] = None, value_style_override: Optional[str] = None) -> None:
+            if not entries:
+                return
+            columns = 2 if is_horizontal_layout else 1
+            cap = value_limit(columns, value_cap)
+            col_sep = '   '
+            bucket: List[Tuple[str, str, str]] = []
+
+            for idx, entry in enumerate(entries):
+                bucket.append(entry)
+                if len(bucket) == columns or idx == len(entries) - 1:
+                    for col_idx, (icon, label, value) in enumerate(bucket):
+                        label_text = f"{icon} {label}" if icon else label
+                        label_block = _pad_display(label_text, label_width)
+                        value_block = _truncate(value, cap)
+                        fr.append((label_style_override or label_style, label_block))
+                        fr.append((value_style_override or value_style, f" {value_block}"))
+                        if col_idx < len(bucket) - 1:
+                            fr.append(("", col_sep))
+                    fr.append(("", "\n"))
+                    bucket = []
 
         add_heading('Overview')
-        add_stat('👤', 'User', cfg.user)
-        add_stat('📝', 'Tasks', f"{total:<3}  Done {done_ct}")
-        add_stat('⏱', 'Now', _fmt_mmss(now_s))
-        add_stat('🧩', 'Task', _fmt_hm(task_s))
-        add_stat('📦', 'Project', _fmt_hm(proj_s))
-        add_stat('⚡', 'Active', str(active_count))
+        overview_rows = [
+            ('👤', 'User', cfg.user),
+            ('📝', 'Tasks', f"{total} • Done {done_ct}"),
+            ('⏱', 'Now', _fmt_mmss(now_s)),
+            ('🧩', 'Task', _fmt_hm(task_s)),
+            ('📦', 'Project', _fmt_hm(proj_s)),
+            ('⚡', 'Active', str(active_count)),
+        ]
+        render_rows(overview_rows, label_width=14 if is_horizontal_layout else 12)
 
         add_heading('Filters', leading_blank=True)
-        add_stat('🔎', 'Search', _truncate(active_search_val, 22))
-        add_stat('📁', 'Project', _truncate(project_cycle or 'All', 22))
+        filter_rows = [
+            ('🔎', 'Search', active_search_val),
+            ('📁', 'Project', project_cycle or 'All'),
+            ('☑️', 'Done', 'Hide' if hide_done else 'Show'),
+            ('🚫', 'No-Date', 'Hide' if hide_no_date else 'Show'),
+            ('↕', 'Sort', sort_presets[sort_index]['name']),
+        ]
         if date_max:
-            add_stat('📅', 'Date Max', date_max)
-        add_stat('☑️', 'Done', 'Hide' if hide_done else 'Show')
-        add_stat('🚫', 'No-Date', 'Hide' if hide_no_date else 'Show')
-        add_stat('↕', 'Sort', _truncate(sort_presets[sort_index]['name'], 22))
+            filter_rows.insert(2, ('📅', 'Date Max', date_max))
+        render_rows(filter_rows, label_width=14 if is_horizontal_layout else 12, value_cap=36 if is_horizontal_layout else 24)
 
         # Top 5 projects by time (30d)
         proj_cache_entry = summary_cache['project']
@@ -4583,8 +4608,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         project_tops = proj_cache_entry.get('tops', []) or []
         if project_tops:
             add_heading('Top Projects (30d)', leading_blank=True)
-            for name, secs in project_tops:
-                add_list_item(name or '-', _fmt_hm(secs))
+            project_rows = [('•', name or '-', _fmt_hm(secs)) for name, secs in project_tops]
+            render_rows(project_rows, label_width=22 if is_horizontal_layout else 18, value_cap=12, label_style_override=accent_style)
 
         label_cache_entry = summary_cache['label']
         if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not label_cache_entry.get('tops'):
@@ -4599,8 +4624,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         label_tops = label_cache_entry.get('tops', []) or []
         if label_tops:
             add_heading('Top Labels (30d)', leading_blank=True)
-            for name, secs in label_tops:
-                add_list_item(name or '-', _fmt_hm(secs))
+            label_rows = [('•', name or '-', _fmt_hm(secs)) for name, secs in label_tops]
+            render_rows(label_rows, label_width=22 if is_horizontal_layout else 18, value_cap=12, label_style_override=accent_style)
 
         if fr and fr[-1][1].endswith("\n"):
             fr[-1] = (fr[-1][0], fr[-1][1][:-1])
