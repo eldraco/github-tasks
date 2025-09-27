@@ -18,18 +18,30 @@ def _install_prompt_toolkit_stub() -> None:
             pass
 
     class DummyApplication(Dummy):
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.background_tasks = []
+            self.invalidate_calls = 0
+            DummyApplication.instances.append(self)
+
         def invalidate(self):
-            pass
+            self.invalidate_calls += 1
 
         def run(self):
-            pass
+            return None
 
-        def create_background_task(self, _coro):
+        def create_background_task(self, coro):
+            self.background_tasks.append(coro)
             return None
 
     class DummyKeyBindings:
+        instances = []
+
         def __init__(self):
             self.bindings = []
+            DummyKeyBindings.instances.append(self)
 
         def add(self, *keys, **kwargs):
             def decorator(func):
@@ -52,12 +64,17 @@ def _install_prompt_toolkit_stub() -> None:
     sys.modules['prompt_toolkit'] = pt
 
     enums = types.ModuleType('prompt_toolkit.enums')
-    enums.EditingMode = object
+
+    class DummyEditingMode:
+        VI = 'vi'
+
+    enums.EditingMode = DummyEditingMode
     sys.modules['prompt_toolkit.enums'] = enums
 
     key_binding = types.ModuleType('prompt_toolkit.key_binding')
     key_binding.KeyBindings = DummyKeyBindings
     sys.modules['prompt_toolkit.key_binding'] = key_binding
+    pt.key_binding = key_binding
 
     layout = types.ModuleType('prompt_toolkit.layout')
     class DummyLayout(Dummy):
@@ -69,7 +86,12 @@ def _install_prompt_toolkit_stub() -> None:
     sys.modules['prompt_toolkit.layout'] = layout
 
     layout_controls = types.ModuleType('prompt_toolkit.layout.controls')
-    layout_controls.FormattedTextControl = _callable_stub
+
+    class DummyFormattedTextControl:
+        def __init__(self, text=None, **kwargs):
+            self.text = text
+
+    layout_controls.FormattedTextControl = DummyFormattedTextControl
     sys.modules['prompt_toolkit.layout.controls'] = layout_controls
 
     layout_containers = types.ModuleType('prompt_toolkit.layout.containers')
@@ -90,7 +112,7 @@ def _install_prompt_toolkit_stub() -> None:
     sys.modules['prompt_toolkit.utils'] = utils
 
     keys = types.ModuleType('prompt_toolkit.keys')
-    keys.Keys = types.SimpleNamespace()
+    keys.Keys = types.SimpleNamespace(Any='__ANY__')
     sys.modules['prompt_toolkit.keys'] = keys
 
     filters = types.ModuleType('prompt_toolkit.filters')
@@ -98,7 +120,21 @@ def _install_prompt_toolkit_stub() -> None:
     sys.modules['prompt_toolkit.filters'] = filters
 
     styles = types.ModuleType('prompt_toolkit.styles')
-    styles.Style = Dummy
+
+    class DummyStyle(Dummy):
+        instances = []
+
+        def __init__(self, rules=None, **kwargs):
+            super().__init__(rules, **kwargs)
+            self.rules = rules or {}
+            self.kwargs = kwargs
+            DummyStyle.instances.append(self)
+
+        @classmethod
+        def from_dict(cls, rules):
+            return cls(rules)
+
+    styles.Style = DummyStyle
     sys.modules['prompt_toolkit.styles'] = styles
 
 
