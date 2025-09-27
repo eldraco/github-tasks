@@ -41,6 +41,7 @@ import asyncio
 import calendar
 import datetime as dt
 import os
+from pathlib import Path
 import re
 import sqlite3
 import sys
@@ -132,6 +133,83 @@ def load_config(path: str) -> Config:
         else:
             raise ValueError(f"Project entry needs 'org' or 'user': {item}")
     return Config(user=user, date_field_regex=dfr, projects=prjs, iteration_field_regex=ifr)
+
+
+# -----------------------------
+# Themes
+# -----------------------------
+
+
+@dataclass
+class ThemePreset:
+    name: str
+    style: Dict[str, str]
+    layout: str = "vertical"
+    description: Optional[str] = None
+
+
+BASE_THEME_STYLE: Dict[str, str] = {
+    'editor.frame': 'bg:#1c1c1c #f0f0f0',
+    'editor.frame.border': '#5f5f5f',
+    'editor.frame.title': 'bold #ffd75f',
+    'editor.body': 'bg:#1c1c1c #f0f0f0',
+    'editor.header': 'bold #ffd75f',
+    'editor.meta': '#87d7ff',
+    'editor.text': '#f0f0f0',
+    'editor.field': '#d7d7d7',
+    'editor.field.cursor': 'bold #ffffff bg:#444444',
+    'editor.instructions': '#5fd7af',
+    'editor.priority': '#f0f0f0',
+    'editor.priority.cursor': 'bold #ffffff bg:#875f00',
+    'editor.label': '#d0d0d0',
+    'editor.label.selected': 'bold #87ff5f',
+    'editor.label.cursor': 'reverse #ffffaf',
+    'editor.label.cursor.selected': 'reverse bold #ffffff',
+    'editor.message': '#ffd787',
+    'editor.warning': 'bold #ff8787',
+    'editor.calendar': '#87afff',
+    'editor.entry': '#ffffff bg:#303030',
+}
+
+DEFAULT_THEME_LAYOUT = "vertical"
+SHIFTED_DIGIT_KEYS = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')']
+
+
+def _load_theme_presets(theme_dir: Path) -> List[ThemePreset]:
+    presets: List[ThemePreset] = [ThemePreset(name="Default", style=dict(BASE_THEME_STYLE), layout=DEFAULT_THEME_LAYOUT)]
+    seen = {presets[0].name.lower()}
+    if not theme_dir.is_dir():
+        return presets
+    candidates = sorted(theme_dir.glob("*.yml")) + sorted(theme_dir.glob("*.yaml"))
+    for path in candidates:
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            logging.getLogger('gh_task_viewer').warning("Failed to load theme file %s", path, exc_info=True)
+            continue
+        if not isinstance(data, dict):
+            continue
+        raw_name = str(data.get("name") or path.stem).strip()
+        name = raw_name or path.stem
+        layout = str(data.get("layout") or DEFAULT_THEME_LAYOUT).strip().lower()
+        if layout not in {"vertical", "horizontal"}:
+            layout = DEFAULT_THEME_LAYOUT
+        overrides = data.get("style") if isinstance(data.get("style"), dict) else {}
+        style_dict = dict(BASE_THEME_STYLE)
+        if isinstance(overrides, dict):
+            for key, value in overrides.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    style_dict[key] = value
+        preset = ThemePreset(name=name, style=style_dict, layout=layout, description=data.get("description"))
+        lowered = name.lower()
+        if lowered == "default":
+            presets[0] = preset
+            continue
+        if lowered in seen:
+            continue
+        presets.append(preset)
+        seen.add(lowered)
+    return presets
 
 
 # -----------------------------
@@ -2693,6 +2771,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         'project': {'ts': 0.0, 'data': {}, 'tops': []},
         'label': {'ts': 0.0, 'data': {}, 'tops': []},
     }
+
+    theme_dir = Path(__file__).resolve().parent / "themes"
+    theme_presets = _load_theme_presets(theme_dir)
+    if not theme_presets:
+        theme_presets = [ThemePreset(name="Default", style=dict(BASE_THEME_STYLE), layout=DEFAULT_THEME_LAYOUT)]
+    current_theme_index = 0
+    current_layout_name = theme_presets[current_theme_index].layout or DEFAULT_THEME_LAYOUT
+    style = Style.from_dict(theme_presets[current_theme_index].style)
     # Inline search buffer (used when in_search == True)
 
     if state_path is None:
@@ -2741,6 +2827,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'current_index': current_index,
             'v_offset': v_offset,
             'h_offset': h_offset,
+            'theme_index': current_theme_index,
         }
         try:
             d = os.path.dirname(state_path)
@@ -2753,6 +2840,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     # apply any saved UI state before loading rows
     _st = _load_state()
+    saved_theme_idx = int(_st.get('theme_index', current_theme_index) or current_theme_index)
+    if 0 <= saved_theme_idx < len(theme_presets):
+        current_theme_index = saved_theme_idx
+        current_layout_name = theme_presets[current_theme_index].layout or DEFAULT_THEME_LAYOUT
+        style = Style.from_dict(theme_presets[current_theme_index].style)
     show_today_only = bool(_st.get('show_today_only', show_today_only))
     hide_done = bool(_st.get('hide_done', hide_done))
     hide_no_date = bool(_st.get('hide_no_date', hide_no_date))
@@ -4398,7 +4490,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     top_status_control = FormattedTextControl(text=lambda: build_top_status())
     top_status_window = Window(height=1, content=top_status_control)
     stats_control = FormattedTextControl(text=lambda: summarize())
-    stats_window = Window(width=32, content=stats_control, wrap_lines=False, always_hide_cursor=True)
+
+    def _build_stats_window(layout_name: str) -> Window:
+        if layout_name == 'horizontal':
+            return Window(content=stats_control, wrap_lines=False, always_hide_cursor=True)
+        return Window(width=32, content=stats_control, wrap_lines=False, always_hide_cursor=True)
 
     detail_control = FormattedTextControl(text=lambda: build_detail_text())
     detail_window = Window(width=80, height=20, content=detail_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
@@ -5131,7 +5227,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             s = int(max(0, s)); m, s = divmod(s, 60); return f"{m:02d}:{s:02d}"
         def _hm(s:int)->str:
             s = int(max(0, s)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
-        base = f" {mode}  ⏱ {_mmss(now_s)}  🧩 {_hm(task_s)}  📦 {_hm(proj_s)}  🟢 {active_count} "
+        theme_label = theme_presets[current_theme_index].name if theme_presets else 'Default'
+        base = f" {mode}  ⏱ {_mmss(now_s)}  🧩 {_hm(task_s)}  📦 {_hm(proj_s)}  🟢 {active_count}  🎨 {theme_label}"
         if status_line:
             base += "  " + status_line
         return base
@@ -5321,8 +5418,42 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         else:
             task_edit_state['message'] = 'Field not editable'
         invalidate()
-    root_body = VSplit([table_window, Window(width=1, char='│'), stats_window])
-    container = FloatContainer(content=HSplit([top_status_window, root_body, status_window]), floats=floats)
+    def _build_root_body() -> object:
+        if current_layout_name == 'horizontal':
+            return HSplit([
+                table_window,
+                Window(height=1, char='─'),
+                _build_stats_window('horizontal'),
+            ])
+        return VSplit([
+            table_window,
+            Window(width=1, char='│'),
+            _build_stats_window('vertical'),
+        ])
+
+    root_body = _build_root_body()
+    root_content = HSplit([top_status_window, root_body, status_window])
+    container = FloatContainer(content=root_content, floats=floats)
+
+    def _refresh_root_body() -> None:
+        nonlocal root_body, root_content
+        new_body = _build_root_body()
+        root_body = new_body
+        updated = False
+        try:
+            if hasattr(root_content, 'children') and len(getattr(root_content, 'children')) >= 3:
+                root_content.children[1] = new_body
+                updated = True
+        except Exception:
+            updated = False
+        if not updated:
+            try:
+                root_content = HSplit([top_status_window, new_body, status_window])
+                container.content = root_content
+            except Exception:
+                pass
+
+    app: Optional[Application] = None
 
     kb = KeyBindings()
     # Mode filters to enable/disable keybindings contextually
@@ -5345,7 +5476,34 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
         stats_control.text = lambda: summarize()
-        app.invalidate()
+        if app is not None:
+            app.invalidate()
+
+    def apply_theme(index: int, announce: bool = True) -> None:
+        nonlocal current_theme_index, current_layout_name, style, status_line
+        if not (0 <= index < len(theme_presets)):
+            return
+        if index == current_theme_index and not announce:
+            return
+        current_theme_index = index
+        preset = theme_presets[index]
+        current_layout_name = preset.layout or DEFAULT_THEME_LAYOUT
+        _refresh_root_body()
+        style = Style.from_dict(preset.style)
+        if app is not None:
+            app.style = style
+        if announce:
+            status_line = f"Theme: {preset.name}"
+            _save_state()
+        invalidate()
+
+    for idx, key_name in enumerate(SHIFTED_DIGIT_KEYS):
+        if idx >= len(theme_presets):
+            break
+
+        @kb.add(key_name, filter=is_normal)
+        def _(event, index=idx):
+            apply_theme(index)
 
     def _invalidate_summary_cache() -> None:
         summary_cache['project'].update({'ts': 0.0, 'data': {}, 'tops': []})
@@ -7156,6 +7314,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "🌐 Fetch",
                 "  u                   Update (fetch GitHub)",
                 "",
+                "🎨 Themes",
+                "  Shift+1..0         Switch theme preset",
+                "  Add YAML under themes/ to create presets",
+                f"  Current: {theme_presets[current_theme_index].name}",
+                "",
                 "❓ General",
                 "  ?                   Toggle help",
                 "  q / Esc             Quit / Close",
@@ -7206,29 +7369,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         report_granularity = 'month'; invalidate()
 
     # refresh loop timer to update status bar (search typing etc.)
-    style = Style.from_dict({
-        'editor.frame': 'bg:#1c1c1c #f0f0f0',
-        'editor.frame.border': '#5f5f5f',
-        'editor.frame.title': 'bold #ffd75f',
-        'editor.body': 'bg:#1c1c1c #f0f0f0',
-        'editor.header': 'bold #ffd75f',
-        'editor.meta': '#87d7ff',
-        'editor.text': '#f0f0f0',
-        'editor.field': '#d7d7d7',
-        'editor.field.cursor': 'bold #ffffff bg:#444444',
-        'editor.instructions': '#5fd7af',
-        'editor.priority': '#f0f0f0',
-        'editor.priority.cursor': 'bold #ffffff bg:#875f00',
-        'editor.label': '#d0d0d0',
-        'editor.label.selected': 'bold #87ff5f',
-        'editor.label.cursor': 'reverse #ffffaf',
-        'editor.label.cursor.selected': 'reverse bold #ffffff',
-        'editor.message': '#ffd787',
-        'editor.warning': 'bold #ff8787',
-        'editor.calendar': '#87afff',
-        'editor.entry': '#ffffff bg:#303030',
-    })
     app = Application(layout=Layout(container), key_bindings=kb, full_screen=True, mouse_support=True, style=style, editing_mode=EditingMode.VI)
+    apply_theme(current_theme_index, announce=False)
 
     # Background ticker to refresh timers & status once per second
     async def _ticker():
@@ -7236,7 +7378,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             try:
                 await asyncio.sleep(1)
                 update_search_status()
-                app.invalidate()
+                invalidate()
             except Exception:
                 # don't crash on background exceptions
                 await asyncio.sleep(1)

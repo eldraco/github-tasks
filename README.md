@@ -127,6 +127,14 @@ General
 - `q` or `Esc`: close detail/help/report, or quit
 
 
+## Themes
+
+- Press `Shift+1` through `Shift+0` to switch among the loaded theme presets.
+- Presets live as YAML files in the `themes/` folder; use `themes/default.yaml` or `themes/solarized_light.yaml` as starting points when authoring new ones.
+- Each preset defines both color rules (`style`) and a layout (`vertical`/`horizontal`). The first preset is used by default unless a persisted theme index is restored from the UI state file.
+- The viewer saves your last-selected preset automatically so it is restored on the next launch.
+
+
 ## What You See
 
 - Dynamic table width that adapts to your terminal size
