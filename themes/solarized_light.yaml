@@ -32,7 +32,7 @@ style:
   table.date.past: '#b58900'
   table.date.future: '#2aa198'
   table.date.unknown: '#93a1a1'
-  summary.panel: 'bg:#eee8d5 #586e75'
+  summary.panel: 'bg:#fdf6e3 #586e75'
   summary.title: 'bold #cb4b16'
   summary.label: '#657b83'
   summary.value: '#073642'
