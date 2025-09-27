@@ -1991,13 +1991,20 @@ class _ProjectFetchResult:
     rate_limited: bool = False
     message: str = ""
 
+
+@dataclass
+class FetchTasksResult:
+    rows: List[TaskRow]
+    partial: bool = False
+    message: str = ""
+
 def fetch_tasks_github(
     token: str,
     cfg: Config,
     date_cutoff: dt.date,
     include_unassigned: bool = False,
     progress: Optional[ProgressCB] = None,
-) -> List[TaskRow]:
+) -> FetchTasksResult:
     session = _session(token)
     regex = re.compile(cfg.date_field_regex, re.IGNORECASE)
     iter_regex = re.compile(cfg.iteration_field_regex, re.IGNORECASE) if cfg.iteration_field_regex else None
@@ -2403,6 +2410,7 @@ def fetch_tasks_github(
 
     results_by_idx: Dict[int, List[TaskRow]] = {}
     rate_limited_triggered = False
+    partial_message: str = ""
 
     workers = min(4, max(1, total))
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -2420,6 +2428,8 @@ def fetch_tasks_github(
             results_by_idx[idx] = result.rows
             if result.rate_limited:
                 rate_limited_triggered = True
+                if not partial_message:
+                    partial_message = result.message or "Rate limited; fetching incomplete"
                 for other_future, other_idx in future_map.items():
                     if other_future is future:
                         continue
@@ -2441,7 +2451,10 @@ def fetch_tasks_github(
     if not rate_limited_triggered and progress:
         tracker.complete("Done")
 
-    return out
+    if rate_limited_triggered and not partial_message:
+        partial_message = "Rate limited; keeping existing cache"
+
+    return FetchTasksResult(rows=out, partial=rate_limited_triggered, message=partial_message)
 
 
 # -----------------------------
@@ -5243,7 +5256,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                         pass
                     rows = generate_mock_tasks(cfg)
                     progress(1, 1, '[########################################] 100% Done')
-                    return rows
+                    return FetchTasksResult(rows=rows, partial=False, message='Mock data loaded')
                 if not token:
                     raise RuntimeError('TOKEN not set')
                 try:
@@ -5252,12 +5265,24 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     pass
                 return fetch_tasks_github(token, cfg, date_cutoff=today_date, progress=progress, include_unassigned=show_unassigned)
 
-            fut_rows = await loop.run_in_executor(None, do_fetch)
-            try:
-                logger.info("Fetched %d tasks; replacing DB rows", len(fut_rows))
-            except Exception:
-                pass
-            db.replace_all(fut_rows)
+            fetch_result = await loop.run_in_executor(None, do_fetch)
+            replaced_cache = False
+            if fetch_result.partial:
+                msg = fetch_result.message or 'Fetch returned partial results; cache kept'
+                try:
+                    logger.warning("Fetch returned partial results (%d rows); cache unchanged", len(fetch_result.rows))
+                except Exception:
+                    pass
+                progress(len(fetch_result.rows), max(1, len(fetch_result.rows)), msg)
+                status_line = msg
+            else:
+                rows = fetch_result.rows
+                try:
+                    logger.info("Fetched %d tasks; replacing DB rows", len(rows))
+                except Exception:
+                    pass
+                db.replace_all(rows)
+                replaced_cache = True
             try:
                 today_date = dt.date.today()
                 logger.debug("today_date refreshed after update: %s", today_date)
@@ -5265,11 +5290,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 pass
             all_rows = load_all()
             current_index = 0 if all_rows else 0
-            progress(len(fut_rows), len(fut_rows), 'Updated')
-            try:
-                logger.info("Update finished successfully. Cached rows: %d", len(all_rows))
-            except Exception:
-                pass
+            if replaced_cache:
+                progress(len(rows), len(rows), 'Updated')
+                try:
+                    logger.info("Update finished successfully. Cached rows: %d", len(all_rows))
+                except Exception:
+                    pass
         except Exception as e:
             status_line = f"Error: {e}"
             try:
