@@ -12,3 +12,4 @@ config.yaml
 *.db-wal
 tests/__pycache__
 __pycache__
+.coverage
