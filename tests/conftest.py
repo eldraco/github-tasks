@@ -1,6 +1,8 @@
 import sys
 import types
 
+import pytest
+
 
 def _install_prompt_toolkit_stub() -> None:
     if 'prompt_toolkit' in sys.modules:
@@ -96,3 +98,17 @@ def _install_prompt_toolkit_stub() -> None:
 
 
 _install_prompt_toolkit_stub()
+
+
+@pytest.fixture
+def temp_target_cache_path(monkeypatch, tmp_path):
+    """Provide an isolated target cache path for gh_task_viewer tests."""
+    cache_path = tmp_path / "gh_tasks.targets.json"
+    monkeypatch.setattr("gh_task_viewer.TARGET_CACHE_PATH", str(cache_path), raising=False)
+    return cache_path
+
+
+@pytest.fixture
+def temp_db_path(tmp_path):
+    """Return a unique SQLite path per test to avoid cross-test contamination."""
+    return tmp_path / "test_tasks.db"
