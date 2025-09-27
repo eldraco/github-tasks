@@ -4,49 +4,14 @@ from types import SimpleNamespace
 import gh_task_viewer as ght
 import prompt_toolkit
 
-from .helpers import closure_value, dummy_event, make_task, move_to_field
-
-
-def editor_state_from(binding):
-    try:
-        return closure_value(binding, 'task_edit_state')
-    except KeyError:
-        opener = closure_value(binding, 'open_task_editor')
-        return closure_value(opener, 'task_edit_state')
-
-
-def find_state_change_binding(bindings, key, state, attr, description):
-    had_attr = attr in state
-    before = state.get(attr, 0)
-    for keys, _, func in bindings:
-        if key not in keys:
-            continue
-        closure_cells = func.__closure__ or ()
-        if closure_cells and not any(getattr(cell, 'cell_contents', None) is state for cell in closure_cells):
-            continue
-        func(dummy_event())
-        if state.get(attr, before) != before:
-            if had_attr:
-                state[attr] = before
-            else:
-                state.pop(attr, None)
-            return func
-    raise AssertionError(f'{description} not found')
-
-
-def find_binding_for_state(bindings, key, state, description):
-    for keys, _, func in bindings:
-        if key not in keys:
-            continue
-        try:
-            if editor_state_from(func) is state:
-                return func
-        except KeyError:
-            pass
-        closure_cells = func.__closure__ or ()
-        if any(getattr(cell, 'cell_contents', None) is state for cell in closure_cells):
-            return func
-    raise AssertionError(f'{description} not found')
+from .helpers import (
+    dummy_event,
+    editor_state_from,
+    find_binding_for_state,
+    find_state_change_binding,
+    make_task,
+    move_to_field,
+)
 
 
 def test_label_editor_metadata_and_toggle(ui_context):
