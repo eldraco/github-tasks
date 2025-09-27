@@ -957,7 +957,7 @@ class TaskDB:
         )
         self.conn.commit()
 
-    def upsert_many(self, rows: List[TaskRow]):
+    def upsert_many(self, rows: List[TaskRow], *, commit: bool = True):
         if not rows:
             return
         cur = self.conn.cursor()
@@ -1061,7 +1061,8 @@ class TaskDB:
                 for r in rows
             ],
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def replace_all(self, rows: List[TaskRow]):
         """Replace all existing tasks with new list (ensures deletions reflected)."""
@@ -1070,107 +1071,7 @@ class TaskDB:
             cur.execute("BEGIN")
             cur.execute("DELETE FROM tasks")
             if rows:
-                cur.executemany(
-                    """                    INSERT INTO tasks (
-                      owner_type, owner, project_number, project_title,
-                      start_field, start_date,
-                      focus_field, focus_date, focus_field_id,
-                      iteration_field, iteration_title, iteration_start, iteration_duration,
-                      title, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
-                      url, updated_at, status, is_done, assigned_to_me, created_by_me,
-                      item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
-                      start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids, assignee_logins, content_node_id
-                    ) VALUES (
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                    )
-                    ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
-                    DO UPDATE SET project_title=excluded.project_title,
-                                  repo=excluded.repo,
-                                  updated_at=excluded.updated_at,
-                                  focus_field_id=excluded.focus_field_id,
-                                  priority=excluded.priority,
-                                  priority_field_id=excluded.priority_field_id,
-                                  priority_option_id=excluded.priority_option_id,
-                                  priority_options=excluded.priority_options,
-                                  priority_dirty=excluded.priority_dirty,
-                                  priority_pending_option_id=excluded.priority_pending_option_id,
-                                  status=excluded.status,
-                                  is_done=excluded.is_done,
-                                  iteration_field=excluded.iteration_field,
-                                  iteration_title=excluded.iteration_title,
-                                  iteration_start=excluded.iteration_start,
-                                  iteration_duration=excluded.iteration_duration,
-                                  labels=excluded.labels,
-                                  assigned_to_me=excluded.assigned_to_me,
-                                  created_by_me=excluded.created_by_me,
-                                  item_id=excluded.item_id,
-                                  project_id=excluded.project_id,
-                                  status_field_id=excluded.status_field_id,
-                                  status_option_id=excluded.status_option_id,
-                                  status_options=excluded.status_options,
-                                  status_dirty=excluded.status_dirty,
-                                  status_pending_option_id=excluded.status_pending_option_id,
-                                  start_field_id=excluded.start_field_id,
-                                  iteration_field_id=excluded.iteration_field_id,
-                                  iteration_options=excluded.iteration_options,
-                                  assignee_field_id=excluded.assignee_field_id,
-                                  assignee_user_ids=excluded.assignee_user_ids,
-                                  assignee_logins=excluded.assignee_logins,
-                                  content_node_id=excluded.content_node_id
-                    )
-                    """,
-                    [
-                        (
-                            r.owner_type,
-                            r.owner,
-                            r.project_number,
-                            r.project_title,
-                            r.start_field,
-                            r.start_date,
-                            r.focus_field,
-                            r.focus_date,
-                            r.focus_field_id,
-                            r.iteration_field,
-                            r.iteration_title,
-                            r.iteration_start,
-                            r.iteration_duration,
-                            r.title,
-                            r.repo_id,
-                            r.repo,
-                            r.labels,
-                            r.priority,
-                            r.priority_field_id,
-                            r.priority_option_id,
-                            r.priority_options,
-                            int(getattr(r, 'priority_dirty', 0)),
-                            getattr(r, 'priority_pending_option_id', ''),
-                            r.url,
-                            r.updated_at,
-                            r.status,
-                            r.is_done,
-                            r.assigned_to_me,
-                            r.created_by_me,
-                            r.item_id,
-                            r.project_id,
-                            r.status_field_id,
-                            r.status_option_id,
-                            r.status_options,
-                            int(getattr(r, 'status_dirty', 0)),
-                            getattr(r, 'status_pending_option_id', ''),
-                            r.start_field_id,
-                            r.iteration_field_id,
-                            r.iteration_options,
-                            r.assignee_field_id,
-                            r.assignee_user_ids,
-                            r.assignee_logins,
-                            r.content_node_id,
-                        )
-                        for r in rows
-                    ],
-                )
+                self.upsert_many(rows, commit=False)
             cur.execute("COMMIT")
         except Exception:
             try:
