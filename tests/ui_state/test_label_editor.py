@@ -84,6 +84,9 @@ def test_label_editor_commit_triggers_apply(ui_context):
 
     apply_tasks = [coro for coro in ui_context.pending_tasks if getattr(getattr(coro, 'cr_code', None), 'co_name', '') == '_apply_labels']
     assert apply_tasks, 'apply labels task not scheduled'
+    for coro in apply_tasks:
+        coro.close()
+        ui_context.pending_tasks.remove(coro)
 
 
 def test_label_editor_retains_unknown_labels(ui_context):
@@ -175,3 +178,19 @@ def test_label_editor_metadata_error(monkeypatch, tmp_path):
     run_pending('_load_label_choices_for_editor')
     assert state['labels_loading'] is False
     assert state['labels_error'].startswith('Label fetch failed')
+
+    for coro in list(pending_tasks):
+        coro.close()
+        pending_tasks.remove(coro)
+
+    app = prompt_toolkit.Application.instances[-1]
+    background = getattr(app, 'background_tasks', None) or []
+    for coro in list(background):
+        try:
+            coro.close()
+        except RuntimeError:
+            pass
+        if coro in background:
+            background.remove(coro)
+
+    db.conn.close()

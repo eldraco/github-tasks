@@ -96,5 +96,22 @@ def ui_context(monkeypatch, tmp_path):
         pending_tasks=pending_tasks,
         run_pending=run_pending,
     )
-    yield ctx
-    db.conn.close()
+    try:
+        yield ctx
+    finally:
+        for coro in list(pending_tasks):
+            try:
+                coro.close()
+            except RuntimeError:
+                pass
+            if coro in pending_tasks:
+                pending_tasks.remove(coro)
+        background = getattr(app, 'background_tasks', None) or []
+        for coro in list(background):
+            try:
+                coro.close()
+            except RuntimeError:
+                pass
+            if coro in background:
+                background.remove(coro)
+        db.conn.close()
