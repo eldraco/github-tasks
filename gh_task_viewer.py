@@ -5691,8 +5691,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if not isinstance(selected, set):
                     selected = set(selected)
                 labels_list = sorted(selected)
+                labels_copy = list(labels_list)
+                editing_meta = task_edit_state.get('editing') or {}
+                target_idx = editing_meta.get('field_idx', cursor)
+                if fields:
+                    target_idx = max(0, min(target_idx, len(fields)-1))
+                stored_fields = task_edit_state.get('fields')
+                field = fields[target_idx] if target_idx < len(fields) else None
                 if field is not None:
-                    field['value'] = labels_list
+                    field['value'] = labels_copy
+                if target_idx < len(fields):
+                    fields[target_idx]['value'] = labels_copy
+                if isinstance(stored_fields, list) and target_idx < len(stored_fields):
+                    stored_fields[target_idx]['value'] = labels_copy
+                task_edit_state['cursor'] = target_idx
                 task_edit_state['mode'] = 'list'
                 task_edit_state['input'] = ''
                 task_edit_state['editing'] = None
