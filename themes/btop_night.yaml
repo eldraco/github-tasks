@@ -8,7 +8,7 @@ layout:
   stats_task_limit: 6
   stats_comment_limit: 5
   stats_detail_width: 48
-  stats_comment_wrap: 80
+  stats_comment_wrap: 120
 description: Inspired by btop's night mode with neon highlights and purple framing.
 style:
   editor.frame: 'bg:#05050a #d7d7ff'
