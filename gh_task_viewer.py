@@ -4613,11 +4613,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 fr.append((heading_style, _pad_display('', left_width + value_width)))
                 fr.append(("", "\n"))
 
+            def _icon_pad(text: str) -> str:
+                if not text:
+                    return ''
+                if text.endswith(' '):
+                    return text
+                return text + ' '
+
             def add_two_column(rows: List[Tuple[str, str, str]]) -> None:
                 for idx in range(0, len(rows), 2):
                     chunk = rows[idx:idx+2]
                     for col_idx, (icon, label, value) in enumerate(chunk):
-                        label_text = f"{icon} {label}" if icon else label
+                        label_text = f"{_icon_pad(icon)}{label}" if icon else label
                         fr.append((label_style, _pad_display(label_text, left_width)))
                         fr.append((value_style, _pad_display(value, value_width)))
                         if col_idx == 0 and len(chunk) > 1:
@@ -4652,7 +4659,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             overview_rows = [
                 ('👤', 'User', cfg.user),
                 ('📝', 'Tasks', f"{total} • Done {done_ct}"),
-                ('⏱', 'Now', _fmt_mmss(now_s)),
+                ('🕒', 'Now', _fmt_mmss(now_s)),
                 ('🧩', 'Task', _fmt_hm(task_s)),
                 ('📦', 'Project', _fmt_hm(proj_s)),
                 ('⚡', 'Active', str(active_count)),
@@ -4660,11 +4667,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_two_column(overview_rows)
 
             filter_rows = [
-                ('🔎', 'Search', active_search_val),
+                ('🔍', 'Search', active_search_val),
                 ('📁', 'Project', project_cycle or 'All'),
-                ('☑️', 'Done', 'Hide' if hide_done else 'Show'),
-                ('🚫', 'No-Date', 'Hide' if hide_no_date else 'Show'),
-                ('↕', 'Sort', sort_presets[sort_index]['name']),
+                ('☑', 'Done', 'Hide' if hide_done else 'Show'),
+                ('⛔', 'No-Date', 'Hide' if hide_no_date else 'Show'),
+                ('⇅', 'Sort', sort_presets[sort_index]['name']),
             ]
             if date_max:
                 filter_rows.insert(2, ('📅', 'Date Max', date_max))
@@ -4705,7 +4712,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         overview_rows = [
             ('👤', 'User', cfg.user),
             ('📝', 'Tasks', f"{total} • Done {done_ct}"),
-            ('⏱', 'Now', _fmt_mmss(now_s)),
+            ('🕒', 'Now', _fmt_mmss(now_s)),
             ('🧩', 'Task', _fmt_hm(task_s)),
             ('📦', 'Project', _fmt_hm(proj_s)),
             ('⚡', 'Active', str(active_count)),
@@ -4714,11 +4721,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         add_heading('Filters', leading_blank=True)
         filter_rows = [
-            ('🔎', 'Search', active_search_val),
+            ('🔍', 'Search', active_search_val),
             ('📁', 'Project', project_cycle or 'All'),
-            ('☑️', 'Done', 'Hide' if hide_done else 'Show'),
-            ('🚫', 'No-Date', 'Hide' if hide_no_date else 'Show'),
-            ('↕', 'Sort', sort_presets[sort_index]['name']),
+            ('☑', 'Done', 'Hide' if hide_done else 'Show'),
+            ('⛔', 'No-Date', 'Hide' if hide_no_date else 'Show'),
+            ('⇅', 'Sort', sort_presets[sort_index]['name']),
         ]
         if date_max:
             filter_rows.insert(2, ('📅', 'Date Max', date_max))
