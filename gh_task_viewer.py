@@ -50,7 +50,7 @@ import json
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Iterable, Set
 
 import requests
@@ -145,6 +145,7 @@ class ThemePreset:
     name: str
     style: Dict[str, str]
     layout: str = "vertical"
+    layout_options: Dict[str, object] = field(default_factory=dict)
     description: Optional[str] = None
 
 
@@ -206,16 +207,26 @@ def _load_theme_presets(theme_dir: Path) -> List[ThemePreset]:
             continue
         raw_name = str(data.get("name") or path.stem).strip()
         name = raw_name or path.stem
-        layout = str(data.get("layout") or DEFAULT_THEME_LAYOUT).strip().lower()
-        if layout not in {"vertical", "horizontal"}:
-            layout = DEFAULT_THEME_LAYOUT
+        layout_options: Dict[str, object] = {}
+        layout_data = data.get("layout")
+        if isinstance(layout_data, dict):
+            raw_orientation = str(layout_data.get("orientation") or DEFAULT_THEME_LAYOUT).strip().lower()
+            if raw_orientation in {"vertical", "horizontal"}:
+                layout = raw_orientation
+            else:
+                layout = DEFAULT_THEME_LAYOUT
+            layout_options = {k: v for k, v in layout_data.items() if k != "orientation"}
+        else:
+            layout = str(layout_data or DEFAULT_THEME_LAYOUT).strip().lower()
+            if layout not in {"vertical", "horizontal"}:
+                layout = DEFAULT_THEME_LAYOUT
         overrides = data.get("style") if isinstance(data.get("style"), dict) else {}
         style_dict = dict(BASE_THEME_STYLE)
         if isinstance(overrides, dict):
             for key, value in overrides.items():
                 if isinstance(key, str) and isinstance(value, str):
                     style_dict[key] = value
-        preset = ThemePreset(name=name, style=style_dict, layout=layout, description=data.get("description"))
+        preset = ThemePreset(name=name, style=style_dict, layout=layout, layout_options=layout_options, description=data.get("description"))
         lowered = name.lower()
         if lowered == "default":
             presets[0] = preset
@@ -2803,6 +2814,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         theme_presets = [ThemePreset(name="Default", style=dict(BASE_THEME_STYLE), layout=DEFAULT_THEME_LAYOUT)]
     current_theme_index = 0
     current_layout_name = theme_presets[current_theme_index].layout or DEFAULT_THEME_LAYOUT
+    current_layout_options: Dict[str, object] = dict(theme_presets[current_theme_index].layout_options or {})
     style = Style.from_dict(theme_presets[current_theme_index].style)
     # Inline search buffer (used when in_search == True)
 
@@ -2869,6 +2881,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     if 0 <= saved_theme_idx < len(theme_presets):
         current_theme_index = saved_theme_idx
         current_layout_name = theme_presets[current_theme_index].layout or DEFAULT_THEME_LAYOUT
+        current_layout_options = dict(theme_presets[current_theme_index].layout_options or {})
         style = Style.from_dict(theme_presets[current_theme_index].style)
     show_today_only = bool(_st.get('show_today_only', show_today_only))
     hide_done = bool(_st.get('hide_done', hide_done))
@@ -2899,6 +2912,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if key is None:
             return ''
         return f"class:{key}"
+
+    def _layout_int(name: str, default: int) -> int:
+        value = current_layout_options.get(name) if isinstance(current_layout_options, dict) else None
+        try:
+            if value is None:
+                raise ValueError
+            val_int = int(value)
+        except Exception:
+            return default
+        return max(1, val_int)
 
     def load_all():
         return db.load(today_only=show_today_only, today=today_date.isoformat())
@@ -4677,8 +4700,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _build_stats_window(layout_name: str) -> Window:
         panel_style = _style_class('summary.panel') or ''
         if layout_name == 'horizontal':
-            return Window(content=stats_control, wrap_lines=False, always_hide_cursor=True, style=panel_style)
-        return Window(width=32, content=stats_control, wrap_lines=False, always_hide_cursor=True, style=panel_style)
+            stats_height = _layout_int('stats_height', 12)
+            return Window(height=Dimension(preferred=stats_height), content=stats_control, wrap_lines=False, always_hide_cursor=True, style=panel_style)
+        stats_width = _layout_int('stats_width', 32)
+        return Window(width=stats_width, content=stats_control, wrap_lines=False, always_hide_cursor=True, style=panel_style)
 
     detail_control = FormattedTextControl(text=lambda: build_detail_text())
     detail_window = Window(width=80, height=20, content=detail_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
@@ -5664,7 +5689,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             app.invalidate()
 
     def apply_theme(index: int, announce: bool = True) -> None:
-        nonlocal current_theme_index, current_layout_name, style, status_line
+        nonlocal current_theme_index, current_layout_name, current_layout_options, style, status_line
         if not (0 <= index < len(theme_presets)):
             return
         if index == current_theme_index and not announce:
@@ -5672,6 +5697,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_theme_index = index
         preset = theme_presets[index]
         current_layout_name = preset.layout or DEFAULT_THEME_LAYOUT
+        current_layout_options = dict(preset.layout_options or {})
         _refresh_root_body()
         style = Style.from_dict(preset.style)
         if app is not None:
