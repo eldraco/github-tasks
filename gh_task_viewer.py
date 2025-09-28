@@ -4729,31 +4729,25 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
             def add_detail_columns(detail: Dict[str, object], url: str) -> None:
                 add_heading_bar('Task List / Comments')
+                detail_width = _layout_int('stats_detail_width', left_width + value_width * 2)
+                wrap_width = _layout_int('stats_comment_wrap', detail_width - 2)
+
+                def add_detail_line(text: str, style: str = label_style) -> None:
+                    fr.append((style, _pad_display(text, detail_width)))
+                    fr.append(('', '\n'))
+
                 if not url or not _parse_issue_url(url):
-                    fr.append((label_style, _pad_display('Select an issue to view details', left_width + value_width)))
-                    fr.append(("", gap))
-                    fr.append((value_style, _pad_display('', left_width + value_width)))
-                    fr.append(("", "\n"))
+                    add_detail_line('Select an issue to view details')
                     return
                 if not token:
-                    fr.append((label_style, _pad_display('Set GITHUB_TOKEN to load details', left_width + value_width)))
-                    fr.append(("", gap))
-                    fr.append((value_style, _pad_display('', left_width + value_width)))
-                    fr.append(("", "\n"))
+                    add_detail_line('Set GITHUB_TOKEN to load details')
                     return
                 if detail.get('loading'):
-                    fr.append((label_style, _pad_display('Loading issue details…', left_width + value_width)))
-                    fr.append(("", gap))
-                    fr.append((value_style, _pad_display('', left_width + value_width)))
-                    fr.append(("", "\n"))
+                    add_detail_line('Loading issue details…')
                     return
                 error_text = detail.get('error')
                 if error_text:
-                    err_msg = _truncate(f"Error: {error_text}", left_width + value_width)
-                    fr.append((label_style, _pad_display(err_msg, left_width + value_width)))
-                    fr.append(("", gap))
-                    fr.append((value_style, _pad_display('', left_width + value_width)))
-                    fr.append(("", "\n"))
+                    add_detail_line(_truncate(f"Error: {error_text}", detail_width))
                     return
                 tasks = detail.get('tasks') or []
                 comments = detail.get('comments') or []
@@ -4764,55 +4758,49 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if comment_limit > 0:
                     comments = comments[:comment_limit]
                 if not tasks and not comments:
-                    fr.append((label_style, _pad_display('No subtasks or comments', left_width + value_width)))
-                    fr.append(("", gap))
-                    fr.append((value_style, _pad_display('', left_width + value_width)))
-                    fr.append(("", "\n"))
+                    add_detail_line('No subtasks or comments')
                     return
-                detail_width = _layout_int('stats_detail_width', left_width + value_width * 2)
-                task_trunc_width = max(1, detail_width - 3)
-                comment_trunc_width = max(1, detail_width - 2)
-                max_rows = max(len(tasks), len(comments))
-                for idx in range(max_rows):
-                    if idx < len(tasks):
-                        task_entry = tasks[idx]
+
+                if tasks:
+                    for task_entry in tasks:
                         icon = '✅' if task_entry.get('done') else '⬜'
                         text = (task_entry.get('text') or '').replace('\n', ' ')
-                        left_text = f"{icon} {_truncate(text, task_trunc_width)}"
-                    else:
-                        left_text = ''
-                    fr.append((label_style, _pad_display(left_text, detail_width)))
-                    fr.append(("", gap))
-                    if idx < len(comments):
-                        comment_entry = comments[idx]
-                        author = (comment_entry.get('author') or '').strip() or 'anon'
-                        body = (comment_entry.get('body') or '').replace('\n', ' ')
-                comment_text = f"💬 {author}: {body}" if body else f"💬 {author}"
-                wrap_width = _layout_int('stats_comment_wrap', comment_trunc_width)
-                if wrap_width <= comment_trunc_width:
-                    comment_text = _truncate(comment_text, comment_trunc_width)
-                    fr.append((value_style, _pad_display(comment_text, detail_width)))
-                else:
-                    words = comment_text.split()
-                    line = []
-                    line_len = 0
-                    remaining = detail_width
-                    for word in words:
-                        wlen = len(word) + (1 if line else 0)
-                        if line_len + wlen > wrap_width:
-                            fr.append((value_style, _pad_display(' '.join(line), detail_width)))
-                            fr.append(("", gap))
-                            remaining -= detail_width + len(gap)
-                            line = [word]
-                            line_len = len(word)
+                        add_detail_line(_truncate(f"{icon} {text}", detail_width))
+                    if comments:
+                        add_detail_line('')
+
+                def wrap_comment(text: str) -> List[str]:
+                    limit = max(1, wrap_width)
+                    words = text.split()
+                    if not words:
+                        return [text]
+                    lines: List[str] = []
+                    current = words[0]
+                    for word in words[1:]:
+                        candidate = f"{current} {word}"
+                        if len(candidate) > limit and current:
+                            lines.append(current)
+                            current = word
                         else:
-                            line.append(word)
-                            line_len += wlen
-                    if line:
-                        fr.append((value_style, _pad_display(' '.join(line), detail_width)))
+                            current = candidate
+                    if current:
+                        lines.append(current)
+                    return lines
+
+                for idx_comment, comment_entry in enumerate(comments):
+                    author = (comment_entry.get('author') or '').strip() or 'anon'
+                    body = (comment_entry.get('body') or '').replace('\n', ' ')
+                    base = f"💬 {author}"
+                    comment_text = f"{base}: {body}" if body else base
+                    if wrap_width > detail_width:
+                        lines = wrap_comment(comment_text)
+                        for line_text in lines:
+                            add_detail_line(_truncate(line_text, detail_width), value_style)
                     else:
-                        fr.append((value_style, _pad_display('', detail_width)))
-                    fr.append(("", "\n"))
+                        effective_width = max(1, wrap_width)
+                        add_detail_line(_truncate(comment_text, effective_width), value_style)
+                    if idx_comment < len(comments) - 1:
+                        add_detail_line('', value_style)
 
             add_heading_bar('Overview', first=True)
             overview_rows = [
