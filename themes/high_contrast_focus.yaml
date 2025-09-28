@@ -1,5 +1,7 @@
 name: High-Contrast Focus
-layout: vertical
+layout:
+  orientation: vertical
+  stats_width: 36
 description: High-contrast dark theme optimized for focus and accessibility.
 style:
   editor.frame: 'bg:#1a1a1a #f2f2f2'

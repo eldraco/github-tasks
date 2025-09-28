@@ -1,5 +1,7 @@
 name: Solarized Light
-layout: horizontal
+layout:
+  orientation: horizontal
+  stats_height: 14
 description: Light solarized palette with stats stacked below the table.
 style:
   editor.frame: 'bg:#fdf6e3 #073642'
