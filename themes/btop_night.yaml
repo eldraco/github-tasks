@@ -1,7 +1,14 @@
 name: Btop Night
 layout:
   orientation: horizontal
-  stats_height: 16
+  stats_height: 24
+  stats_label_width: 22
+  stats_value_width: 14
+  stats_bar_width: 26
+  stats_task_limit: 6
+  stats_comment_limit: 5
+  stats_detail_width: 200
+  stats_comment_wrap: 200
 description: Inspired by btop's night mode with neon highlights and purple framing.
 style:
   editor.frame: 'bg:#05050a #d7d7ff'
