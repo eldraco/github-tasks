@@ -77,12 +77,26 @@ def _install_prompt_toolkit_stub() -> None:
     pt.key_binding = key_binding
 
     layout = types.ModuleType('prompt_toolkit.layout')
+
     class DummyLayout(Dummy):
         pass
-    layout.HSplit = _callable_stub
-    layout.VSplit = _callable_stub
+
+    class DummyWindow(Dummy):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.args = args
+            self.kwargs = kwargs
+
+    class DummySplit(Dummy):
+        def __init__(self, children=None, **kwargs):
+            super().__init__(children, **kwargs)
+            self.children = list(children or [])
+            self.kwargs = kwargs
+
+    layout.HSplit = DummySplit
+    layout.VSplit = DummySplit
     layout.Layout = DummyLayout
-    layout.Window = _callable_stub
+    layout.Window = DummyWindow
     sys.modules['prompt_toolkit.layout'] = layout
 
     layout_controls = types.ModuleType('prompt_toolkit.layout.controls')
@@ -95,8 +109,22 @@ def _install_prompt_toolkit_stub() -> None:
     sys.modules['prompt_toolkit.layout.controls'] = layout_controls
 
     layout_containers = types.ModuleType('prompt_toolkit.layout.containers')
-    layout_containers.FloatContainer = _callable_stub
-    layout_containers.Float = _callable_stub
+
+    class DummyFloat(Dummy):
+        def __init__(self, content=None, **kwargs):
+            super().__init__(content, **kwargs)
+            self.content = content
+            self.kwargs = kwargs
+
+    class DummyFloatContainer(Dummy):
+        def __init__(self, content=None, floats=None, **kwargs):
+            super().__init__(content, floats, **kwargs)
+            self.content = content
+            self.floats = list(floats or [])
+            self.kwargs = kwargs
+
+    layout_containers.FloatContainer = DummyFloatContainer
+    layout_containers.Float = DummyFloat
     sys.modules['prompt_toolkit.layout.containers'] = layout_containers
 
     layout_dimension = types.ModuleType('prompt_toolkit.layout.dimension')

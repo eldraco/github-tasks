@@ -1,7 +1,5 @@
 import datetime as dt
 
-import pytest
-
 import gh_task_viewer as ght
 
 

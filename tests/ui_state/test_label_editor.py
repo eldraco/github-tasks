@@ -1,5 +1,4 @@
 import asyncio
-from types import SimpleNamespace
 
 import gh_task_viewer as ght
 import prompt_toolkit

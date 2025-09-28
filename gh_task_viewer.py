@@ -41,6 +41,7 @@ import asyncio
 import calendar
 import datetime as dt
 import os
+from pathlib import Path
 import re
 import sqlite3
 import sys
@@ -49,7 +50,7 @@ import json
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Iterable, Set
 
 import requests
@@ -132,6 +133,109 @@ def load_config(path: str) -> Config:
         else:
             raise ValueError(f"Project entry needs 'org' or 'user': {item}")
     return Config(user=user, date_field_regex=dfr, projects=prjs, iteration_field_regex=ifr)
+
+
+# -----------------------------
+# Themes
+# -----------------------------
+
+
+@dataclass
+class ThemePreset:
+    name: str
+    style: Dict[str, str]
+    layout: str = "vertical"
+    layout_options: Dict[str, object] = field(default_factory=dict)
+    description: Optional[str] = None
+
+
+BASE_THEME_STYLE: Dict[str, str] = {
+    'editor.frame': 'bg:#1c1c1c #f0f0f0',
+    'editor.frame.border': '#5f5f5f',
+    'editor.frame.title': 'bold #ffd75f',
+    'editor.body': 'bg:#1c1c1c #f0f0f0',
+    'editor.header': 'bold #ffd75f',
+    'editor.meta': '#87d7ff',
+    'editor.text': '#f0f0f0',
+    'editor.field': '#d7d7d7',
+    'editor.field.cursor': 'bold #ffffff bg:#444444',
+    'editor.instructions': '#5fd7af',
+    'editor.priority': '#f0f0f0',
+    'editor.priority.cursor': 'bold #ffffff bg:#875f00',
+    'editor.label': '#d0d0d0',
+    'editor.label.selected': 'bold #87ff5f',
+    'editor.label.cursor': 'reverse #ffffaf',
+    'editor.label.cursor.selected': 'reverse bold #ffffff',
+    'editor.message': '#ffd787',
+    'editor.warning': 'bold #ff8787',
+    'editor.calendar': '#87afff',
+    'editor.entry': '#ffffff bg:#303030',
+    'table.header': 'bold #ffd75f',
+    'table.status.todo': '#87d7ff',
+    'table.status.in_progress': '#ffd75f',
+    'table.status.done': '#87ff5f',
+    'table.status.blocked': '#ff8787',
+    'table.status.other': '#d0d0d0',
+    'table.date.today': 'ansired bold',
+    'table.date.past': 'ansiyellow',
+    'table.date.future': 'ansigreen',
+    'table.date.unknown': 'ansigray',
+    'summary.panel': 'bg:#1c1c1c #f0f0f0',
+    'summary.title': 'bold #ffd75f',
+    'summary.label': '#ffd787',
+    'summary.value': '#f0f0f0',
+    'summary.accent': '#87d7ff',
+}
+
+DEFAULT_THEME_LAYOUT = "vertical"
+SHIFTED_DIGIT_KEYS = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')']
+
+
+def _load_theme_presets(theme_dir: Path) -> List[ThemePreset]:
+    presets: List[ThemePreset] = [ThemePreset(name="Default", style=dict(BASE_THEME_STYLE), layout=DEFAULT_THEME_LAYOUT)]
+    seen = {presets[0].name.lower()}
+    if not theme_dir.is_dir():
+        return presets
+    candidates = sorted(theme_dir.glob("*.yml")) + sorted(theme_dir.glob("*.yaml"))
+    for path in candidates:
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            logging.getLogger('gh_task_viewer').warning("Failed to load theme file %s", path, exc_info=True)
+            continue
+        if not isinstance(data, dict):
+            continue
+        raw_name = str(data.get("name") or path.stem).strip()
+        name = raw_name or path.stem
+        layout_options: Dict[str, object] = {}
+        layout_data = data.get("layout")
+        if isinstance(layout_data, dict):
+            raw_orientation = str(layout_data.get("orientation") or DEFAULT_THEME_LAYOUT).strip().lower()
+            if raw_orientation in {"vertical", "horizontal"}:
+                layout = raw_orientation
+            else:
+                layout = DEFAULT_THEME_LAYOUT
+            layout_options = {k: v for k, v in layout_data.items() if k != "orientation"}
+        else:
+            layout = str(layout_data or DEFAULT_THEME_LAYOUT).strip().lower()
+            if layout not in {"vertical", "horizontal"}:
+                layout = DEFAULT_THEME_LAYOUT
+        overrides = data.get("style") if isinstance(data.get("style"), dict) else {}
+        style_dict = dict(BASE_THEME_STYLE)
+        if isinstance(overrides, dict):
+            for key, value in overrides.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    style_dict[key] = value
+        preset = ThemePreset(name=name, style=style_dict, layout=layout, layout_options=layout_options, description=data.get("description"))
+        lowered = name.lower()
+        if lowered == "default":
+            presets[0] = preset
+            continue
+        if lowered in seen:
+            continue
+        presets.append(preset)
+        seen.add(lowered)
+    return presets
 
 
 # -----------------------------
@@ -2263,7 +2367,6 @@ def fetch_tasks_github(
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldSingleSelectValue":
                         field_data = fv.get("field") or {}
                         raw_name = field_data.get("name") or ""
-                        fname_sel = raw_name.strip().lower()
                         option_id_val = fv.get("optionId") or ""
                         options_raw = field_data.get("options") or []
                         is_status_field = _looks_like_status_field(raw_name)
@@ -2520,15 +2623,25 @@ def fetch_tasks_github(
 # -----------------------------
 # UI helpers (fragments only)
 # -----------------------------
-def color_for_date(d: str, today: dt.date) -> str:
+def color_for_date(d: Optional[str], today: dt.date, palette: Optional[Dict[str, str]] = None) -> str:
     try:
-        dd = dt.date.fromisoformat(d)
+        dd = dt.date.fromisoformat(d) if d else None
     except Exception:
+        dd = None
+    if dd is None:
+        if palette:
+            return palette.get('unknown', 'ansigray')
         return "ansigray"
     if dd == today:
+        if palette:
+            return palette.get('today', 'ansired bold')
         return "ansired bold"
     if dd < today:
+        if palette:
+            return palette.get('past', 'ansiyellow')
         return "ansiyellow"
+    if palette:
+        return palette.get('future', 'ansigreen')
     return "ansigreen"
 
 def _char_width(ch: str) -> int:
@@ -2612,7 +2725,7 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         return [("bold", "Nothing to show."), ("", " Press "), ("bold", "u"), ("", " to fetch.")]
 
     current: Optional[str] = None
-    header = "Focus Day   Start Date   STATUS   PRIORITY   TITLE                                     REPO                 URL"
+    header = "Focus Day   Start Date   Status   Priority   Title                                     Repo                 URL"
     for t in tasks:
         if t.project_title != current:
             current = t.project_title
@@ -2688,11 +2801,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     session_float: Optional[Float] = None
     update_in_progress = False
     task_duration_cache: Dict[str, Dict[str, int]] = {}
-    SUMMARY_CACHE_TTL = 5.0  # seconds; avoid recomputing heavy aggregates on every repaint
+    summary_cache_ttl = 5.0  # seconds; avoid recomputing heavy aggregates on every repaint
     summary_cache: Dict[str, Dict[str, object]] = {
         'project': {'ts': 0.0, 'data': {}, 'tops': []},
         'label': {'ts': 0.0, 'data': {}, 'tops': []},
     }
+
+    theme_dir = Path(__file__).resolve().parent / "themes"
+    theme_presets = _load_theme_presets(theme_dir)
+    if not theme_presets:
+        theme_presets = [ThemePreset(name="Default", style=dict(BASE_THEME_STYLE), layout=DEFAULT_THEME_LAYOUT)]
+    current_theme_index = 0
+    current_layout_name = theme_presets[current_theme_index].layout or DEFAULT_THEME_LAYOUT
+    current_layout_options: Dict[str, object] = dict(theme_presets[current_theme_index].layout_options or {})
+    style = Style.from_dict(theme_presets[current_theme_index].style)
     # Inline search buffer (used when in_search == True)
 
     if state_path is None:
@@ -2741,6 +2863,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'current_index': current_index,
             'v_offset': v_offset,
             'h_offset': h_offset,
+            'theme_index': current_theme_index,
         }
         try:
             d = os.path.dirname(state_path)
@@ -2753,6 +2876,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     # apply any saved UI state before loading rows
     _st = _load_state()
+    saved_theme_idx = int(_st.get('theme_index', current_theme_index) or current_theme_index)
+    if 0 <= saved_theme_idx < len(theme_presets):
+        current_theme_index = saved_theme_idx
+        current_layout_name = theme_presets[current_theme_index].layout or DEFAULT_THEME_LAYOUT
+        current_layout_options = dict(theme_presets[current_theme_index].layout_options or {})
+        style = Style.from_dict(theme_presets[current_theme_index].style)
     show_today_only = bool(_st.get('show_today_only', show_today_only))
     hide_done = bool(_st.get('hide_done', hide_done))
     hide_no_date = bool(_st.get('hide_no_date', hide_no_date))
@@ -2766,6 +2895,32 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     current_index = int(_st.get('current_index', current_index) or 0)
     v_offset = int(_st.get('v_offset', v_offset) or 0)
     h_offset = int(_st.get('h_offset', h_offset) or 0)
+
+    def _style_value(name: str, default: str = '') -> str:
+        style_map = theme_presets[current_theme_index].style
+        if name in style_map:
+            return style_map[name]
+        if name in BASE_THEME_STYLE:
+            return BASE_THEME_STYLE[name]
+        return default
+
+    def _style_class(name: str, fallback: Optional[str] = None) -> str:
+        key = name if name in theme_presets[current_theme_index].style else fallback
+        if key is None and name in BASE_THEME_STYLE:
+            key = name
+        if key is None:
+            return ''
+        return f"class:{key}"
+
+    def _layout_int(name: str, default: int) -> int:
+        value = current_layout_options.get(name) if isinstance(current_layout_options, dict) else None
+        try:
+            if value is None:
+                raise ValueError
+            val_int = int(value)
+        except Exception:
+            return default
+        return max(1, val_int)
 
     def load_all():
         return db.load(today_only=show_today_only, today=today_date.isoformat())
@@ -3278,7 +3433,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         content = boxed(title_head, body, width=92)
         return [("", content)]
 
-    STATUS_KEYWORDS: Dict[str, List[str]] = {
+    status_keywords: Dict[str, List[str]] = {
         'done': ["done", "complete", "completed", "finished", "closed", "resolved", "merged", "✅", "✔"],
         'in_progress': ["in progress", "progress", "doing", "active", "working"]
     }
@@ -3304,7 +3459,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def _match_status_option(row: TaskRow, target: str) -> Tuple[str, str]:
         options = _status_options_map(row)
-        keywords = STATUS_KEYWORDS.get(target, [])
+        keywords = status_keywords.get(target, [])
         for kw in keywords:
             opt = options.get(kw.lower())
             if opt:
@@ -3316,7 +3471,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def _is_done_name(name: str) -> int:
         low = (name or "").lower()
-        return int(any(kw in low for kw in STATUS_KEYWORDS['done']))
+        return int(any(kw in low for kw in status_keywords['done']))
 
     async def _apply_status_change(target: str):
         nonlocal all_rows, status_line, current_index
@@ -4148,12 +4303,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     title_w += deficit  # best-effort rebalance
             header = (
                 "  " + _pad_display("Iteration", iter_w) +
-                "  " + _pad_display("STATUS", 10) +
-                "  " + _pad_display("PRIORITY", priority_w) +
-                "  " + _pad_display("TIME", time_w, align='right') +
-                "  " + _pad_display("TITLE", title_w) +
-                "  " + _pad_display("LABELS", label_w) +
-                "  " + _pad_display("PROJECT", proj_w)
+                "  " + _pad_display("Status", 10) +
+                "  " + _pad_display("Priority", priority_w) +
+                "  " + _pad_display("Time", time_w, align='right') +
+                "  " + _pad_display("Title", title_w) +
+                "  " + _pad_display("Labels", label_w) +
+                "  " + _pad_display("Project", proj_w)
             )
         else:
             proj_min = 12
@@ -4182,14 +4337,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             header = (
                 "  " + _pad_display("Focus Day", 11) +
                 "  " + _pad_display("Start Date", 12) +
-                "  " + _pad_display("STATUS", 10) +
-                "  " + _pad_display("PRIORITY", priority_w) +
-                "  " + _pad_display("TIME", time_w, align='right') +
-                "  " + _pad_display("TITLE", title_w) +
-                "  " + _pad_display("LABELS", label_w) +
-                "  " + _pad_display("PROJECT", proj_w)
+                "  " + _pad_display("Status", 10) +
+                "  " + _pad_display("Priority", priority_w) +
+                "  " + _pad_display("Time", time_w, align='right') +
+                "  " + _pad_display("Title", title_w) +
+                "  " + _pad_display("Labels", label_w) +
+                "  " + _pad_display("Project", proj_w)
             )
-        frags.append(("bold", header[h_offset:]))
+        frags.append((_style_class('table.header'), header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
             frags.append(("italic", "(no tasks match filters)"))
@@ -4199,19 +4354,81 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         display_slice = rows[v_offset:v_offset+visible_rows]
         duration_urls = [t.url for t in display_slice if t.url]
         task_duration_cache = db.task_duration_snapshot(duration_urls)
+
+        date_palette = {
+            'today': _style_class('table.date.today'),
+            'past': _style_class('table.date.past'),
+            'future': _style_class('table.date.future'),
+            'unknown': _style_class('table.date.unknown'),
+        }
+
+        def status_style_for(name: Optional[str]) -> str:
+            if not name:
+                return _style_class('table.status.other')
+            norm = name.strip().lower()
+            if 'block' in norm or 'hold' in norm or 'stuck' in norm:
+                return _style_class('table.status.blocked')
+            if 'progress' in norm or 'doing' in norm or 'active' in norm or 'working' in norm:
+                return _style_class('table.status.in_progress')
+            if 'done' in norm or 'complete' in norm or 'closed' in norm or 'shipped' in norm:
+                return _style_class('table.status.done')
+            if 'todo' in norm or 'backlog' in norm or 'ready' in norm or 'plan' in norm:
+                return _style_class('table.status.todo')
+            return _style_class('table.status.other')
+
+        def trim_segments(segments: List[Tuple[str, str]], offset: int) -> List[Tuple[str, str]]:
+            if offset <= 0:
+                return segments
+            remaining = offset
+            trimmed: List[Tuple[str, str]] = []
+            for style_txt, text in segments:
+                if not text:
+                    continue
+                if remaining >= len(text):
+                    remaining -= len(text)
+                    continue
+                if remaining > 0:
+                    trimmed.append((style_txt, text[remaining:]))
+                    remaining = 0
+                else:
+                    trimmed.append((style_txt, text))
+            return trimmed
+
+        def highlight_segments(segments: List[Tuple[str, str]], needle: str) -> List[Tuple[str, str]]:
+            if not needle:
+                return segments
+            result: List[Tuple[str, str]] = []
+            needle_lower = needle.lower()
+            for style_txt, text in segments:
+                if not text:
+                    continue
+                lower_text = text.lower()
+                if needle_lower not in lower_text:
+                    result.append((style_txt, text))
+                    continue
+                start = 0
+                n_len = len(needle)
+                while True:
+                    idx = lower_text.find(needle_lower, start)
+                    if idx == -1:
+                        if start < len(text):
+                            result.append((style_txt, text[start:]))
+                        break
+                    if idx > start:
+                        result.append((style_txt, text[start:idx]))
+                    highlight_style = (style_txt + ' underline').strip() if style_txt else 'underline'
+                    result.append((highlight_style, text[idx:idx+n_len]))
+                    start = idx + n_len
+            return result
+
         for rel_idx, t in enumerate(display_slice):
             idx = v_offset + rel_idx
             is_sel = (idx == current_index)
             style_row = "reverse" if is_sel else ""
-            col = color_for_date(t.focus_date, today)
+            col = color_for_date(t.focus_date, today, date_palette)
             running = bool(t.url and (t.url in active_urls))
-            # For running tasks, override foreground color to cyan (plus bold)
-            if is_sel:
-                base_style = col + " bold"
-            elif running:
-                base_style = "ansicyan bold"
-            else:
-                base_style = col
+            # Base style follows date palette; running tasks accent key columns.
+            base_style = col
             marker = '⏱ ' if running else '  '
             # Time column: current run (mm:ss) and total (H:MM)
             snapshot = task_duration_cache.get(t.url) if t.url else None
@@ -4234,37 +4451,60 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             labels_text = ", ".join(labels_list)
             priority_display = (t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else '')
             priority_cell = _pad_display(priority_display, priority_w)
+            status_style = status_style_for(t.status)
+            running_style = 'ansicyan bold' if running else None
+
+            segments: List[Tuple[str, str]] = []
+
+            def add_segment(text: str, seg_style: Optional[str] = None) -> None:
+                if not text:
+                    return
+                if is_sel:
+                    segments.append((style_row, text))
+                    return
+                style_token = seg_style if seg_style is not None else base_style
+                segments.append((style_token.strip(), text))
+
+            def add_column(text: str, seg_style: Optional[str] = None) -> None:
+                add_segment('  ', running_style if running_style and seg_style is None and not is_sel else (base_style if not is_sel else style_row))
+                add_segment(text, seg_style)
+
+            marker_style = running_style if running_style else base_style
+
+            add_segment(marker, marker_style)
             if use_iteration:
                 iter_label = t.iteration_title or t.iteration_start or '-'
                 if t.iteration_title and t.iteration_start:
                     iter_label = f"{t.iteration_title} ({t.iteration_start})"
                 iteration_cell = _pad_display(iter_label or '-', iter_w)
                 labels_cell = _pad_display(labels_text or '-', label_w)
-                line = f"{marker}{iteration_cell}  {status_cell}  {priority_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
+                add_segment(iteration_cell, base_style)
+                add_column(status_cell, status_style)
+                add_column(priority_cell)
+                add_column(time_cell, running_style if running_style else base_style)
+                add_column(title_cell)
+                add_column(labels_cell)
+                add_column(project_cell)
             else:
                 focus_cell = _pad_display(t.focus_date or '-', 11)
                 start_cell = _pad_display(t.start_date, 12)
                 labels_cell = _pad_display(labels_text or '-', label_w)
-                line = f"{marker}{focus_cell}  {start_cell}  {status_cell}  {priority_cell}  {time_cell}  {title_cell}  {labels_cell}  {project_cell}"
-            line = line[h_offset:]
-            # highlight search term occurrences (live search buffer if active)
+                add_segment(focus_cell, base_style)
+                add_column(start_cell)
+                add_column(status_cell, status_style)
+                add_column(priority_cell)
+                add_column(time_cell, running_style if running_style else base_style)
+                add_column(title_cell)
+                add_column(labels_cell)
+                add_column(project_cell)
+
+            segments = trim_segments(segments, h_offset)
             active_search = search_buffer if in_search else search_term
             if active_search and not is_sel:
-                low = line.lower()
-                needle = active_search.lower()
-                start = 0
-                while True:
-                    i = low.find(needle, start)
-                    if i == -1:
-                        break
-                    if i>start:
-                        frags.append((base_style, line[start:i]))
-                    frags.append((base_style + ' underline', line[i:i+len(needle)]))
-                    start = i+len(needle)
-                if start < len(line):
-                    frags.append((base_style, line[start:]))
-            else:
-                frags.append((base_style if not is_sel else style_row, line))
+                segments = highlight_segments(segments, active_search)
+
+            for seg_style, seg_text in segments:
+                frags.append((seg_style, seg_text))
             frags.append(("", "\n"))
         if frags and frags[-1][1] == "\n":
             frags.pop()
@@ -4276,10 +4516,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         total = len(rows)
         done_ct = sum(1 for r in rows if r.is_done)
         now_mon = time.monotonic()
+
         def _fmt_hm(ts: int) -> str:
-            s = int(max(0, ts)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
+            s = int(max(0, ts))
+            h, r = divmod(s, 3600)
+            m, _ = divmod(r, 60)
+            return f"{h:d}:{m:02d}"
+
         def _fmt_mmss(ts: int) -> str:
-            s = int(max(0, ts)); m, s = divmod(s, 60); return f"{m:02d}:{s:02d}"
+            s = int(max(0, ts))
+            m, s = divmod(s, 60)
+            return f"{m:02d}:{s:02d}"
+
         # Timer snapshot
         now_s = task_s = proj_s = 0
         active_count = 0
@@ -4301,26 +4549,76 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     task_s = snapshot.get('total', 0)
             if cur.project_title:
                 proj_s = db.project_total_seconds(cur.project_title)
+
         active_search_val = (search_buffer if in_search else search_term) or '-'
-        fr: List[Tuple[str,str]] = []
-        fr += [("bold", "Overview\n")]
-        fr += [("ansicyan", f"👤 {cfg.user}\n")]
-        fr += [("", f"📝 Shown: {total:<3} ✅ {done_ct}\n")]
-        fr += [("", f"⏱ Now: {_fmt_mmss(now_s)}\n")]
-        fr += [("", f"🧩 Task: {_fmt_hm(task_s)}\n")]
-        fr += [("", f"📦 Proj: {_fmt_hm(proj_s)}\n")]
-        fr += [("", f"🟢 Active: {active_count}\n")]
-        fr += [("", "\n")]
-        fr += [("bold", "Filters\n")]
-        fr += [("", f"🔎 {_truncate(active_search_val,22)}\n")]
-        fr += [("", f"📁 {_truncate(project_cycle or 'All',22)}\n")]
+
+        heading_style = _style_class('summary.title')
+        label_style = _style_class('summary.label')
+        value_style = _style_class('summary.value')
+        accent_style = _style_class('summary.accent')
+
+        fr: List[Tuple[str, str]] = []
+
+        is_horizontal_layout = current_layout_name == 'horizontal'
+
+        def add_heading(text: str, *, leading_blank: bool = False) -> None:
+            if leading_blank and fr and not fr[-1][1].endswith("\n\n"):
+                fr.append(("", "\n"))
+            fr.append((heading_style, f"{text}\n"))
+
+        def value_limit(columns: int, requested: Optional[int] = None) -> int:
+            if requested is not None:
+                return requested
+            return 30 if columns > 1 else 24
+
+        def render_rows(entries: List[Tuple[str, str, str]], *, label_width: int, value_cap: Optional[int] = None, label_style_override: Optional[str] = None, value_style_override: Optional[str] = None) -> None:
+            if not entries:
+                return
+            columns = 2 if is_horizontal_layout else 1
+            cap = value_limit(columns, value_cap)
+            col_sep = '   '
+            bucket: List[Tuple[str, str, str]] = []
+
+            for idx, entry in enumerate(entries):
+                bucket.append(entry)
+                if len(bucket) == columns or idx == len(entries) - 1:
+                    for col_idx, (icon, label, value) in enumerate(bucket):
+                        label_text = f"{icon} {label}" if icon else label
+                        label_block = _pad_display(label_text, label_width)
+                        value_block = _truncate(value, cap)
+                        fr.append((label_style_override or label_style, label_block))
+                        fr.append((value_style_override or value_style, f" {value_block}"))
+                        if col_idx < len(bucket) - 1:
+                            fr.append(("", col_sep))
+                    fr.append(("", "\n"))
+                    bucket = []
+
+        add_heading('Overview')
+        overview_rows = [
+            ('👤', 'User', cfg.user),
+            ('📝', 'Tasks', f"{total} • Done {done_ct}"),
+            ('⏲️ ', 'Now', _fmt_mmss(now_s)),
+            ('🧩', 'Task', _fmt_hm(task_s)),
+            ('📦', 'Project', _fmt_hm(proj_s)),
+            ('⚡', 'Active', str(active_count)),
+        ]
+        render_rows(overview_rows, label_width=14 if is_horizontal_layout else 12)
+
+        add_heading('Filters', leading_blank=True)
+        filter_rows = [
+            ('🔎', 'Search', active_search_val),
+            ('📁', 'Project', project_cycle or 'All'),
+            ('☑️', 'Done', 'Hide' if hide_done else 'Show'),
+            ('🚫', 'No-Date', 'Hide' if hide_no_date else 'Show'),
+            ('↕', 'Sort', sort_presets[sort_index]['name']),
+        ]
         if date_max:
-            fr += [("", f"📅 <= {date_max}\n")]
-        fr += [("", f"☑️ Done:{'Hide' if hide_done else 'Off'} NoDate:{'Hide' if hide_no_date else 'Off'}\n")]
-        fr += [("", f"↕ Sort: {_truncate(sort_presets[sort_index]['name'],22)}\n")]
+            filter_rows.insert(2, ('📅', 'Date Max', date_max))
+        render_rows(filter_rows, label_width=14 if is_horizontal_layout else 12, value_cap=36 if is_horizontal_layout else 24)
+
         # Top 5 projects by time (30d)
         proj_cache_entry = summary_cache['project']
-        if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not proj_cache_entry.get('tops'):
+        if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not proj_cache_entry.get('tops'):
             try:
                 proj_data = db.aggregate_project_totals(since_days=30)
             except Exception:
@@ -4331,13 +4629,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             proj_cache_entry['ts'] = now_mon
         project_tops = proj_cache_entry.get('tops', []) or []
         if project_tops:
-            fr += [("", "\n")]
-            fr += [("bold", "Top Proj (30d)\n")]
-            for name, secs in project_tops:
-                fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
+            add_heading('Top Projects (30d)', leading_blank=True)
+            project_rows = [('•', name or '-', _fmt_hm(secs)) for name, secs in project_tops]
+            render_rows(project_rows, label_width=22 if is_horizontal_layout else 18, value_cap=12, label_style_override=accent_style)
 
         label_cache_entry = summary_cache['label']
-        if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not label_cache_entry.get('tops'):
+        if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not label_cache_entry.get('tops'):
             try:
                 label_data = db.aggregate_label_totals(since_days=30)
             except Exception:
@@ -4348,10 +4645,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             label_cache_entry['ts'] = now_mon
         label_tops = label_cache_entry.get('tops', []) or []
         if label_tops:
-            fr += [("", "\n")]
-            fr += [("bold", "Top Labels (30d)\n")]
-            for name, secs in label_tops:
-                fr += [("", f"• {_truncate(name or '-',18):<18} {_fmt_hm(secs):>6}\n")]
+            add_heading('Top Labels (30d)', leading_blank=True)
+            label_rows = [('•', name or '-', _fmt_hm(secs)) for name, secs in label_tops]
+            render_rows(label_rows, label_width=22 if is_horizontal_layout else 18, value_cap=12, label_style_override=accent_style)
+
         if fr and fr[-1][1].endswith("\n"):
             fr[-1] = (fr[-1][0], fr[-1][1][:-1])
         return fr
@@ -4398,7 +4695,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     top_status_control = FormattedTextControl(text=lambda: build_top_status())
     top_status_window = Window(height=1, content=top_status_control)
     stats_control = FormattedTextControl(text=lambda: summarize())
-    stats_window = Window(width=32, content=stats_control, wrap_lines=False, always_hide_cursor=True)
+
+    def _build_stats_window(layout_name: str) -> Window:
+        panel_style = _style_class('summary.panel') or ''
+        if layout_name == 'horizontal':
+            stats_height = _layout_int('stats_height', 12)
+            return Window(height=Dimension(preferred=stats_height), content=stats_control, wrap_lines=False, always_hide_cursor=True, style=panel_style)
+        stats_width = _layout_int('stats_width', 32)
+        return Window(width=stats_width, content=stats_control, wrap_lines=False, always_hide_cursor=True, style=panel_style)
 
     detail_control = FormattedTextControl(text=lambda: build_detail_text())
     detail_window = Window(width=80, height=20, content=detail_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
@@ -4799,36 +5103,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_line("No editable fields", 'class:editor.warning')
         else:
             add_blank()
-            for idx, field in enumerate(fields):
+            for idx, field_info in enumerate(fields):
                 marker = '➤' if idx == cursor else ' '
-                ftype = field.get('type')
+                ftype = field_info.get('type')
                 if ftype == 'priority':
-                    opts = field.get('options') or []
-                    index = max(0, min(field.get('index', 0), len(opts)-1)) if opts else 0
+                    opts = field_info.get('options') or []
+                    index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
                     value = opts[index].get('name') if opts else '(no options)'
                     if opts and row and getattr(row, 'priority_dirty', 0):
                         value = (value or '-') + '*'
                 elif ftype == 'assignees':
-                    vals = field.get('value') or []
+                    vals = field_info.get('value') or []
                     if isinstance(vals, list):
                         value = ', '.join(vals) or '-'
                     else:
                         value = str(vals) or '-'
                 elif ftype == 'labels':
-                    vals = field.get('value') or []
+                    vals = field_info.get('value') or []
                     if isinstance(vals, list):
                         value = ', '.join(vals) or '-'
                     else:
                         value = str(vals) or '-'
                 elif ftype == 'priority-text':
-                    value = field.get('value') or '-'
+                    value = field_info.get('value') or '-'
                 elif ftype == 'comment':
                     value = '(add comment)'
                 else:
-                    value = field.get('value', '')
+                    value = field_info.get('value', '')
                 value = value or '-'
                 style = 'class:editor.field.cursor' if idx == cursor else 'class:editor.field'
-                add_line(f" {marker} {field.get('name')} : {value}", style)
+                add_line(f" {marker} {field_info.get('name')} : {value}", style)
 
         if mode == 'edit-date-calendar' and fields:
             editing = task_edit_state.get('editing') or {}
@@ -5131,7 +5435,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             s = int(max(0, s)); m, s = divmod(s, 60); return f"{m:02d}:{s:02d}"
         def _hm(s:int)->str:
             s = int(max(0, s)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
-        base = f" {mode}  ⏱ {_mmss(now_s)}  🧩 {_hm(task_s)}  📦 {_hm(proj_s)}  🟢 {active_count} "
+        theme_label = theme_presets[current_theme_index].name if theme_presets else 'Default'
+        base = f" {mode}  ⏱ {_mmss(now_s)}  🧩 {_hm(task_s)}  📦 {_hm(proj_s)}  🟢 {active_count}  🎨 {theme_label}"
         if status_line:
             base += "  " + status_line
         return base
@@ -5321,31 +5626,87 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         else:
             task_edit_state['message'] = 'Field not editable'
         invalidate()
-    root_body = VSplit([table_window, Window(width=1, char='│'), stats_window])
-    container = FloatContainer(content=HSplit([top_status_window, root_body, status_window]), floats=floats)
+    def _build_root_body() -> object:
+        if current_layout_name == 'horizontal':
+            return HSplit([
+                table_window,
+                Window(height=1, char='─'),
+                _build_stats_window('horizontal'),
+            ])
+        return VSplit([
+            table_window,
+            Window(width=1, char='│'),
+            _build_stats_window('vertical'),
+        ])
+
+    root_body = _build_root_body()
+    root_content = HSplit([top_status_window, root_body, status_window])
+    container = FloatContainer(content=root_content, floats=floats)
+
+    def _refresh_root_body() -> None:
+        nonlocal root_body, root_content
+        new_body = _build_root_body()
+        root_body = new_body
+        updated = False
+        try:
+            if hasattr(root_content, 'children') and len(getattr(root_content, 'children')) >= 3:
+                root_content.children[1] = new_body
+                updated = True
+        except Exception:
+            updated = False
+        if not updated:
+            try:
+                root_content = HSplit([top_status_window, new_body, status_window])
+                container.content = root_content
+            except Exception:
+                pass
+
+    app: Optional[Application] = None
 
     kb = KeyBindings()
     # Mode filters to enable/disable keybindings contextually
-    is_search = Condition(lambda: in_search)
-    is_date = Condition(lambda: in_date_filter)
-    is_detail = Condition(lambda: detail_mode)
     is_add_mode = Condition(lambda: add_mode)
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
-    is_task_edit_mode = Condition(lambda: edit_task_mode)
     is_task_edit_text = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-assignees', 'edit-comment'))
     is_task_edit_nav = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-labels'))
     is_task_edit_calendar = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-date-calendar')
-    is_task_edit_priority = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'priority-select')
     is_task_edit_labels = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-labels')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
-    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
         stats_control.text = lambda: summarize()
-        app.invalidate()
+        if app is not None:
+            app.invalidate()
+
+    def apply_theme(index: int, announce: bool = True) -> None:
+        nonlocal current_theme_index, current_layout_name, current_layout_options, style, status_line
+        if not (0 <= index < len(theme_presets)):
+            return
+        if index == current_theme_index and not announce:
+            return
+        current_theme_index = index
+        preset = theme_presets[index]
+        current_layout_name = preset.layout or DEFAULT_THEME_LAYOUT
+        current_layout_options = dict(preset.layout_options or {})
+        _refresh_root_body()
+        style = Style.from_dict(preset.style)
+        if app is not None:
+            app.style = style
+        if announce:
+            status_line = f"Theme: {preset.name}"
+            _save_state()
+        invalidate()
+
+    for idx, key_name in enumerate(SHIFTED_DIGIT_KEYS):
+        if idx >= len(theme_presets):
+            break
+
+        @kb.add(key_name, filter=is_normal)
+        def _(event, index=idx):
+            apply_theme(index)
 
     def _invalidate_summary_cache() -> None:
         summary_cache['project'].update({'ts': 0.0, 'data': {}, 'tops': []})
@@ -5469,14 +5830,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             assignee_node_ids: List[str] = []
             if mode == 'issue':
                 repo_id = (repo_choice or {}).get('repo_id') or ''
-                repo_label = (repo_choice or {}).get('repo') or repo_source
                 if not repo_id:
                     lookup_source = repo_manual or repo_source
                     if not lookup_source:
                         raise RuntimeError('Repository metadata unavailable')
                     repo_lookup = await loop.run_in_executor(None, lambda: get_repo_id(token, lookup_source))
                     repo_id = repo_lookup.get('repo_id') or ''
-                    repo_label = repo_lookup.get('repo') or lookup_source
                 if not repo_id:
                     raise RuntimeError('Repository metadata unavailable')
                 for login in assignees:
@@ -6126,6 +6485,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('A', filter=is_normal)
     def _(event):
+        nonlocal add_mode, add_state, add_float, status_line
         if detail_mode or in_search:
             return
         choices = build_project_choices()
@@ -6133,7 +6493,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = "No projects available to add task"
             invalidate()
             return
-        nonlocal add_mode, add_state, add_float
         add_mode = True
         mode_choices = ['Create Issue', 'Add Project Task']
         today_iso = dt.date.today().isoformat()
@@ -6466,6 +6825,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('enter', filter=is_add_mode)
     def _(event):
+        nonlocal status_line
         step = add_state.get('step')
         if step == 'mode':
             idx = add_state.get('mode_index', 0)
@@ -6910,33 +7270,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal status_line
         try:
             # Build payload (same as JSON export) and render with portrait summary
-            since_days = 90
-            payload = {
-                'meta': {
-                    'generated_at': dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds'),
-                    'user': cfg.user,
-                    'since_days': since_days,
-                    'granularity': 'all',
-                    'scope': 'all',
-                },
-                'overall': {g: db.aggregate_period_totals(g, since_days=since_days) for g in ['day','week','month']},
-                'projects_total_window': db.aggregate_project_totals(since_days=since_days),
-                'tasks_total_window': db.aggregate_task_totals(since_days=since_days),
-                'task_titles': db.task_titles(),
-            }
-            # Try importing reportlab here to check availability
             try:
-                from reportlab.lib.pagesizes import A4  # noqa: F401
+                from reportlab.lib import colors
+                from reportlab.lib.pagesizes import A4
+                from reportlab.lib.units import mm
+                from reportlab.pdfgen import canvas
             except Exception:
                 status_line = "PDF export needs reportlab (pip install reportlab)"; invalidate(); return
             ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
             out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'report-{ts}.pdf')
             # Use the same portrait renderer as CLI export
             # Implemented within CLI block; re-implement minimal version here for consistency
-            from reportlab.lib.pagesizes import A4
-            from reportlab.pdfgen import canvas
-            from reportlab.lib import colors
-            from reportlab.lib.units import mm
             def fmt_hm(s:int)->str:
                 s = int(max(0, s))
                 h, r = divmod(s, 3600)
@@ -7156,6 +7500,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "🌐 Fetch",
                 "  u                   Update (fetch GitHub)",
                 "",
+                "🎨 Themes",
+                "  Shift+1..0         Switch theme preset",
+                "  Add YAML under themes/ to create presets",
+                f"  Current: {theme_presets[current_theme_index].name}",
+                "",
                 "❓ General",
                 "  ?                   Toggle help",
                 "  q / Esc             Quit / Close",
@@ -7206,29 +7555,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         report_granularity = 'month'; invalidate()
 
     # refresh loop timer to update status bar (search typing etc.)
-    style = Style.from_dict({
-        'editor.frame': 'bg:#1c1c1c #f0f0f0',
-        'editor.frame.border': '#5f5f5f',
-        'editor.frame.title': 'bold #ffd75f',
-        'editor.body': 'bg:#1c1c1c #f0f0f0',
-        'editor.header': 'bold #ffd75f',
-        'editor.meta': '#87d7ff',
-        'editor.text': '#f0f0f0',
-        'editor.field': '#d7d7d7',
-        'editor.field.cursor': 'bold #ffffff bg:#444444',
-        'editor.instructions': '#5fd7af',
-        'editor.priority': '#f0f0f0',
-        'editor.priority.cursor': 'bold #ffffff bg:#875f00',
-        'editor.label': '#d0d0d0',
-        'editor.label.selected': 'bold #87ff5f',
-        'editor.label.cursor': 'reverse #ffffaf',
-        'editor.label.cursor.selected': 'reverse bold #ffffff',
-        'editor.message': '#ffd787',
-        'editor.warning': 'bold #ff8787',
-        'editor.calendar': '#87afff',
-        'editor.entry': '#ffffff bg:#303030',
-    })
     app = Application(layout=Layout(container), key_bindings=kb, full_screen=True, mouse_support=True, style=style, editing_mode=EditingMode.VI)
+    apply_theme(current_theme_index, announce=False)
 
     # Background ticker to refresh timers & status once per second
     async def _ticker():
@@ -7236,7 +7564,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             try:
                 await asyncio.sleep(1)
                 update_search_status()
-                app.invalidate()
+                invalidate()
             except Exception:
                 # don't crash on background exceptions
                 await asyncio.sleep(1)
