@@ -4669,9 +4669,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             filter_rows = [
                 ('🔍', 'Search', active_search_val),
                 ('📁', 'Project', project_cycle or 'All'),
-                ('☑', 'Done', 'Hide' if hide_done else 'Show'),
+                ('✅', 'Done', 'Hide' if hide_done else 'Show'),
                 ('⛔', 'No-Date', 'Hide' if hide_no_date else 'Show'),
-                ('⇅', 'Sort', sort_presets[sort_index]['name']),
+                ('🔁', 'Sort', sort_presets[sort_index]['name']),
             ]
             if date_max:
                 filter_rows.insert(2, ('📅', 'Date Max', date_max))
@@ -4723,9 +4723,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         filter_rows = [
             ('🔍', 'Search', active_search_val),
             ('📁', 'Project', project_cycle or 'All'),
-            ('☑', 'Done', 'Hide' if hide_done else 'Show'),
+            ('✅', 'Done', 'Hide' if hide_done else 'Show'),
             ('⛔', 'No-Date', 'Hide' if hide_no_date else 'Show'),
-            ('⇅', 'Sort', sort_presets[sort_index]['name']),
+            ('🔁', 'Sort', sort_presets[sort_index]['name']),
         ]
         if date_max:
             filter_rows.insert(2, ('📅', 'Date Max', date_max))
