@@ -1923,6 +1923,51 @@ def add_issue_comment(token: str, issue_url: str, body: str) -> None:
         raise RuntimeError(f"Comment failed ({r.status_code}): {r.text}")
 
 
+def fetch_issue_details(token: str, issue_url: str, max_comments: int = 5) -> Dict[str, object]:
+    parts = _parse_issue_url(issue_url)
+    if not parts or token is None:
+        return {'tasks': [], 'comments': []}
+    owner, repo, number = parts
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+    }
+    import requests as _rq
+    issue_resp = _rq.get(
+        f'https://api.github.com/repos/{owner}/{repo}/issues/{number}',
+        headers=headers,
+        timeout=30,
+    )
+    if issue_resp.status_code >= 300:
+        raise RuntimeError(f"Issue fetch failed ({issue_resp.status_code}): {issue_resp.text}")
+    data = issue_resp.json()
+    body = data.get('body') or ''
+    task_pattern = re.compile(r'^\s*[-*]\s*\[( |x|X)\]\s*(.+)$')
+    tasks: List[Dict[str, object]] = []
+    for line in body.splitlines():
+        match = task_pattern.match(line)
+        if match:
+            tasks.append({
+                'done': match.group(1).strip().lower() == 'x',
+                'text': match.group(2).strip(),
+            })
+    comments: List[Dict[str, object]] = []
+    comments_url = data.get('comments_url')
+    if comments_url and (data.get('comments') or 0) and max_comments > 0:
+        params = {'per_page': max_comments, 'sort': 'updated', 'direction': 'desc'}
+        comments_resp = _rq.get(comments_url, headers=headers, params=params, timeout=30)
+        if comments_resp.status_code < 300:
+            for item in comments_resp.json()[:max_comments]:
+                if not isinstance(item, dict):
+                    continue
+                comments.append({
+                    'author': ((item.get('user') or {}).get('login') or '').strip(),
+                    'body': (item.get('body') or '').strip(),
+                    'created_at': item.get('created_at') or '',
+                })
+    return {'tasks': tasks, 'comments': comments}
+
+
 def get_user_node_id(token: str, login: str) -> str:
     login_key = (login or '').lower()
     if not login_key:
@@ -2806,6 +2851,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         'project': {'ts': 0.0, 'data': {}, 'tops': []},
         'label': {'ts': 0.0, 'data': {}, 'tops': []},
     }
+    issue_detail_cache: Dict[str, Dict[str, object]] = {}
+    issue_detail_tasks: Dict[str, asyncio.Task] = {}
 
     theme_dir = Path(__file__).resolve().parent / "themes"
     theme_presets = _load_theme_presets(theme_dir)
@@ -4598,6 +4645,31 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             value_width = _layout_int('stats_value_width', 12)
             gap = '   '
             bar_width = _layout_int('stats_bar_width', 18)
+            comment_fetch_limit = _layout_int('stats_comment_limit', 5)
+            detail_url = cur.url if rows and current_index < len(rows) else ''
+            detail_map: Dict[str, object] = {}
+            if detail_url and _parse_issue_url(detail_url):
+                existing = issue_detail_cache.get(detail_url)
+                if existing is None:
+                    if not token:
+                        issue_detail_cache[detail_url] = {'error': 'GITHUB_TOKEN required'}
+                    else:
+                        issue_detail_cache[detail_url] = {'loading': True}
+                        if detail_url not in issue_detail_tasks:
+                            async def load_issue_detail(url: str, limit: int) -> None:
+                                try:
+                                    loop_inner = asyncio.get_running_loop()
+                                    data = await loop_inner.run_in_executor(None, lambda: fetch_issue_details(token, url, limit))
+                                except Exception as exc:
+                                    issue_detail_cache[url] = {'error': str(exc)}
+                                else:
+                                    issue_detail_cache[url] = data
+                                issue_detail_tasks.pop(url, None)
+                                invalidate()
+                            issue_detail_tasks[detail_url] = asyncio.create_task(load_issue_detail(detail_url, comment_fetch_limit))
+                detail_map = issue_detail_cache.get(detail_url, {})
+            else:
+                detail_map = {}
 
             def add_divider() -> None:
                 total_width = (left_width + value_width) * 2 + len(gap)
@@ -4655,6 +4727,93 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     fr.append((label_style, _pad_display(bar, left_width + value_width)))
                     fr.append(("", "\n"))
 
+            def add_detail_columns(detail: Dict[str, object], url: str) -> None:
+                add_heading_bar('Task List / Comments')
+                if not url or not _parse_issue_url(url):
+                    fr.append((label_style, _pad_display('Select an issue to view details', left_width + value_width)))
+                    fr.append(("", gap))
+                    fr.append((value_style, _pad_display('', left_width + value_width)))
+                    fr.append(("", "\n"))
+                    return
+                if not token:
+                    fr.append((label_style, _pad_display('Set GITHUB_TOKEN to load details', left_width + value_width)))
+                    fr.append(("", gap))
+                    fr.append((value_style, _pad_display('', left_width + value_width)))
+                    fr.append(("", "\n"))
+                    return
+                if detail.get('loading'):
+                    fr.append((label_style, _pad_display('Loading issue details…', left_width + value_width)))
+                    fr.append(("", gap))
+                    fr.append((value_style, _pad_display('', left_width + value_width)))
+                    fr.append(("", "\n"))
+                    return
+                error_text = detail.get('error')
+                if error_text:
+                    err_msg = _truncate(f"Error: {error_text}", left_width + value_width)
+                    fr.append((label_style, _pad_display(err_msg, left_width + value_width)))
+                    fr.append(("", gap))
+                    fr.append((value_style, _pad_display('', left_width + value_width)))
+                    fr.append(("", "\n"))
+                    return
+                tasks = detail.get('tasks') or []
+                comments = detail.get('comments') or []
+                task_limit = _layout_int('stats_task_limit', 6)
+                comment_limit = _layout_int('stats_comment_limit', 5)
+                if task_limit > 0:
+                    tasks = tasks[:task_limit]
+                if comment_limit > 0:
+                    comments = comments[:comment_limit]
+                if not tasks and not comments:
+                    fr.append((label_style, _pad_display('No subtasks or comments', left_width + value_width)))
+                    fr.append(("", gap))
+                    fr.append((value_style, _pad_display('', left_width + value_width)))
+                    fr.append(("", "\n"))
+                    return
+                detail_width = _layout_int('stats_detail_width', left_width + value_width * 2)
+                task_trunc_width = max(1, detail_width - 3)
+                comment_trunc_width = max(1, detail_width - 2)
+                max_rows = max(len(tasks), len(comments))
+                for idx in range(max_rows):
+                    if idx < len(tasks):
+                        task_entry = tasks[idx]
+                        icon = '✅' if task_entry.get('done') else '⬜'
+                        text = (task_entry.get('text') or '').replace('\n', ' ')
+                        left_text = f"{icon} {_truncate(text, task_trunc_width)}"
+                    else:
+                        left_text = ''
+                    fr.append((label_style, _pad_display(left_text, detail_width)))
+                    fr.append(("", gap))
+                    if idx < len(comments):
+                        comment_entry = comments[idx]
+                        author = (comment_entry.get('author') or '').strip() or 'anon'
+                        body = (comment_entry.get('body') or '').replace('\n', ' ')
+                comment_text = f"💬 {author}: {body}" if body else f"💬 {author}"
+                wrap_width = _layout_int('stats_comment_wrap', comment_trunc_width)
+                if wrap_width <= comment_trunc_width:
+                    comment_text = _truncate(comment_text, comment_trunc_width)
+                    fr.append((value_style, _pad_display(comment_text, detail_width)))
+                else:
+                    words = comment_text.split()
+                    line = []
+                    line_len = 0
+                    remaining = detail_width
+                    for word in words:
+                        wlen = len(word) + (1 if line else 0)
+                        if line_len + wlen > wrap_width:
+                            fr.append((value_style, _pad_display(' '.join(line), detail_width)))
+                            fr.append(("", gap))
+                            remaining -= detail_width + len(gap)
+                            line = [word]
+                            line_len = len(word)
+                        else:
+                            line.append(word)
+                            line_len += wlen
+                    if line:
+                        fr.append((value_style, _pad_display(' '.join(line), detail_width)))
+                    else:
+                        fr.append((value_style, _pad_display('', detail_width)))
+                    fr.append(("", "\n"))
+
             add_heading_bar('Overview', first=True)
             overview_rows = [
                 ('👤', 'User', cfg.user),
@@ -4703,6 +4862,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 label_cache_entry['ts'] = now_mon
             label_tops = label_cache_entry.get('tops', []) or []
             add_bar_section('Top Labels (30d)', label_tops)
+
+            add_detail_columns(detail_map, detail_url)
 
             if fr and fr[-1][1].endswith("\n"):
                 fr[-1] = (fr[-1][0], fr[-1][1][:-1])
