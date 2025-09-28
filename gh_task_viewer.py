@@ -4594,10 +4594,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     bucket = []
 
         if is_horizontal_layout:
-            left_width = 18
-            value_width = 12
+            left_width = _layout_int('stats_label_width', 18)
+            value_width = _layout_int('stats_value_width', 12)
             gap = '   '
-            bar_width = 18
+            bar_width = _layout_int('stats_bar_width', 18)
 
             def add_divider() -> None:
                 total_width = (left_width + value_width) * 2 + len(gap)
