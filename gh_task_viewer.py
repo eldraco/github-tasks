@@ -4593,16 +4593,124 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     fr.append(("", "\n"))
                     bucket = []
 
+        if is_horizontal_layout:
+            left_width = 18
+            value_width = 12
+            gap = '   '
+            bar_width = 18
+
+            def add_divider() -> None:
+                total_width = (left_width + value_width) * 2 + len(gap)
+                fr.append((accent_style, '─' * total_width + '\n'))
+
+            def add_heading_bar(title: str, *, first: bool = False) -> None:
+                if not first:
+                    fr.append(("", "\n"))
+                add_divider()
+                heading_block = _pad_display(title.upper(), left_width + value_width)
+                fr.append((heading_style, heading_block))
+                fr.append(("", gap))
+                fr.append((heading_style, _pad_display('', left_width + value_width)))
+                fr.append(("", "\n"))
+
+            def add_two_column(rows: List[Tuple[str, str, str]]) -> None:
+                for idx in range(0, len(rows), 2):
+                    chunk = rows[idx:idx+2]
+                    for col_idx, (icon, label, value) in enumerate(chunk):
+                        label_text = f"{icon} {label}" if icon else label
+                        fr.append((label_style, _pad_display(label_text, left_width)))
+                        fr.append((value_style, _pad_display(value, value_width)))
+                        if col_idx == 0 and len(chunk) > 1:
+                            fr.append(("", gap))
+                    if len(chunk) == 1:
+                        fr.append(("", gap))
+                        fr.append((label_style, _pad_display('', left_width)))
+                        fr.append((value_style, _pad_display('', value_width)))
+                    fr.append(("", "\n"))
+
+            def add_bar_section(title: str, items: List[Tuple[str, int]]) -> None:
+                add_heading_bar(title)
+                if not items:
+                    fr.append((label_style, _pad_display('• None', left_width)))
+                    fr.append((value_style, _pad_display('-', value_width)))
+                    fr.append(("", gap))
+                    fr.append((label_style, _pad_display('', left_width + value_width)))
+                    fr.append(("", "\n"))
+                    return
+                max_val = max(val for _, val in items) or 1
+                for name, val in items[:6]:
+                    ratio = min(1.0, float(val) / float(max_val))
+                    filled = int(round(ratio * bar_width))
+                    bar = '█' * filled + '░' * (bar_width - filled)
+                    fr.append((accent_style, _pad_display(f"• {_truncate(name or '-', left_width - 2)}", left_width)))
+                    fr.append((value_style, _pad_display(_fmt_hm(val), value_width)))
+                    fr.append(("", gap))
+                    fr.append((label_style, _pad_display(bar, left_width + value_width)))
+                    fr.append(("", "\n"))
+
+            add_heading_bar('Overview', first=True)
+            overview_rows = [
+                ('👤', 'User', cfg.user),
+                ('📝', 'Tasks', f"{total} • Done {done_ct}"),
+                ('⏱', 'Now', _fmt_mmss(now_s)),
+                ('🧩', 'Task', _fmt_hm(task_s)),
+                ('📦', 'Project', _fmt_hm(proj_s)),
+                ('⚡', 'Active', str(active_count)),
+            ]
+            add_two_column(overview_rows)
+
+            filter_rows = [
+                ('🔎', 'Search', active_search_val),
+                ('📁', 'Project', project_cycle or 'All'),
+                ('☑️', 'Done', 'Hide' if hide_done else 'Show'),
+                ('🚫', 'No-Date', 'Hide' if hide_no_date else 'Show'),
+                ('↕', 'Sort', sort_presets[sort_index]['name']),
+            ]
+            if date_max:
+                filter_rows.insert(2, ('📅', 'Date Max', date_max))
+            add_heading_bar('Filters')
+            add_two_column(filter_rows)
+
+            proj_cache_entry = summary_cache['project']
+            if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not proj_cache_entry.get('tops'):
+                try:
+                    proj_data = db.aggregate_project_totals(since_days=30)
+                except Exception:
+                    proj_data = proj_cache_entry.get('data', {}) or {}
+                else:
+                    proj_cache_entry['data'] = proj_data
+                    proj_cache_entry['tops'] = sorted(proj_data.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                proj_cache_entry['ts'] = now_mon
+            project_tops = proj_cache_entry.get('tops', []) or []
+            add_bar_section('Top Projects (30d)', project_tops)
+
+            label_cache_entry = summary_cache['label']
+            if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not label_cache_entry.get('tops'):
+                try:
+                    label_data = db.aggregate_label_totals(since_days=30)
+                except Exception:
+                    label_data = label_cache_entry.get('data', {}) or {}
+                else:
+                    label_cache_entry['data'] = label_data
+                    label_cache_entry['tops'] = sorted(label_data.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                label_cache_entry['ts'] = now_mon
+            label_tops = label_cache_entry.get('tops', []) or []
+            add_bar_section('Top Labels (30d)', label_tops)
+
+            if fr and fr[-1][1].endswith("\n"):
+                fr[-1] = (fr[-1][0], fr[-1][1][:-1])
+            return fr
+
         add_heading('Overview')
         overview_rows = [
             ('👤', 'User', cfg.user),
             ('📝', 'Tasks', f"{total} • Done {done_ct}"),
-            ('⏲️ ', 'Now', _fmt_mmss(now_s)),
+            ('⏱', 'Now', _fmt_mmss(now_s)),
             ('🧩', 'Task', _fmt_hm(task_s)),
             ('📦', 'Project', _fmt_hm(proj_s)),
             ('⚡', 'Active', str(active_count)),
         ]
-        render_rows(overview_rows, label_width=14 if is_horizontal_layout else 12)
+        render_rows(overview_rows, label_width=12)
 
         add_heading('Filters', leading_blank=True)
         filter_rows = [
@@ -4614,9 +4722,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         ]
         if date_max:
             filter_rows.insert(2, ('📅', 'Date Max', date_max))
-        render_rows(filter_rows, label_width=14 if is_horizontal_layout else 12, value_cap=36 if is_horizontal_layout else 24)
+        render_rows(filter_rows, label_width=12, value_cap=24)
 
-        # Top 5 projects by time (30d)
         proj_cache_entry = summary_cache['project']
         if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not proj_cache_entry.get('tops'):
             try:
@@ -4631,7 +4738,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if project_tops:
             add_heading('Top Projects (30d)', leading_blank=True)
             project_rows = [('•', name or '-', _fmt_hm(secs)) for name, secs in project_tops]
-            render_rows(project_rows, label_width=22 if is_horizontal_layout else 18, value_cap=12, label_style_override=accent_style)
+            render_rows(project_rows, label_width=18, value_cap=12, label_style_override=accent_style)
 
         label_cache_entry = summary_cache['label']
         if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not label_cache_entry.get('tops'):
@@ -4647,7 +4754,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if label_tops:
             add_heading('Top Labels (30d)', leading_blank=True)
             label_rows = [('•', name or '-', _fmt_hm(secs)) for name, secs in label_tops]
-            render_rows(label_rows, label_width=22 if is_horizontal_layout else 18, value_cap=12, label_style_override=accent_style)
+            render_rows(label_rows, label_width=18, value_cap=12, label_style_override=accent_style)
 
         if fr and fr[-1][1].endswith("\n"):
             fr[-1] = (fr[-1][0], fr[-1][1][:-1])
