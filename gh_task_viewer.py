@@ -2367,7 +2367,6 @@ def fetch_tasks_github(
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldSingleSelectValue":
                         field_data = fv.get("field") or {}
                         raw_name = field_data.get("name") or ""
-                        fname_sel = raw_name.strip().lower()
                         option_id_val = fv.get("optionId") or ""
                         options_raw = field_data.get("options") or []
                         is_status_field = _looks_like_status_field(raw_name)
@@ -2802,7 +2801,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     session_float: Optional[Float] = None
     update_in_progress = False
     task_duration_cache: Dict[str, Dict[str, int]] = {}
-    SUMMARY_CACHE_TTL = 5.0  # seconds; avoid recomputing heavy aggregates on every repaint
+    summary_cache_ttl = 5.0  # seconds; avoid recomputing heavy aggregates on every repaint
     summary_cache: Dict[str, Dict[str, object]] = {
         'project': {'ts': 0.0, 'data': {}, 'tops': []},
         'label': {'ts': 0.0, 'data': {}, 'tops': []},
@@ -3434,7 +3433,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         content = boxed(title_head, body, width=92)
         return [("", content)]
 
-    STATUS_KEYWORDS: Dict[str, List[str]] = {
+    status_keywords: Dict[str, List[str]] = {
         'done': ["done", "complete", "completed", "finished", "closed", "resolved", "merged", "✅", "✔"],
         'in_progress': ["in progress", "progress", "doing", "active", "working"]
     }
@@ -3460,7 +3459,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def _match_status_option(row: TaskRow, target: str) -> Tuple[str, str]:
         options = _status_options_map(row)
-        keywords = STATUS_KEYWORDS.get(target, [])
+        keywords = status_keywords.get(target, [])
         for kw in keywords:
             opt = options.get(kw.lower())
             if opt:
@@ -3472,7 +3471,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def _is_done_name(name: str) -> int:
         low = (name or "").lower()
-        return int(any(kw in low for kw in STATUS_KEYWORDS['done']))
+        return int(any(kw in low for kw in status_keywords['done']))
 
     async def _apply_status_change(target: str):
         nonlocal all_rows, status_line, current_index
@@ -4619,7 +4618,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         # Top 5 projects by time (30d)
         proj_cache_entry = summary_cache['project']
-        if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not proj_cache_entry.get('tops'):
+        if (now_mon - float(proj_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not proj_cache_entry.get('tops'):
             try:
                 proj_data = db.aggregate_project_totals(since_days=30)
             except Exception:
@@ -4635,7 +4634,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             render_rows(project_rows, label_width=22 if is_horizontal_layout else 18, value_cap=12, label_style_override=accent_style)
 
         label_cache_entry = summary_cache['label']
-        if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= SUMMARY_CACHE_TTL or not label_cache_entry.get('tops'):
+        if (now_mon - float(label_cache_entry.get('ts', 0.0))) >= summary_cache_ttl or not label_cache_entry.get('tops'):
             try:
                 label_data = db.aggregate_label_totals(since_days=30)
             except Exception:
@@ -5104,36 +5103,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_line("No editable fields", 'class:editor.warning')
         else:
             add_blank()
-            for idx, field in enumerate(fields):
+            for idx, field_info in enumerate(fields):
                 marker = '➤' if idx == cursor else ' '
-                ftype = field.get('type')
+                ftype = field_info.get('type')
                 if ftype == 'priority':
-                    opts = field.get('options') or []
-                    index = max(0, min(field.get('index', 0), len(opts)-1)) if opts else 0
+                    opts = field_info.get('options') or []
+                    index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
                     value = opts[index].get('name') if opts else '(no options)'
                     if opts and row and getattr(row, 'priority_dirty', 0):
                         value = (value or '-') + '*'
                 elif ftype == 'assignees':
-                    vals = field.get('value') or []
+                    vals = field_info.get('value') or []
                     if isinstance(vals, list):
                         value = ', '.join(vals) or '-'
                     else:
                         value = str(vals) or '-'
                 elif ftype == 'labels':
-                    vals = field.get('value') or []
+                    vals = field_info.get('value') or []
                     if isinstance(vals, list):
                         value = ', '.join(vals) or '-'
                     else:
                         value = str(vals) or '-'
                 elif ftype == 'priority-text':
-                    value = field.get('value') or '-'
+                    value = field_info.get('value') or '-'
                 elif ftype == 'comment':
                     value = '(add comment)'
                 else:
-                    value = field.get('value', '')
+                    value = field_info.get('value', '')
                 value = value or '-'
                 style = 'class:editor.field.cursor' if idx == cursor else 'class:editor.field'
-                add_line(f" {marker} {field.get('name')} : {value}", style)
+                add_line(f" {marker} {field_info.get('name')} : {value}", style)
 
         if mode == 'edit-date-calendar' and fields:
             editing = task_edit_state.get('editing') or {}
@@ -5666,20 +5665,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     kb = KeyBindings()
     # Mode filters to enable/disable keybindings contextually
-    is_search = Condition(lambda: in_search)
-    is_date = Condition(lambda: in_date_filter)
-    is_detail = Condition(lambda: detail_mode)
     is_add_mode = Condition(lambda: add_mode)
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
-    is_task_edit_mode = Condition(lambda: edit_task_mode)
     is_task_edit_text = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-assignees', 'edit-comment'))
     is_task_edit_nav = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-labels'))
     is_task_edit_calendar = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-date-calendar')
-    is_task_edit_priority = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'priority-select')
     is_task_edit_labels = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-labels')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
-    is_input_mode = Condition(lambda: in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode))
 
     def invalidate():
@@ -5837,14 +5830,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             assignee_node_ids: List[str] = []
             if mode == 'issue':
                 repo_id = (repo_choice or {}).get('repo_id') or ''
-                repo_label = (repo_choice or {}).get('repo') or repo_source
                 if not repo_id:
                     lookup_source = repo_manual or repo_source
                     if not lookup_source:
                         raise RuntimeError('Repository metadata unavailable')
                     repo_lookup = await loop.run_in_executor(None, lambda: get_repo_id(token, lookup_source))
                     repo_id = repo_lookup.get('repo_id') or ''
-                    repo_label = repo_lookup.get('repo') or lookup_source
                 if not repo_id:
                     raise RuntimeError('Repository metadata unavailable')
                 for login in assignees:
@@ -6494,6 +6485,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('A', filter=is_normal)
     def _(event):
+        nonlocal add_mode, add_state, add_float, status_line
         if detail_mode or in_search:
             return
         choices = build_project_choices()
@@ -6501,7 +6493,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = "No projects available to add task"
             invalidate()
             return
-        nonlocal add_mode, add_state, add_float
         add_mode = True
         mode_choices = ['Create Issue', 'Add Project Task']
         today_iso = dt.date.today().isoformat()
@@ -6834,6 +6825,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('enter', filter=is_add_mode)
     def _(event):
+        nonlocal status_line
         step = add_state.get('step')
         if step == 'mode':
             idx = add_state.get('mode_index', 0)
@@ -7278,33 +7270,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal status_line
         try:
             # Build payload (same as JSON export) and render with portrait summary
-            since_days = 90
-            payload = {
-                'meta': {
-                    'generated_at': dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds'),
-                    'user': cfg.user,
-                    'since_days': since_days,
-                    'granularity': 'all',
-                    'scope': 'all',
-                },
-                'overall': {g: db.aggregate_period_totals(g, since_days=since_days) for g in ['day','week','month']},
-                'projects_total_window': db.aggregate_project_totals(since_days=since_days),
-                'tasks_total_window': db.aggregate_task_totals(since_days=since_days),
-                'task_titles': db.task_titles(),
-            }
-            # Try importing reportlab here to check availability
             try:
-                from reportlab.lib.pagesizes import A4  # noqa: F401
+                from reportlab.lib import colors
+                from reportlab.lib.pagesizes import A4
+                from reportlab.lib.units import mm
+                from reportlab.pdfgen import canvas
             except Exception:
                 status_line = "PDF export needs reportlab (pip install reportlab)"; invalidate(); return
             ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
             out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'report-{ts}.pdf')
             # Use the same portrait renderer as CLI export
             # Implemented within CLI block; re-implement minimal version here for consistency
-            from reportlab.lib.pagesizes import A4
-            from reportlab.pdfgen import canvas
-            from reportlab.lib import colors
-            from reportlab.lib.units import mm
             def fmt_hm(s:int)->str:
                 s = int(max(0, s))
                 h, r = divmod(s, 3600)
