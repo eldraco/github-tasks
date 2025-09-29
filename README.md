@@ -1,17 +1,30 @@
 # GitHub Projects (v2) Terminal Task Viewer + Work Timers
 
-A fast, keyboard-driven TUI to browse GitHub Projects (v2) issues/PRs, filter and search them locally, track per-task work time, and export beautiful one-page PDF reports with time aggregates.
+Run GitHub Projects like a command center, not a chore list. This terminal-first companion keeps you in flow, laser-focused on the next deliverable, and ready with executive updates in minutes instead of hours.
 
-- Terminal-first UI with dynamic column widths
-- Works offline from a local SQLite cache
-- Per-task timers with multi-task concurrent tracking
-- Aggregated time reports (Daily/Weekly/Monthly/Yearly)
-- One-page PDF export with charts, plus JSON exports for automation
+Built for maintainers, busy teammates, and solo builders who want supercharged task management without another web dashboard.
+
+## Why it saves hours
+
+- Keyboard-native UI that loads instantly and adapts to any terminal width, so you never break focus
+- Local SQLite cache that mirrors your Projects (v2) data for fast filtering, offline browsing, and zero rate-limit panic
+- Per-task work timers with concurrent tracking to capture every context switch automatically
+- Time intelligence that rolls up daily/weekly/monthly/yearly aggregates for standups, retros, and billing
+- One-page PDF and structured JSON exports that make sharing progress as easy as hitting `Z`
+
+## Superpowers at a glance
+
+- Slice projects, assignees, and focus windows on the fly to see what truly needs attention
+- Lightning-fast search, sortable columns, and configurable date fields tuned for project leads
+- Integrated discovery to pull the right Projects (org or user) into your workspace instantly
+- Tunable themes and layouts so the UI matches your environment, dark-night terminal included
+
+Ready to reclaim your GitHub task list? Jump in with the quick install below and start timing your work within minutes.
 
 
 ## Install
 
-Requires Python 3.9+.
+Requires Python 3.9+. In just a few commands you'll be ready to sync projects and start timing your work.
 
 1) Create a virtualenv (recommended) and install deps:
 
@@ -46,6 +59,8 @@ GITHUB_TOKEN=ghp_your_token_here
 
 ## Configuration
 
+Tailor what the viewer pulls down so every fetch reflects the projects you care about.
+
 Create `config_gh_task.yml` (or use your own path and pass `--config`):
 
 ```
@@ -75,6 +90,8 @@ To change the user in the config, just update the `user: ...` value and restart 
 
 ## Usage
 
+Spin it up whenever you need instant clarity on what's next.
+
 Basic run (TUI):
 
 ```
@@ -95,6 +112,8 @@ python gh_task_viewer.py --config config_gh_task.yml --no-ui
 
 
 ## UI Cheatsheet
+
+Learn the keystrokes that keep you in the flow.
 
 Navigation
 - `j / k`, arrow keys: move
@@ -129,6 +148,8 @@ General
 
 ## Themes
 
+Personalize the control center to match your environment, from midnight terminals to sunlit monitors.
+
 - Press `Shift+1` through `Shift+0` to switch among the loaded theme presets.
 - Presets live as YAML files in the `themes/` folder; use `themes/default.yaml` or `themes/solarized_light.yaml` as starting points when authoring new ones.
 - Each preset defines both color rules (`style`) and a layout (`vertical`/`horizontal`). The first preset is used by default unless a persisted theme index is restored from the UI state file.
@@ -144,6 +165,8 @@ General
 
 ## What You See
 
+Get situational awareness at a glance.
+
 - Dynamic table width that adapts to your terminal size
 - Columns: Focus Date, Start Date, Status, Time, Title, Project
 - `Time` column shows `mm:ss|H:MM` = current run | total per task
@@ -154,6 +177,8 @@ General
 
 ## Work Timers
 
+Let the app capture your focus sessions automatically while you stay heads-down.
+
 - Timers are stored in SQLite (`work_sessions` table) with start/stop times.
 - You can run multiple timers at once (e.g., context switching across tasks).
 - Toggle a timer with `W` on the selected row.
@@ -161,6 +186,8 @@ General
 
 
 ## Reports & Exports
+
+Progress updates stop being a chore when the data is already packaged for you.
 
 Timer Report (`R`)
 - Shows a summary snapshot and aggregates by Day/Week/Month.
@@ -216,6 +243,8 @@ Payload includes:
 
 ## Database
 
+All state lives in one tidy SQLite file, so you stay portable and in control.
+
 - SQLite path is given by `--db` (defaults to `~/.gh_tasks.db`).
 - Tables
   - `tasks`: cached entries from GitHub Projects v2
@@ -230,12 +259,9 @@ The fetcher uses backoff and handles GitHub GraphQL `RATE_LIMITED` gracefully. I
 
 ## Troubleshooting
 
+Hit a snag? These cover the usual suspects.
+
 - No data on first run? Press `u` to fetch from GitHub.
 - Missing token? Set `GITHUB_TOKEN` env var or `.env` file.
 - PDF export fails? Install ReportLab: `pip install reportlab`.
 - Tables wrap/scroll oddly? Reduce font size or widen the terminal; columns adapt automatically.
-
-
-## License
-
-This repo contains original code for a terminal viewer; no license is asserted here. If you plan to publish or share, please add an explicit license of your choice.
