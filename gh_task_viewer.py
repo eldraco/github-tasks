@@ -245,6 +245,7 @@ def _load_theme_presets(theme_dir: Path) -> List[ThemePreset]:
 TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
 USER_ID_CACHE: Dict[str, str] = {}
 STATUS_OPTION_CACHE: Dict[str, List[Dict[str, object]]] = {}
+PRIORITY_FIELD_CACHE: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
 _UNSET = object()
 
 
@@ -1829,28 +1830,26 @@ def set_project_users(token: str, project_id: str, item_id: str, field_id: str, 
     if user_ids is None:
         user_ids = []
     session = _session(token)
-    attempts: List[Tuple[str, Dict[str, object]]] = [
-        (GQL_MUTATION_SET_USERS_USERIDS, {"userIds": [uid for uid in user_ids if uid]})
-    ]
-
     filtered_ids = [uid for uid in user_ids if uid]
-    if filtered_ids:
-        def _escape(uid: str) -> str:
-            return uid.replace('"', '\"')
+    def _escape(uid: str) -> str:
+        return (uid or '').replace('"', '\"')
 
-        node_payload = ", ".join(f'{{userId:"{_escape(uid)}"}}' for uid in filtered_ids)
-        if node_payload:
-            query_nodes = GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", node_payload)
-            attempts.append((query_nodes, {}))
+    node_payload_id = ", ".join(f'{{id:"{_escape(uid)}"}}' for uid in filtered_ids)
+    node_payload_user = ", ".join(f'{{userId:"{_escape(uid)}"}}' for uid in filtered_ids)
+
+    attempts: List[str] = []
+    attempts.append(GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", node_payload_id))
+    if filtered_ids:
+        # Some older API variants expect userId instead of id; try both for compatibility.
+        attempts.append(GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", node_payload_user))
 
     last_error = ""
-    for query, extra in attempts:
+    for query in attempts:
         variables = {
             "projectId": project_id,
             "itemId": item_id,
             "fieldId": field_id,
         }
-        variables.update(extra)
         try:
             resp = _graphql_with_backoff(session, query, variables)
         except Exception as exc:
@@ -2104,6 +2103,45 @@ def get_project_field_options(token: str, field_id: str) -> List[Dict[str, str]]
     return out
 
 
+def get_priority_field_metadata(token: str, project_id: str) -> Tuple[str, List[Dict[str, str]]]:
+    if not project_id:
+        return "", []
+    cached = PRIORITY_FIELD_CACHE.get(project_id)
+    if cached:
+        field_id, options = cached
+        return field_id, list(options)
+    if not token:
+        return "", []
+    session = _session(token)
+    try:
+        resp = _graphql_with_backoff(session, GQL_PROJECT_FIELDS, {"id": project_id})
+    except Exception:
+        return "", []
+    errs = resp.get("errors") or []
+    if errs:
+        PRIORITY_FIELD_CACHE[project_id] = ("", [])
+        return "", []
+    node = (resp.get("data") or {}).get("node") or {}
+    fields = ((node.get("fields") or {}).get("nodes")) or []
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        field_id = (field.get("id") or "").strip()
+        name = (field.get("name") or "").strip()
+        if not (field_id and name):
+            continue
+        if not _looks_like_priority_field(name):
+            continue
+        try:
+            options = get_project_field_options(token, field_id)
+        except Exception:
+            options = []
+        PRIORITY_FIELD_CACHE[project_id] = (field_id, options)
+        return field_id, list(options)
+    PRIORITY_FIELD_CACHE[project_id] = ("", [])
+    return "", []
+
+
 # -----------------------------
 # Fetch with progress callback
 # -----------------------------
@@ -2117,6 +2155,8 @@ def _ascii_bar(done:int, total:int, width:int=40)->str:
 
 STATUS_FIELD_HINTS = ("status", "state", "progress", "stage", "column")
 PRIORITY_FIELD_HINTS = ("priority", "prio")
+LONG_TASK_THRESHOLD_SECONDS = 4 * 60 * 60  # 4 hours
+LONG_TASK_REPROMPT_INCREMENT = 60 * 60     # re-confirm every extra hour over threshold
 
 
 def _looks_like_status_field(name: Optional[str]) -> bool:
@@ -2301,6 +2341,9 @@ def fetch_tasks_github(
             label = f"{label} — {ptitle}"
         local_rows: List[TaskRow] = []
         session_local = _session(token)
+        priority_field_id_cache: Optional[str] = None
+        priority_options_cache: List[Dict[str, str]] = []
+        priority_lookup_attempted = False
         after: Optional[str] = None
         tracker.set_message(f"Scanning {label}")
         while True:
@@ -2507,6 +2550,33 @@ def fetch_tasks_github(
                                     focus_field_id_local = field_fd.get("id") or focus_field_id_local
                                 except ValueError:
                                     pass
+
+                need_priority_lookup = False
+                if priority_field_id:
+                    if not priority_field_id_cache:
+                        priority_field_id_cache = priority_field_id
+                    if priority_options_list:
+                        priority_options_cache = priority_options_list.copy()
+                    else:
+                        need_priority_lookup = True
+                else:
+                    if priority_field_id_cache:
+                        priority_field_id = priority_field_id_cache
+                    else:
+                        need_priority_lookup = True
+                if need_priority_lookup and not priority_lookup_attempted and project_id:
+                    fetched_field_id, fetched_options = get_priority_field_metadata(token, project_id)
+                    priority_lookup_attempted = True
+                    if fetched_field_id and not priority_field_id:
+                        priority_field_id = fetched_field_id
+                    if fetched_field_id and not priority_field_id_cache:
+                        priority_field_id_cache = fetched_field_id
+                    if fetched_options:
+                        priority_options_cache = fetched_options.copy()
+                        if not priority_options_list:
+                            priority_options_list = fetched_options.copy()
+                if not priority_options_list and priority_options_cache:
+                    priority_options_list = priority_options_cache.copy()
 
                 found_date = False
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
@@ -3600,6 +3670,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = f"Status update failed: {exc}"
         else:
             db.mark_status_synced(row.url)
+            if new_is_done and row.url in db.active_task_urls():
+                labels = fetch_labels_for_url(token, row.url) if token else []
+                labels_json = json.dumps(labels) if labels else None
+                _handle_timer_stop(row, labels_json, allow_prompt=True)
+                try:
+                    logger.info("Auto-stopped timer for %s after marking done", row.url)
+                except Exception:
+                    pass
             status_line = f"Status set to {display_name}"
         finally:
             pending_status_urls.discard(row.url)
@@ -5408,7 +5486,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_blank()
             add_line(f"🗓️ Select {fields[cursor].get('name')} (h/l day, j/k week, </> month, t today)", 'class:editor.instructions')
             add_line(cursor_date.strftime("%B %Y"), 'class:editor.calendar')
-            add_line(" Mo Tu We Th Fr Sa Su", 'class:editor.calendar')
+            day_header = ''.join(f" {calendar.day_abbr[i][:2]} " for i in range(7))
+            add_line(day_header, 'class:editor.calendar')
             for week in cal.monthdatescalendar(cursor_date.year, cursor_date.month):
                 row_cells: List[str] = []
                 for day in week:
@@ -5708,6 +5787,110 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     add_control = FormattedTextControl(text=lambda: build_add_overlay())
     add_window = Window(width=92, height=Dimension(preferred=26, max=44), content=add_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
     floats = []
+    overrun_prompt: Optional[Dict[str, object]] = None
+    overrun_float: Optional[Float] = None
+    overrun_ack: Dict[str, int] = {}
+
+    def _format_duration_brief(total_seconds: int) -> str:
+        seconds = int(max(0, total_seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def build_overrun_prompt_text() -> str:
+        if not overrun_prompt:
+            return ""
+        total = int(overrun_prompt.get('total_seconds') or 0)
+        title = (overrun_prompt.get('task_title') or '').strip() or '-'
+        project = (overrun_prompt.get('project_title') or '').strip() or '-'
+        lines = [
+            "⚠️  Long Timer Detected",
+            "",
+            f"Task: {title}",
+            f"Project: {project}",
+            "",
+            f"Recorded time: {_format_duration_brief(total)}",
+            "",
+            "Is this correct?",
+            "",
+            "Enter / y  Confirm",
+            "E           Edit sessions",
+            "Esc         Dismiss",
+        ]
+        return "\n".join(lines)
+
+    overrun_control = FormattedTextControl(text=lambda: build_overrun_prompt_text())
+    overrun_body = Window(
+        width=Dimension.exact(62),
+        height=Dimension(preferred=11, max=14),
+        content=overrun_control,
+        wrap_lines=True,
+        always_hide_cursor=True,
+    )
+    overrun_window = Frame(body=overrun_body, title="Confirm Timer Duration")
+
+    def show_overrun_prompt(row: TaskRow, total_seconds: int) -> None:
+        nonlocal overrun_prompt, overrun_float, status_line
+        overrun_prompt = {
+            'task_url': row.url,
+            'task_title': row.title or row.url,
+            'project_title': row.project_title or '',
+            'total_seconds': int(max(0, total_seconds)),
+        }
+        if overrun_float and overrun_float in floats:
+            floats.remove(overrun_float)
+        overrun_float = Float(content=overrun_window, top=2, left=4)
+        floats.append(overrun_float)
+        status_line = 'Confirm timer duration'
+        invalidate()
+
+    def close_overrun_prompt(message: Optional[str] = None) -> None:
+        nonlocal overrun_prompt, overrun_float, status_line
+        if overrun_float and overrun_float in floats:
+            floats.remove(overrun_float)
+        overrun_float = None
+        overrun_prompt = None
+        if message is not None:
+            status_line = message
+        invalidate()
+
+    def confirm_overrun_prompt(message: Optional[str] = 'Timer duration confirmed') -> None:
+        nonlocal overrun_prompt
+        if not overrun_prompt:
+            return
+        url = overrun_prompt.get('task_url')
+        total = int(overrun_prompt.get('total_seconds') or 0)
+        if url:
+            prior = overrun_ack.get(url, 0)
+            overrun_ack[url] = max(prior, total)
+        close_overrun_prompt(message)
+
+    def _maybe_prompt_long_task(row: TaskRow, total_seconds: int, allow_prompt: bool = True) -> None:
+        if not row or not row.url:
+            return
+        url = row.url
+        total = int(max(0, total_seconds))
+        if total < LONG_TASK_THRESHOLD_SECONDS:
+            overrun_ack[url] = 0
+            return
+        prior = overrun_ack.get(url, 0)
+        if not allow_prompt:
+            overrun_ack[url] = max(prior, total)
+            return
+        if (prior == 0) or (total >= prior + LONG_TASK_REPROMPT_INCREMENT):
+            show_overrun_prompt(row, total)
+        else:
+            overrun_ack[url] = max(prior, total)
+
+    def _handle_timer_stop(row: TaskRow, labels_json: Optional[str] = None, allow_prompt: bool = True) -> None:
+        if not row or not row.url:
+            return
+        db.stop_session(row.url, row.project_title, row.repo, labels_json or "[]")
+        total = db.task_total_seconds(row.url)
+        _reset_timer_caches()
+        _maybe_prompt_long_task(row, total, allow_prompt)
 
     def close_add_mode(message: Optional[str] = None):
         nonlocal add_mode, add_state, add_float, status_line
@@ -5936,7 +6119,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_task_edit_calendar = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-date-calendar')
     is_task_edit_labels = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-labels')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
-    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode))
+    is_overrun_prompt = Condition(lambda: overrun_prompt is not None)
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -6040,7 +6224,30 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             except Exception:
                 pass
             all_rows = load_all()
+            try:
+                active_urls = set(db.active_task_urls())
+            except Exception:
+                active_urls = set()
+            auto_stop_count = 0
+            if active_urls:
+                for row in all_rows:
+                    if not row.url:
+                        continue
+                    if row.url not in active_urls:
+                        continue
+                    if not row.is_done:
+                        continue
+                    _handle_timer_stop(row, None, allow_prompt=False)
+                    active_urls.discard(row.url)
+                    try:
+                        logger.info("Auto-stopped timer for %s during refresh", row.url)
+                    except Exception:
+                        pass
+                    auto_stop_count += 1
             _reset_timer_caches()
+            if auto_stop_count:
+                suffix = f"Stopped {auto_stop_count} timer{'s' if auto_stop_count != 1 else ''} for done tasks"
+                status_line = f"{status_line} · {suffix}" if status_line else suffix
             current_index = 0 if all_rows else 0
             if replaced_cache:
                 progress(len(rows), len(rows), 'Updated')
@@ -6256,6 +6463,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         # Save UI state before exiting
         _save_state()
         event.app.exit()
+
+    @kb.add('enter', filter=is_overrun_prompt)
+    @kb.add('y', filter=is_overrun_prompt)
+    @kb.add('Y', filter=is_overrun_prompt)
+    def _(event):
+        confirm_overrun_prompt('Timer duration confirmed')
+
+    @kb.add('e', filter=is_overrun_prompt)
+    @kb.add('E', filter=is_overrun_prompt)
+    def _(event):
+        nonlocal current_index, status_line
+        prompt_snapshot = overrun_prompt
+        if not prompt_snapshot:
+            return
+        target_url = prompt_snapshot.get('task_url') or ''
+        close_overrun_prompt(None)
+        if not target_url:
+            return
+        rows = filtered_rows()
+        found = False
+        for idx, candidate in enumerate(rows):
+            if candidate.url == target_url:
+                current_index = idx
+                found = True
+                break
+        if not found:
+            status_line = 'Task not visible in current filter'
+            invalidate()
+            return
+        open_session_editor()
 
     @kb.add('enter')
     def _(event):
@@ -7361,6 +7598,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('escape')
     def _(event):
         nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
+        if overrun_prompt:
+            close_overrun_prompt(None)
+            return
         if edit_task_mode:
             if task_edit_state.get('mode') in ('edit-date', 'priority-select'):
                 _cancel_task_edit('Edit cancelled')
@@ -7475,9 +7715,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not t.url:
             return
         # Toggle: if running -> stop, else start
-        if t.url in db.active_task_urls():
+        active_urls = db.active_task_urls()
+        if t.url in active_urls:
             labels = fetch_labels_for_url(token, t.url) if token else []
-            db.stop_session(t.url, t.project_title, t.repo, json.dumps(labels))
+            labels_json = json.dumps(labels)
+            _handle_timer_stop(t, labels_json, allow_prompt=True)
             try:
                 logger.info("Stopped timer for %s", t.url)
             except Exception:
@@ -7489,7 +7731,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 logger.info("Started timer for %s labels=%s", t.url, labels)
             except Exception:
                 pass
-        _reset_timer_caches()
+            _reset_timer_caches()
         invalidate()
 
     # Quick export from UI: writes a JSON report next to DB with timestamp
