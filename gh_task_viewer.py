@@ -246,6 +246,7 @@ TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
 USER_ID_CACHE: Dict[str, str] = {}
 STATUS_OPTION_CACHE: Dict[str, List[Dict[str, object]]] = {}
 PRIORITY_FIELD_CACHE: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
+PEOPLE_FIELD_CACHE: Dict[str, str] = {}
 _UNSET = object()
 
 
@@ -1000,6 +1001,14 @@ class TaskDB:
         )
         self.conn.commit()
 
+    def update_assignee_field(self, url: str, field_id: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET assignee_field_id=? WHERE url=?",
+            (field_id or '', url),
+        )
+        self.conn.commit()
+
     def update_labels(self, url: str, labels: List[str]) -> None:
         try:
             payload = json.dumps(labels or [], ensure_ascii=False)
@@ -1033,6 +1042,14 @@ class TaskDB:
         cur.execute(
             "UPDATE tasks SET priority=?, priority_option_id=?, priority_dirty=0, priority_pending_option_id='' WHERE url=?",
             (priority_text, option_id or '', url),
+        )
+        self.conn.commit()
+
+    def update_priority_field(self, url: str, field_id: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET priority_field_id=? WHERE url=?",
+            (field_id or '', url),
         )
         self.conn.commit()
 
@@ -2142,6 +2159,40 @@ def get_priority_field_metadata(token: str, project_id: str) -> Tuple[str, List[
     return "", []
 
 
+def get_people_field_id(token: str, project_id: str) -> Optional[str]:
+    if not project_id:
+        return None
+    if project_id in PEOPLE_FIELD_CACHE:
+        cached = PEOPLE_FIELD_CACHE.get(project_id) or ''
+        return cached or None
+    if not token:
+        return None
+    session = _session(token)
+    try:
+        resp = _graphql_with_backoff(session, GQL_PROJECT_FIELDS, {"id": project_id})
+    except Exception:
+        PEOPLE_FIELD_CACHE[project_id] = ''
+        return None
+    errs = resp.get("errors") or []
+    if errs:
+        PEOPLE_FIELD_CACHE[project_id] = ''
+        return None
+    node = (resp.get("data") or {}).get("node") or {}
+    fields = ((node.get("fields") or {}).get("nodes")) or []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        field_id = (f.get("id") or '').strip()
+        name = (f.get("name") or '').strip().lower()
+        if not field_id or not name:
+            continue
+        if any(hint in name for hint in PEOPLE_FIELD_HINTS):
+            PEOPLE_FIELD_CACHE[project_id] = field_id
+            return field_id
+    PEOPLE_FIELD_CACHE[project_id] = ''
+    return None
+
+
 # -----------------------------
 # Fetch with progress callback
 # -----------------------------
@@ -2155,6 +2206,7 @@ def _ascii_bar(done:int, total:int, width:int=40)->str:
 
 STATUS_FIELD_HINTS = ("status", "state", "progress", "stage", "column")
 PRIORITY_FIELD_HINTS = ("priority", "prio")
+PEOPLE_FIELD_HINTS = ("people", "owner", "assignee")
 LONG_TASK_THRESHOLD_SECONDS = 4 * 60 * 60  # 4 hours
 LONG_TASK_REPROMPT_INCREMENT = 60 * 60     # re-confirm every extra hour over threshold
 
@@ -3200,6 +3252,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_state['loading_repo_metadata'] = False
         add_state['repo_metadata_source'] = ''
         add_state['repo_metadata_task'] = None
+        add_state['calendar_active'] = False
+        add_state['calendar_field'] = ''
+        add_state['calendar_date'] = ''
+        add_state['calendar_prev'] = ''
 
     async def _fetch_repo_metadata(repo_full_name: str) -> None:
         nonlocal add_state, status_line
@@ -3332,8 +3388,102 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_state['assignee_choices'] = []
         add_state['assignee_index'] = 0
         add_state['assignees_selected'] = set()
+        add_state['calendar_active'] = False
+        add_state['calendar_field'] = ''
+        add_state['calendar_date'] = ''
+        add_state['calendar_prev'] = ''
         invalidate()
         add_state['repo_metadata_task'] = asyncio.create_task(_fetch_repo_metadata(repo_full_name))
+
+    def _open_add_calendar(field: str) -> None:
+        nonlocal status_line
+        if field not in ('start', 'end', 'focus'):
+            return
+        field_map = {
+            'start': ('start_date', 'start_cursor'),
+            'end': ('end_date', 'end_cursor'),
+            'focus': ('focus_date', 'focus_cursor'),
+        }
+        field_key, cursor_key = field_map[field]
+        raw = (add_state.get(field_key) or '').strip()
+        try:
+            base_date = dt.date.fromisoformat(raw) if raw else dt.date.today()
+        except Exception:
+            base_date = dt.date.today()
+        add_state['calendar_active'] = True
+        add_state['calendar_field'] = field
+        add_state['calendar_prev'] = raw
+        add_state['calendar_date'] = base_date.isoformat()
+        status_line = f"Select {field.capitalize()} date"
+        invalidate()
+
+    def _cancel_add_calendar(message: Optional[str] = None) -> None:
+        nonlocal status_line
+        if not add_state.get('calendar_active'):
+            return
+        field = add_state.get('calendar_field') or ''
+        field_map = {
+            'start': ('start_date', 'start_cursor'),
+            'end': ('end_date', 'end_cursor'),
+            'focus': ('focus_date', 'focus_cursor'),
+        }
+        if field in field_map:
+            field_key, cursor_key = field_map[field]
+            prev = add_state.get('calendar_prev', '') or ''
+            add_state[field_key] = prev
+            add_state[cursor_key] = len(prev)
+        add_state['calendar_active'] = False
+        add_state['calendar_field'] = ''
+        add_state['calendar_prev'] = ''
+        add_state['calendar_date'] = ''
+        if message is not None:
+            status_line = message
+        invalidate()
+
+    def _confirm_add_calendar(message: Optional[str] = None) -> None:
+        nonlocal status_line
+        if not add_state.get('calendar_active'):
+            return
+        field = add_state.get('calendar_field') or ''
+        field_map = {
+            'start': ('start_date', 'start_cursor', 'Start Date'),
+            'end': ('end_date', 'end_cursor', 'End Date'),
+            'focus': ('focus_date', 'focus_cursor', 'Focus Day'),
+        }
+        entry = field_map.get(field)
+        if entry:
+            field_key, cursor_key, label = entry
+            iso = add_state.get('calendar_date') or ''
+            add_state[field_key] = iso
+            add_state[cursor_key] = len(iso)
+            if message is None:
+                status_line = f"{label} set to {iso}"
+        add_state['calendar_active'] = False
+        add_state['calendar_field'] = ''
+        add_state['calendar_prev'] = ''
+        add_state['calendar_date'] = ''
+        if message is not None:
+            status_line = message
+        invalidate()
+
+    def _add_calendar_adjust(days: int = 0, months: int = 0) -> None:
+        if not add_state.get('calendar_active'):
+            return
+        iso = add_state.get('calendar_date') or ''
+        try:
+            current = dt.date.fromisoformat(iso)
+        except Exception:
+            current = dt.date.today()
+        if months:
+            month = current.month - 1 + months
+            year = current.year + month // 12
+            month = (month % 12) + 1
+            day = min(current.day, calendar.monthrange(year, month)[1])
+            current = dt.date(year, month, day)
+        if days:
+            current += dt.timedelta(days=days)
+        add_state['calendar_date'] = current.isoformat()
+        invalidate()
 
     def build_add_overlay() -> List[Tuple[str, str]]:
         if not add_mode:
@@ -3414,11 +3564,35 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'focus': ('focus_date', 'focus_cursor'),
             }
             prompt = prompts.get(step, 'Enter Date')
-            body.append(f"{prompt}, Enter to continue, Esc cancel")
             field_key, cursor_key = field_map[step]
-            val = add_state.get(field_key, '')
-            cur = max(0, min(len(val), add_state.get(cursor_key, len(val))))
-            body.append(val[:cur] + "_" + val[cur:])
+            if add_state.get('calendar_active') and add_state.get('calendar_field') == step:
+                iso = add_state.get('calendar_date') or add_state.get(field_key) or dt.date.today().isoformat()
+                try:
+                    cursor_date = dt.date.fromisoformat(str(iso))
+                except Exception:
+                    cursor_date = dt.date.today()
+                cal = calendar.Calendar(firstweekday=0)
+                body.append("Use h/l day, j/k week, </> month, t today, Enter=save, Esc=cancel")
+                body.append(cursor_date.strftime("%B %Y"))
+                header = ''.join(f" {calendar.day_abbr[i][:2]} " for i in range(7))
+                body.append(header)
+                for week in cal.monthdatescalendar(cursor_date.year, cursor_date.month):
+                    row_cells: List[str] = []
+                    for day in week:
+                        label = f"{day.day:2d}"
+                        if day == cursor_date:
+                            cell = f"[{label}]"
+                        elif day.month != cursor_date.month:
+                            cell = f"({label})"
+                        else:
+                            cell = f" {label} "
+                        row_cells.append(cell)
+                    body.append(''.join(row_cells))
+            else:
+                body.append(f"{prompt}. Enter to continue, Esc cancel, press C for calendar")
+                val = add_state.get(field_key, '')
+                cur = max(0, min(len(val), add_state.get(cursor_key, len(val))))
+                body.append(val[:cur] + "_" + val[cur:])
         elif step == 'iteration':
             body.append("Use j/k to move, Enter to choose, Esc cancel")
             choices = add_state.get('iteration_choices') or []
@@ -3911,6 +4085,96 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _refresh_task_editor_state()
         invalidate()
 
+    async def _load_priority_options_for_editor(row: TaskRow) -> None:
+        nonlocal all_rows, status_line
+        if not edit_task_mode:
+            return
+        if task_edit_state.get('priority_loading'):
+            return
+        if not token:
+            msg = 'GITHUB_TOKEN required for priority options'
+            status_line = msg
+            task_edit_state['message'] = msg
+            invalidate(); return
+        if not row or not (row.project_id or '').strip():
+            task_edit_state['message'] = 'Priority field metadata unavailable'
+            invalidate(); return
+        task_edit_state['priority_loading'] = True
+        task_edit_state['message'] = 'Loading priority options…'
+        invalidate()
+        loop = asyncio.get_running_loop()
+
+        def _fetch_priority() -> Tuple[str, List[Dict[str, str]]]:
+            field_id = (row.priority_field_id or '').strip()
+            options: List[Dict[str, str]] = []
+            project_id = (row.project_id or '').strip()
+            if project_id:
+                cached_field_id, cached_options = get_priority_field_metadata(token, project_id)
+                if cached_field_id and not field_id:
+                    field_id = cached_field_id
+                if cached_options:
+                    options = cached_options
+            if field_id and not options:
+                options = get_project_field_options(token, field_id)
+            return field_id, options
+
+        try:
+            field_id, options = await loop.run_in_executor(None, _fetch_priority)
+        except Exception as exc:
+            task_edit_state['message'] = f'Priority options unavailable: {exc}'
+        else:
+            if field_id:
+                if field_id != (row.priority_field_id or '').strip():
+                    db.update_priority_field(row.url, field_id)
+                if options:
+                    db.update_priority_options_by_field(field_id, options)
+                    db.update_priority_options(row.url, options)
+                    all_rows = load_all()
+                    task_edit_state['message'] = 'Priority options loaded'
+                else:
+                    task_edit_state['message'] = 'Priority options unavailable'
+            else:
+                task_edit_state['message'] = 'Priority field not configured'
+        finally:
+            task_edit_state['priority_loading'] = False
+            _refresh_task_editor_state(preserve_cursor=False)
+            invalidate()
+
+    async def _ensure_assignee_field(row: TaskRow) -> None:
+        nonlocal all_rows, status_line
+        if not edit_task_mode:
+            return
+        if task_edit_state.get('assignee_loading'):
+            return
+        if not token:
+            msg = 'GITHUB_TOKEN required for People field'
+            status_line = msg
+            task_edit_state['message'] = msg
+            invalidate(); return
+        if not row or not (row.project_id or '').strip():
+            task_edit_state['message'] = 'People field metadata unavailable'
+            invalidate(); return
+        task_edit_state['assignee_loading'] = True
+        task_edit_state['message'] = 'Loading People field…'
+        invalidate()
+        loop = asyncio.get_running_loop()
+        try:
+            field_id = await loop.run_in_executor(None, lambda: get_people_field_id(token, row.project_id))
+        except Exception as exc:
+            task_edit_state['message'] = f'People field lookup failed: {exc}'
+        else:
+            if field_id:
+                if field_id != (row.assignee_field_id or '').strip():
+                    db.update_assignee_field(row.url, field_id)
+                    all_rows = load_all()
+                task_edit_state['message'] = 'People field ready; press Enter again'
+            else:
+                task_edit_state['message'] = 'People field not found'
+        finally:
+            task_edit_state['assignee_loading'] = False
+            _refresh_task_editor_state(preserve_cursor=False)
+            invalidate()
+
     async def _load_label_choices_for_editor(repo_full: str, initial_selection: Set[str]) -> None:
         if not token:
             if edit_task_mode and task_edit_state.get('labels_repo') == repo_full:
@@ -4289,7 +4553,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'value': row.focus_date or '',
         })
         priority_opts = _priority_options(row)
-        if priority_opts:
+        priority_field_known = bool((row.priority_field_id or '').strip())
+        if priority_opts or priority_field_known:
             try:
                 current_idx = next((idx for idx, opt in enumerate(priority_opts) if (opt.get('id') or '').strip() == (row.priority_option_id or '').strip()), 0)
             except Exception:
@@ -4300,6 +4565,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'field_key': 'priority',
                 'options': priority_opts,
                 'index': current_idx,
+                'field_available': priority_field_known,
             })
         elif (row.priority or '').strip():
             fields.append({
@@ -4360,6 +4626,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['fields'] = fields
         task_edit_state['cursor'] = cursor
         task_edit_state['task_url'] = row.url
+        task_edit_state['priority_loading'] = False
+        task_edit_state['assignee_loading'] = False
         if task_edit_state.get('mode') != 'list':
             task_edit_state['mode'] = 'list'
             task_edit_state['input'] = ''
@@ -5450,9 +5718,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if ftype == 'priority':
                     opts = field_info.get('options') or []
                     index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
-                    value = opts[index].get('name') if opts else '(no options)'
-                    if opts and row and getattr(row, 'priority_dirty', 0):
-                        value = (value or '-') + '*'
+                    if opts:
+                        value = opts[index].get('name') if opts else '(no options)'
+                        if row and getattr(row, 'priority_dirty', 0):
+                            value = (value or '-') + '*'
+                    else:
+                        fallback = (row.priority or '').strip() if row else ''
+                        if fallback:
+                            value = fallback
+                        else:
+                            if field_info.get('field_available'):
+                                value = '(load options)'
+                            else:
+                                value = '(none)'
                 elif ftype == 'assignees':
                     vals = field_info.get('value') or []
                     if isinstance(vals, list):
@@ -5897,6 +6175,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if add_float and add_float in floats:
             floats.remove(add_float)
         add_float = None
+        if add_state.get('calendar_active'):
+            _cancel_add_calendar(None)
         task = add_state.get('repo_metadata_task') if isinstance(add_state, dict) else None
         if isinstance(task, asyncio.Task):
             task.cancel()
@@ -5949,6 +6229,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'message': 'Use j/k to select, Enter to edit, Esc to close',
             'task_url': row.url,
             'editing': None,
+            'priority_loading': False,
+            'assignee_loading': False,
         }
         if task_edit_float and task_edit_float in floats:
             floats.remove(task_edit_float)
@@ -5985,6 +6267,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['mode'] = 'list'
         task_edit_state['input'] = ''
         task_edit_state['editing'] = None
+        task_edit_state['priority_loading'] = False
+        task_edit_state['assignee_loading'] = False
         task_edit_state['message'] = message or 'Edit cancelled'
         invalidate()
 
@@ -6016,13 +6300,26 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['message'] = 'Use h/j/k/l to move, </> month, t=Today, Enter=save, Esc=cancel'
         elif ftype == 'priority':
             options = field.get('options') or []
+            rows = filtered_rows()
+            row = rows[current_index] if rows else None
             if not options:
-                task_edit_state['message'] = 'Priority options unavailable'
+                if not row:
+                    task_edit_state['message'] = 'No task selected'
+                    return
+                asyncio.create_task(_load_priority_options_for_editor(row))
                 return
             task_edit_state['mode'] = 'priority-select'
             task_edit_state['editing'] = {'field_idx': cursor, 'prev_index': field.get('index', 0)}
             task_edit_state['message'] = 'Use j/k to choose priority (Enter=save, Esc=cancel)'
         elif ftype == 'assignees':
+            rows = filtered_rows()
+            if not rows:
+                task_edit_state['message'] = 'No task selected'
+                invalidate(); return
+            row = rows[current_index]
+            if not (row.assignee_field_id or '').strip():
+                asyncio.create_task(_ensure_assignee_field(row))
+                return
             current = field.get('value') or []
             if not isinstance(current, list):
                 current = []
@@ -6112,6 +6409,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     kb = KeyBindings()
     # Mode filters to enable/disable keybindings contextually
     is_add_mode = Condition(lambda: add_mode)
+    is_add_calendar = Condition(lambda: add_mode and bool(add_state.get('calendar_active')))
+    is_add_date_input = Condition(lambda: add_mode and add_state.get('step') in ('start', 'end', 'focus') and not add_state.get('calendar_active'))
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
     is_task_edit_text = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-assignees', 'edit-comment'))
@@ -7036,6 +7335,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'metadata_error': '',
             'repo_metadata_source': '',
             'repo_metadata_task': None,
+            'calendar_active': False,
+            'calendar_field': '',
+            'calendar_date': '',
+            'calendar_prev': '',
         }
         _set_project_choices_for_mode('issue')
         if add_float and add_float in floats:
@@ -7243,7 +7546,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_state[cursor_key] = cur + len(ch)
         invalidate()
 
-    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') in ('start','end','focus')))
+    @kb.add('c', filter=Condition(lambda: add_mode and add_state.get('step') in ('start','end','focus') and not add_state.get('calendar_active')))
+    @kb.add('C', filter=Condition(lambda: add_mode and add_state.get('step') in ('start','end','focus') and not add_state.get('calendar_active')))
+    def _(event):
+        step = add_state.get('step')
+        if step in ('start', 'end', 'focus'):
+            _open_add_calendar(step)
+
+    @kb.add(Keys.Any, filter=is_add_date_input)
     def _(event):
         ch = event.data or ""
         if not ch or (ch not in '0123456789-' and ch.lower() != 't'):
@@ -7264,8 +7574,44 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         else:
             if len(date_val) >= 10:
                 return
-            add_state[field_key] = date_val[:cur] + ch + date_val[cur:]
+            updated = date_val[:cur] + ch + date_val[cur:]
+            add_state[field_key] = updated
             add_state[cursor_key] = cur + 1
+        invalidate()
+
+    @kb.add('h', filter=is_add_calendar)
+    @kb.add('left', filter=is_add_calendar)
+    def _(event):
+        _add_calendar_adjust(days=-1)
+
+    @kb.add('l', filter=is_add_calendar)
+    @kb.add('right', filter=is_add_calendar)
+    def _(event):
+        _add_calendar_adjust(days=1)
+
+    @kb.add('j', filter=is_add_calendar)
+    @kb.add('down', filter=is_add_calendar)
+    def _(event):
+        _add_calendar_adjust(days=7)
+
+    @kb.add('k', filter=is_add_calendar)
+    @kb.add('up', filter=is_add_calendar)
+    def _(event):
+        _add_calendar_adjust(days=-7)
+
+    @kb.add('<', filter=is_add_calendar)
+    @kb.add('pageup', filter=is_add_calendar)
+    def _(event):
+        _add_calendar_adjust(months=-1)
+
+    @kb.add('>', filter=is_add_calendar)
+    @kb.add('pagedown', filter=is_add_calendar)
+    def _(event):
+        _add_calendar_adjust(months=1)
+
+    @kb.add('t', filter=is_add_calendar)
+    def _(event):
+        add_state['calendar_date'] = dt.date.today().isoformat()
         invalidate()
 
     @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') == 'repo' and not add_state.get('repo_choices')))
@@ -7326,6 +7672,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('enter', filter=is_add_mode)
     def _(event):
         nonlocal status_line
+        if add_state.get('calendar_active'):
+            _confirm_add_calendar()
         step = add_state.get('step')
         if step == 'mode':
             idx = add_state.get('mode_index', 0)
@@ -7600,6 +7948,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
         if overrun_prompt:
             close_overrun_prompt(None)
+            return
+        if add_mode and add_state.get('calendar_active'):
+            _cancel_add_calendar('Calendar cancelled')
             return
         if edit_task_mode:
             if task_edit_state.get('mode') in ('edit-date', 'priority-select'):
