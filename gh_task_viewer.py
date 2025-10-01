@@ -305,6 +305,8 @@ class TaskRow:
     project_title: str
     start_field: str
     start_date: str
+    end_field: str
+    end_date: str
     focus_field: str
     focus_date: str
     focus_field_id: str = ""
@@ -347,7 +349,7 @@ class TaskRow:
 class TaskDB:
     SCHEMA_COLUMNS = [
         "owner_type","owner","project_number","project_title",
-        "start_field","start_date",
+        "start_field","start_date","end_field","end_date",
         "focus_field","focus_date","focus_field_id",
         "iteration_field","iteration_title","iteration_start","iteration_duration",
         "title","repo_id","repo","labels","priority","priority_field_id","priority_option_id","priority_options","priority_dirty","priority_pending_option_id","url","updated_at","status","is_done","assigned_to_me","created_by_me",
@@ -362,6 +364,8 @@ class TaskDB:
         project_title TEXT NOT NULL,
         start_field TEXT NOT NULL,
         start_date TEXT NOT NULL,
+        end_field TEXT,
+        end_date TEXT,
         focus_field TEXT NOT NULL,
         focus_date TEXT NOT NULL,
         focus_field_id TEXT,
@@ -417,6 +421,7 @@ class TaskDB:
 
     def _idx(self):
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(start_date)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_end_date ON tasks(end_date)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_focus_date ON tasks(focus_date)")
         self.conn.commit()
 
@@ -439,7 +444,7 @@ class TaskDB:
         cur.execute(self.CREATE_TABLE_SQL)
         defaults = {
             "owner_type":"''","owner":"''","project_number":"0","project_title":"''",
-            "start_field":"''","start_date":"''",
+            "start_field":"''","start_date":"''","end_field":"''","end_date":"''",
             "focus_field":"''","focus_date":"''","focus_field_id":"''",
             "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
             "title":"''","repo_id":"''","repo":"NULL","labels":"'[]'","priority":"NULL","priority_field_id":"''","priority_option_id":"''","priority_options":"'[]'","priority_dirty":"0","priority_pending_option_id":"''","url":"''",
@@ -1105,7 +1110,7 @@ class TaskDB:
         cur.executemany(
             """            INSERT INTO tasks (
               owner_type, owner, project_number, project_title,
-              start_field, start_date,
+              start_field, start_date, end_field, end_date,
               focus_field, focus_date, focus_field_id,
               iteration_field, iteration_title, iteration_start, iteration_duration,
               title, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
@@ -1113,15 +1118,17 @@ class TaskDB:
               item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
               start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids, assignee_logins, content_node_id
             ) VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
                           updated_at=excluded.updated_at,
+                          end_field=excluded.end_field,
+                          end_date=excluded.end_date,
                           focus_field_id=excluded.focus_field_id,
                           priority=excluded.priority,
                           priority_field_id=excluded.priority_field_id,
@@ -1161,6 +1168,8 @@ class TaskDB:
                     r.project_title,
                     r.start_field,
                     r.start_date,
+                    r.end_field,
+                    r.end_date,
                     r.focus_field,
                     r.focus_date,
                     r.focus_field_id,
@@ -1227,7 +1236,7 @@ class TaskDB:
             today = today or dt.date.today().isoformat()
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,focus_field_id,
+                       start_date,end_field,end_date,focus_field,focus_date,focus_field_id,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
@@ -1241,7 +1250,7 @@ class TaskDB:
         else:
             cur.execute(
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
-                       start_date,focus_field,focus_date,focus_field_id,
+                       start_date,end_field,end_date,focus_field,focus_date,focus_field_id,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
@@ -2260,6 +2269,7 @@ def _ascii_bar(done:int, total:int, width:int=40)->str:
 STATUS_FIELD_HINTS = ("status", "state", "progress", "stage", "column")
 PRIORITY_FIELD_HINTS = ("priority", "prio")
 PEOPLE_FIELD_HINTS = ("people", "owner", "assignee")
+END_FIELD_HINTS = ("end date", "due date", "target date", "finish date")
 LONG_TASK_THRESHOLD_SECONDS = 4 * 60 * 60  # 4 hours
 LONG_TASK_REPROMPT_INCREMENT = 60 * 60     # re-confirm every extra hour over threshold
 
@@ -2519,15 +2529,22 @@ def fetch_tasks_github(
                         if nm:
                             label_names.append(str(nm))
 
+                assignee_logins_raw: List[str] = []
                 assignees_norm: List[str] = []
                 if ctype in ("Issue", "PullRequest"):
                     for node in (content.get("assignees") or {}).get("nodes") or []:
-                        login_norm = _norm_login((node or {}).get("login"))
+                        login_raw = (node or {}).get("login")
+                        login_clean = (login_raw or '').strip()
+                        if login_clean:
+                            assignee_logins_raw.append(login_clean)
+                        login_norm = _norm_login(login_raw)
                         if login_norm:
                             assignees_norm.append(login_norm)
                 people_logins: List[str] = []
                 assignee_field_id: str = ""
                 assignee_user_ids: List[str] = []
+                end_field_name: str = ""
+                end_date_value: str = ""
                 status_text: Optional[str] = None
                 status_field_id: str = ""
                 status_field_priority = 999
@@ -2551,7 +2568,11 @@ def fetch_tasks_github(
                         field_data = fv.get("field") or {}
                         assignee_field_id = field_data.get("id") or assignee_field_id
                         for node in (fv.get("users") or {}).get("nodes") or []:
-                            login_norm = _norm_login((node or {}).get("login"))
+                            login_raw = (node or {}).get("login")
+                            login_clean = (login_raw or '').strip()
+                            if login_clean:
+                                assignee_logins_raw.append(login_clean)
+                            login_norm = _norm_login(login_raw)
                             if login_norm:
                                 people_logins.append(login_norm)
                             node_id = (node or {}).get("id")
@@ -2606,6 +2627,14 @@ def fetch_tasks_github(
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
                         field_info = fv.get("field") or {}
                         start_field_id = field_info.get("id") or start_field_id
+                        fname_raw = (field_info.get("name") or "")
+                        fname_lower = fname_raw.strip().lower()
+                        if fname_lower in END_FIELD_HINTS:
+                            candidate = (fv.get("date") or "").strip()
+                            if fname_raw:
+                                end_field_name = fname_raw
+                            if candidate:
+                                end_date_value = candidate
                     if (not iteration_captured) and fv and fv.get("__typename") == "ProjectV2ItemFieldIterationValue":
                         field_info = fv.get("field") or {}
                         fname_iter = (field_info.get("name") or "")
@@ -2683,6 +2712,31 @@ def fetch_tasks_github(
                 if not priority_options_list and priority_options_cache:
                     priority_options_list = priority_options_cache.copy()
 
+                if assignee_user_ids:
+                    seen_ids = set()
+                    unique_ids = []
+                    for uid in assignee_user_ids:
+                        if uid and uid not in seen_ids:
+                            seen_ids.add(uid)
+                            unique_ids.append(uid)
+                    assignee_user_ids = unique_ids
+
+                seen_assignees: Set[str] = set()
+                assignee_logins_ordered: List[str] = []
+                for login in assignee_logins_raw:
+                    login_clean = login.strip()
+                    if not login_clean:
+                        continue
+                    key = login_clean.lower()
+                    if key in seen_assignees:
+                        continue
+                    seen_assignees.add(key)
+                    assignee_logins_ordered.append(login_clean)
+                try:
+                    assignee_logins_json = json.dumps(assignee_logins_ordered, ensure_ascii=False)
+                except Exception:
+                    assignee_logins_json = "[]"
+
                 found_date = False
                 for fv in (it.get("fieldValues") or {}).get("nodes") or []:
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
@@ -2704,6 +2758,8 @@ def fetch_tasks_github(
                                 owner_type=owner_type, owner=owner, project_number=number,
                                 project_title=project_title,
                                 start_field=fname, start_date=fdate,
+                                end_field=end_field_name or "",
+                                end_date=end_date_value or "",
                                 focus_field=focus_fname or "",
                                 focus_date=focus_fdate or "",
                                 iteration_field=iteration_field,
@@ -2734,6 +2790,7 @@ def fetch_tasks_github(
                                 iteration_options=json.dumps(iteration_options_list, ensure_ascii=False),
                                 assignee_field_id=assignee_field_id,
                                 assignee_user_ids=json.dumps(assignee_user_ids, ensure_ascii=False),
+                                assignee_logins=assignee_logins_json,
                             )
                         )
                         found_date = True
@@ -2748,6 +2805,8 @@ def fetch_tasks_github(
                             owner_type=owner_type, owner=owner, project_number=number,
                             project_title=project_title,
                             start_field="(no date)", start_date="",
+                            end_field=end_field_name or "",
+                            end_date=end_date_value or "",
                             focus_field=focus_fname or "",
                             focus_date=focus_fdate or "",
                             iteration_field=iteration_field,
@@ -2779,6 +2838,7 @@ def fetch_tasks_github(
                             iteration_options=json.dumps(iteration_options_list, ensure_ascii=False),
                             assignee_field_id=assignee_field_id,
                             assignee_user_ids=json.dumps(assignee_user_ids, ensure_ascii=False),
+                            assignee_logins=assignee_logins_json,
                         )
                     )
 
@@ -2944,8 +3004,34 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
     if not tasks:
         return [("bold", "Nothing to show."), ("", " Press "), ("bold", "u"), ("", " to fetch.")]
 
+    def _assignee_display(row: TaskRow) -> str:
+        raw = row.assignee_logins or '[]'
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                parsed = []
+        except Exception:
+            parsed = []
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        for value in parsed:
+            login = str(value).strip()
+            if not login:
+                continue
+            key = login.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(login)
+        if cleaned:
+            display = ", ".join(cleaned[:3])
+            if len(cleaned) > 3:
+                display += ", …"
+            return display
+        return "@me" if row.assigned_to_me else '-'
+
     current: Optional[str] = None
-    header = "Focus Day   Start Date   Status   Priority   Title                                     Repo                 URL"
+    header = "Focus Day   Start Date   End Date    Status   Priority   Assignees           Title                                     Repo                 URL"
     for t in tasks:
         if t.project_title != current:
             current = t.project_title
@@ -2958,14 +3044,16 @@ def build_fragments(tasks: List[TaskRow], today: dt.date) -> List[Tuple[str, str
         col = color_for_date(t.focus_date, today)
         focus_cell = _pad_display(t.focus_date or '-', 11)
         start_cell = _pad_display(t.start_date, 12)
+        end_cell = _pad_display(t.end_date or '-', 12)
         status_cell = _pad_display(t.status or '-', 10)
         priority_cell = _pad_display((t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else ''), 10)
+        assignee_cell = _pad_display(_assignee_display(t), 20)
         title_cell = _pad_display(t.title, 45)
         repo_cell = _pad_display(t.repo or '-', 20)
         url_cell = _pad_display(t.url, 40)
         frags.append((col, focus_cell))
         frags.append(("",  "  "))
-        frags.append(("", f"{start_cell}  {status_cell}  {priority_cell}  {title_cell}  {repo_cell}  {url_cell}"))
+        frags.append(("", f"{start_cell}  {end_cell}  {status_cell}  {priority_cell}  {assignee_cell}  {title_cell}  {repo_cell}  {url_cell}"))
         frags.append(("", "\n"))
 
     if frags and frags[-1] == ("", "\n"):
@@ -4760,8 +4848,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             proj_min = 12
             title_min = 20
             label_min = 16
-            spaces_width = 2 * 7  # gaps between columns
-            fixed = 2 + 11 + 12 + 10 + priority_w + time_w + spaces_width  # marker + focus + start + status + priority + time + spaces
+            end_w = 12
+            assignee_min = 16
+            assignee_w = max(assignee_min, 18)
+            spaces_width = 2 * 9  # gaps between columns (after focus)
+            fixed = 2 + 11 + 12 + end_w + 10 + priority_w + assignee_w + time_w + spaces_width
             dyn = max(title_min + label_min + proj_min, avail_cols - fixed)
             extra = dyn - (title_min + label_min + proj_min)
             weights = [2, 1, 1]
@@ -4783,8 +4874,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             header = (
                 "  " + _pad_display("Focus Day", 11) +
                 "  " + _pad_display("Start Date", 12) +
+                "  " + _pad_display("End Date", end_w) +
                 "  " + _pad_display("Status", 10) +
                 "  " + _pad_display("Priority", priority_w) +
+                "  " + _pad_display("Assignees", assignee_w) +
                 "  " + _pad_display("Time", time_w, align='right') +
                 "  " + _pad_display("Title", title_w) +
                 "  " + _pad_display("Labels", label_w) +
@@ -4824,6 +4917,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             variants = max(1, len(FUTURE_ROW_STYLE_CLASSES))
             for idx, (_, date_key) in enumerate(future_dates):
                 future_map[date_key] = idx % variants
+
+        me_login = (cfg.user or '').strip().lower()
+
+        def assignee_text_for(row: TaskRow) -> str:
+            raw = row.assignee_logins or '[]'
+            try:
+                parsed = json.loads(raw)
+                if not isinstance(parsed, list):
+                    parsed = []
+            except Exception:
+                parsed = []
+            cleaned: List[str] = []
+            seen: Set[str] = set()
+            for value in parsed:
+                login = str(value).strip()
+                if not login:
+                    continue
+                key = login.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append(login)
+            if cleaned:
+                display: List[str] = []
+                for login in cleaned[:3]:
+                    marker = '*' if me_login and login.lower() == me_login else ''
+                    display.append(f"{login}{marker}")
+                if len(cleaned) > 3:
+                    display.append('…')
+                return ", ".join(display)
+            if row.assigned_to_me and me_login:
+                return f"@{cfg.user}*"
+            if row.assigned_to_me:
+                return "@me"
+            return '-'
 
         def status_style_for(name: Optional[str]) -> str:
             if not name:
@@ -4971,11 +5099,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             else:
                 focus_cell = _pad_display(t.focus_date or '-', 11)
                 start_cell = _pad_display(t.start_date, 12)
+                end_cell = _pad_display(t.end_date or '-', end_w)
+                assignee_cell = _pad_display(assignee_text_for(t), assignee_w)
                 labels_cell = _pad_display(labels_text or '-', label_w)
                 add_segment(focus_cell, base_style)
                 add_column(start_cell, base_style)
+                add_column(end_cell, base_style)
                 add_column(status_cell, status_style)
                 add_column(priority_cell)
+                add_column(assignee_cell)
                 add_column(time_cell, running_style if running_style else base_style)
                 add_column(title_cell)
                 add_column(labels_cell)
@@ -8598,6 +8730,7 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
             rows.append(TaskRow(
                 owner_type="org", owner="example", project_number=i, project_title=proj,
                 start_field="Start date", start_date=date_str,
+                end_field="End date", end_date=(today + dt.timedelta(days=d_off + 3)).isoformat(),
                 focus_field="Focus Day", focus_date=date_str,
                 focus_field_id="focus-field",
                 title=f"Task {i}-{d_off}",
@@ -8624,6 +8757,7 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 iteration_options=json.dumps(iteration_options, ensure_ascii=False),
                 assignee_field_id=assignee_field_id,
                 assignee_user_ids=assignee_user_ids,
+                assignee_logins=json.dumps([cfg.user, "teammate"], ensure_ascii=False),
             ))
     return rows
 
