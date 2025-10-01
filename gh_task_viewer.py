@@ -5,7 +5,8 @@
 #   u  refresh (runs in background and updates a progress bar)
 #   t  show tasks with date == today
 #   T  set focus day for current task to today
-#   Y  set focus day for current task to tomorrow
+#   Y  shift focus day +1 day
+#   y  shift focus day -1 day
 #   a  show all cached tasks
 #   P  clear project filter (show all projects again)
 #   N  toggle hide tasks with no date
@@ -7096,12 +7097,29 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         today_focus = dt.date.today().isoformat()
         asyncio.create_task(_update_task_date('focus', today_focus))
 
+    def _focus_shift(days: int) -> None:
+        rows = filtered_rows()
+        if not rows:
+            return
+        row = rows[current_index]
+        try:
+            current = dt.date.fromisoformat(row.focus_date or row.start_date or '')
+        except Exception:
+            current = dt.date.today()
+        new_date = (current + dt.timedelta(days=days)).isoformat()
+        asyncio.create_task(_update_task_date('focus', new_date))
+
     @kb.add('Y', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
             return
-        tomorrow_focus = (dt.date.today() + dt.timedelta(days=1)).isoformat()
-        asyncio.create_task(_update_task_date('focus', tomorrow_focus))
+        _focus_shift(1)
+
+    @kb.add('y', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        _focus_shift(-1)
 
     @kb.add('a', filter=is_normal)
     def _(event):
@@ -8447,7 +8465,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  D / I               Set status Done / In Progress",
                 "  ] / [               Priority next / previous",
                 "  T                   Set focus day to today",
-                "  Y                   Set focus day to tomorrow",
+                "  Y / y               Focus +1 day / -1 day",
                 "  O                   Edit task fields",
                 "  E                   Edit work sessions",
                 "",
