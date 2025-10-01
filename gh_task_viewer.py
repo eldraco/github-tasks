@@ -1462,6 +1462,34 @@ GQL_MUTATION_SET_USERS_USERIDS = """mutation($projectId:ID!, $itemId:ID!, $field
 }
 """
 
+GQL_MUTATION_SET_USERS_WRAPPED = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $userIds:[ID!]!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{projectV2FieldUserValue:{userIds:$userIds}}
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
+GQL_MUTATION_SET_USERS_WRAPPED_ITEM = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $userIds:[ID!]!) {
+  updateProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId,
+      value:{projectV2ItemFieldUserValue:{userIds:$userIds}}
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
 GQL_MUTATION_SET_USERS_TEMPLATE = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!) {
   updateProjectV2ItemFieldValue(
     input:{
@@ -1848,25 +1876,31 @@ def set_project_users(token: str, project_id: str, item_id: str, field_id: str, 
         user_ids = []
     session = _session(token)
     filtered_ids = [uid for uid in user_ids if uid]
-    def _escape(uid: str) -> str:
-        return (uid or '').replace('"', '\"')
+    base_vars = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+    }
 
-    node_payload_id = ", ".join(f'{{id:"{_escape(uid)}"}}' for uid in filtered_ids)
-    node_payload_user = ", ".join(f'{{userId:"{_escape(uid)}"}}' for uid in filtered_ids)
+    attempts: List[Tuple[str, Dict[str, object]]] = []
 
-    attempts: List[str] = []
-    attempts.append(GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", node_payload_id))
-    if filtered_ids:
-        # Some older API variants expect userId instead of id; try both for compatibility.
-        attempts.append(GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", node_payload_user))
+    attempts.append((GQL_MUTATION_SET_USERS_USERIDS, {**base_vars, "userIds": filtered_ids}))
+    attempts.append((GQL_MUTATION_SET_USERS_WRAPPED, {**base_vars, "userIds": filtered_ids}))
+    attempts.append((GQL_MUTATION_SET_USERS_WRAPPED_ITEM, {**base_vars, "userIds": filtered_ids}))
+
+    def _build_template(ids: List[str]) -> str:
+        if not ids:
+            nodes = ""
+        else:
+            def _escape(uid: str) -> str:
+                return uid.replace('"', '\"')
+            nodes = ", ".join(f'{{userId:"{_escape(uid)}"}}' for uid in ids)
+        return GQL_MUTATION_SET_USERS_TEMPLATE.replace("__NODES__", nodes)
+
+    attempts.append((_build_template(filtered_ids), base_vars))
 
     last_error = ""
-    for query in attempts:
-        variables = {
-            "projectId": project_id,
-            "itemId": item_id,
-            "fieldId": field_id,
-        }
+    for query, variables in attempts:
         try:
             resp = _graphql_with_backoff(session, query, variables)
         except Exception as exc:
