@@ -5,6 +5,7 @@
 #   u  refresh (runs in background and updates a progress bar)
 #   t  show tasks with date == today
 #   T  set focus day for current task to today
+#   Y  set focus day for current task to tomorrow
 #   a  show all cached tasks
 #   P  clear project filter (show all projects again)
 #   N  toggle hide tasks with no date
@@ -7095,6 +7096,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         today_focus = dt.date.today().isoformat()
         asyncio.create_task(_update_task_date('focus', today_focus))
 
+    @kb.add('Y', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        tomorrow_focus = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+        asyncio.create_task(_update_task_date('focus', tomorrow_focus))
+
     @kb.add('a', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
@@ -8439,6 +8447,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  D / I               Set status Done / In Progress",
                 "  ] / [               Priority next / previous",
                 "  T                   Set focus day to today",
+                "  Y                   Set focus day to tomorrow",
                 "  O                   Edit task fields",
                 "  E                   Edit work sessions",
                 "",
