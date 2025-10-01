@@ -130,6 +130,8 @@ Filters
 - `N`: toggle hide tasks with no date
 - `F`: set Date <= filter (YYYY-MM-DD)
 - `t / a`: show today only / show all
+- `T`: set the selected task's focus day to today
+- `Y / y`: move the selected task's focus day forward/backward by one day
 
 Cache & fetch
 - `u`: fetch from GitHub and update local cache
@@ -170,7 +172,8 @@ Get situational awareness at a glance.
 - Dynamic table width that adapts to your terminal size
 - Columns: Focus Date, Start Date, Status, Time, Title, Project
 - `Time` column shows `mm:ss|H:MM` = current run | total per task
-- Running timers are marked with `⏱` and rendered in cyan
+- Running timers are marked with `⏱` and rendered in cyan across the entire row
+- Rows are color-coded by focus date: today in bold red, past dates a softer red, and future dates rotate through a palette so each day stands out (status-specific colors still take precedence for "In Progress" or "Waiting")
 - Top bar shows a live Now/Task/Project timers snapshot
 - Right panel lists per-project stats and total time
 
