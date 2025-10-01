@@ -246,15 +246,44 @@ scan_project() {
           | select(.date <= $date)
         ][0];
 
+      def end_candidates: ["end date","due date","target date","finish date"];
+
+      def end_match:
+        [ .fieldValues.nodes[]?
+          | select(.__typename=="ProjectV2ItemFieldDateValue")
+          | . as $node
+          | ((.field.name // "") | ascii_downcase) as $nm
+          | select( (end_candidates | index($nm)) != null )
+          | $node
+        ][0];
+
+      def assignee_list:
+        (
+          [ .content.assignees.nodes[]?.login ] +
+          [ .fieldValues.nodes[]?
+              | select(.__typename=="ProjectV2ItemFieldUserValue")
+              | .users.nodes[]?.login
+          ]
+        | map(select(. != null) | tostring)
+        | sort
+        | unique
+        );
+
       (.. | .items? | objects | .nodes? // empty)[]? as $it
       | ( $it | assigned_to_me ) as $am
       | ( $it | start_match ) as $sm
       | select($am and ($sm != null))
+      | ( $it | end_match ) as $em
+      | ( $it | assignee_list ) as $assignees
       | {
           project: ($it.project.title // ""),
           project_url: ($it.project.url // ""),
-          start_field: $sm.field.name,
-          start_date: $sm.date,
+          start_field: (try ($sm.field.name) catch ""),
+          start_date: (try ($sm.date) catch ""),
+          end_field: (if (($em | type) == "object") then (try ($em.field.name) catch "") else "" end),
+          end_date:  (if (($em | type) == "object") then (try ($em.date) catch "") else "" end),
+          assignees: $assignees,
+          assignees_text: (if ($assignees | length) > 0 then ($assignees | join(", ")) else "" end),
           title: ( $it.content.title // "(Draft item)" ),
           url:   ( $it.content.url   // ($it.project.url // "") ),
           repo:  ( $it.content.repository.nameWithOwner // null )
@@ -318,8 +347,19 @@ TMP_LINES="$(mktemp 2>/dev/null || mktemp -t tmp)"
 printf "%s" "$RESULTS_JSON" | jq -r '
   group_by(.project)[]
   | "## " + (.[0].project // "(No project title)"),
-    "DATE\tFIELD\tTITLE\tREPO\tURL",
-    ( .[] | [ .start_date, .start_field, .title, (.repo // "-"), .url ] | @tsv ),
+    "DATE\tEND\tFIELD\tASSIGNEES\tTITLE\tREPO\tURL",
+    ( .[]
+      | [
+          (.start_date // ""),
+          (.end_date   // ""),
+          (.start_field // ""),
+          (if (.assignees_text // "") != "" then .assignees_text else "-" end),
+          (.title // ""),
+          (.repo  // "-"),
+          (.url   // "")
+        ]
+      | @tsv
+    ),
     ""
 ' > "$TMP_LINES"
 
@@ -330,15 +370,17 @@ COLS="${COLUMNS:-}"
 [ -z "$COLS" ] && COLS=120
 
 W_DATE=10     #  YYYY-MM-DD
+W_END=10
 W_FIELD=22
+W_ASSIGNEES=20
 W_REPO=28
 W_URL=40
 SPACE_PAD=2   # spaces between columns
 
-sum_fixed=$(( W_DATE + W_FIELD + W_REPO + W_URL + (SPACE_PAD*4) ))
+sum_fixed=$(( W_DATE + W_END + W_FIELD + W_ASSIGNEES + W_REPO + W_URL + (SPACE_PAD*6) ))
 W_TITLE=$(( COLS - sum_fixed ))
-# Minimums; if terminal is narrow, steal from URL/REPO/FIELD to keep at least this much for TITLE
-MIN_TITLE=18; MIN_FIELD=14; MIN_REPO=14; MIN_URL=20
+# Minimums; if terminal is narrow, steal from URL/REPO/FIELD/ASSIGNEES to keep at least this much for TITLE
+MIN_TITLE=18; MIN_FIELD=14; MIN_ASSIGNEES=12; MIN_REPO=14; MIN_URL=20
 
 # Rebalance if needed to guarantee at least MIN_TITLE for title.
 rebalance() {
@@ -365,7 +407,14 @@ rebalance() {
       W_FIELD=$(( W_FIELD - d )); take=$(( take - d ))
     fi
   }
-  W_TITLE=$(( COLS - (W_DATE + W_FIELD + W_REPO + W_URL + (SPACE_PAD*4)) ))
+  [ $take -le 0 ] || {
+    avail=$(( W_ASSIGNEES - MIN_ASSIGNEES ))
+    if [ $avail -gt 0 ]; then
+      d=$([ $avail -ge $take ] && echo $take || echo $avail)
+      W_ASSIGNEES=$(( W_ASSIGNEES - d )); take=$(( take - d ))
+    fi
+  }
+  W_TITLE=$(( COLS - (W_DATE + W_END + W_FIELD + W_ASSIGNEES + W_REPO + W_URL + (SPACE_PAD*6)) ))
 }
 rebalance
 
@@ -375,7 +424,9 @@ BEGIN{
   FS="\t"; OFS=sprintf("%*s", sp,"");  # sp spaces between cols
   # header underline uses simple dashes
   dash_date = sprintf("%"wd"s",""); gsub(/ /,"-",dash_date)
+  dash_end  = sprintf("%"we"s",""); gsub(/ /,"-",dash_end)
   dash_field= sprintf("%"wf"s",""); gsub(/ /,"-",dash_field)
+  dash_assg = sprintf("%"wa"s",""); gsub(/ /,"-",dash_assg)
   dash_title= sprintf("%"wt"s",""); gsub(/ /,"-",dash_title)
   dash_repo = sprintf("%"wr"s",""); gsub(/ /,"-",dash_repo)
   dash_url  = sprintf("%"wu"s",""); gsub(/ /,"-",dash_url)
@@ -387,9 +438,9 @@ function trunc(s,w,   ell) {
   if (w<=1) return substr(s,1,w)
   return substr(s,1,w-1) ell
 }
-function fmt(d,f,t,r,u){
-  printf "%-"wd"s%s%-"wf"s%s%-"wt"s%s%-"wr"s%s%-"wu"s\n",
-         d,OFS,f,OFS,t,OFS,r,OFS,u
+function fmt(d,e,f,assignees,t,r,u){
+  printf "%-"wd"s%s%-"we"s%s%-"wf"s%s%-"wa"s%s%-"wt"s%s%-"wr"s%s%-"wu"s\n",
+         d,OFS,e,OFS,f,OFS,assignees,OFS,t,OFS,r,OFS,u
 }
 {
   if ($0 ~ /^## /) {
@@ -409,15 +460,15 @@ function fmt(d,f,t,r,u){
     next
   }
   # Table lines (TSV)
-  if ($0 ~ /^DATE\tFIELD\tTITLE\tREPO\tURL$/) {
-    d="DATE"; f="FIELD"; t="TITLE"; r="REPO"; u="URL"
-    fmt(d,f,t,r,u)
-    print trunc(dash_date,wd) OFS trunc(dash_field,wf) OFS trunc(dash_title,wt) OFS trunc(dash_repo,wr) OFS trunc(dash_url,wu)
+  if ($0 ~ /^DATE\tEND\tFIELD\tASSIGNEES\tTITLE\tREPO\tURL$/) {
+    d="DATE"; e="END"; f="FIELD"; a="ASSIGNEES"; t="TITLE"; r="REPO"; u="URL"
+    fmt(d,e,f,a,t,r,u)
+    print trunc(dash_date,wd) OFS trunc(dash_end,we) OFS trunc(dash_field,wf) OFS trunc(dash_assg,wa) OFS trunc(dash_title,wt) OFS trunc(dash_repo,wr) OFS trunc(dash_url,wu)
     printed_header=1
   } else {
     split($0,a,"\t")
-    d=trunc(a[1],wd); f=trunc(a[2],wf); t=trunc(a[3],wt); r=trunc(a[4],wr); u=trunc(a[5],wu)
-    fmt(d,f,t,r,u)
+    d=trunc(a[1],wd); e=trunc(a[2],we); f=trunc(a[3],wf); ass=trunc(a[4],wa); t=trunc(a[5],wt); r=trunc(a[6],wr); u=trunc(a[7],wu)
+    fmt(d,e,f,ass,t,r,u)
   }
 }
 '
@@ -425,10 +476,9 @@ function fmt(d,f,t,r,u){
 proj_bold="$BOLD"; proj_norm="$NC"
 
 awk \
-  -v wd="$W_DATE" -v wf="$W_FIELD" -v wt="$W_TITLE" -v wr="$W_REPO" -v wu="$W_URL" \
+  -v wd="$W_DATE" -v we="$W_END" -v wf="$W_FIELD" -v wa="$W_ASSIGNEES" -v wt="$W_TITLE" -v wr="$W_REPO" -v wu="$W_URL" \
   -v sp="$SPACE_PAD" \
   -v proj_bold="$proj_bold" -v proj_norm="$proj_norm" \
   "$AWK_FMT" < "$TMP_LINES"
 
 ok "Done."
-
