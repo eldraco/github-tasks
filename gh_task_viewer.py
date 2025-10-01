@@ -176,10 +176,20 @@ BASE_THEME_STYLE: Dict[str, str] = {
     'table.status.done': '#87ff5f',
     'table.status.blocked': '#ff8787',
     'table.status.other': '#d0d0d0',
+    'table.status.waiting': '#ffff5f',
     'table.date.today': 'ansired bold',
     'table.date.past': 'ansiyellow',
     'table.date.future': 'ansigreen',
     'table.date.unknown': 'ansigray',
+    'table.row.today': 'bold ansired',
+    'table.row.past': '#ff8787',
+    'table.row.future0': '#5fd7ff',
+    'table.row.future1': '#af87ff',
+    'table.row.future2': '#5fff87',
+    'table.row.future3': '#ffd75f',
+    'table.row.future4': '#87ffd7',
+    'table.row.running': 'bold ansicyan',
+    'table.row.unknown': '#d0d0d0',
     'summary.panel': 'bg:#1c1c1c #f0f0f0',
     'summary.title': 'bold #ffd75f',
     'summary.label': '#ffd787',
@@ -189,6 +199,12 @@ BASE_THEME_STYLE: Dict[str, str] = {
 
 DEFAULT_THEME_LAYOUT = "vertical"
 SHIFTED_DIGIT_KEYS = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')']
+ROW_STYLE_TODAY = 'table.row.today'
+ROW_STYLE_PAST = 'table.row.past'
+ROW_STYLE_UNKNOWN = 'table.row.unknown'
+ROW_STYLE_RUNNING = 'table.row.running'
+FUTURE_ROW_STYLE_CLASSES = ['table.row.future0', 'table.row.future1', 'table.row.future2', 'table.row.future3', 'table.row.future4']
+STATUS_WAITING_CLASS = 'table.status.waiting'
 
 
 def _load_theme_presets(theme_dir: Path) -> List[ThemePreset]:
@@ -4789,19 +4805,38 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'unknown': _style_class('table.date.unknown'),
         }
 
+        future_seen: Set[str] = set()
+        future_dates: List[Tuple[dt.date, str]] = []
+        for r in rows:
+            key = (r.focus_date or r.start_date or '').strip()
+            if not key:
+                continue
+            dt_key = _safe_date(key)
+            if dt_key and dt_key > today and key not in future_seen:
+                future_seen.add(key)
+                future_dates.append((dt_key, key))
+        future_dates.sort()
+        future_map: Dict[str, int] = {}
+        if future_dates:
+            variants = max(1, len(FUTURE_ROW_STYLE_CLASSES))
+            for idx, (_, date_key) in enumerate(future_dates):
+                future_map[date_key] = idx % variants
+
         def status_style_for(name: Optional[str]) -> str:
             if not name:
-                return _style_class('table.status.other')
+                return ''
             norm = name.strip().lower()
             if 'block' in norm or 'hold' in norm or 'stuck' in norm:
                 return _style_class('table.status.blocked')
             if 'progress' in norm or 'doing' in norm or 'active' in norm or 'working' in norm:
                 return _style_class('table.status.in_progress')
+            if 'wait' in norm:
+                return _style_class(STATUS_WAITING_CLASS)
             if 'done' in norm or 'complete' in norm or 'closed' in norm or 'shipped' in norm:
                 return _style_class('table.status.done')
             if 'todo' in norm or 'backlog' in norm or 'ready' in norm or 'plan' in norm:
                 return _style_class('table.status.todo')
-            return _style_class('table.status.other')
+            return ''
 
         def trim_segments(segments: List[Tuple[str, str]], offset: int) -> List[Tuple[str, str]]:
             if offset <= 0:
@@ -4852,10 +4887,24 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             idx = v_offset + rel_idx
             is_sel = (idx == current_index)
             style_row = "reverse" if is_sel else ""
-            col = color_for_date(t.focus_date, today, date_palette)
             running = bool(t.url and (t.url in active_urls))
-            # Base style follows date palette; running tasks accent key columns.
-            base_style = col
+            date_key = (t.focus_date or t.start_date or '').strip()
+            date_val = _safe_date(date_key) if date_key else None
+            if running:
+                base_style = _style_class(ROW_STYLE_RUNNING) or 'ansicyan bold'
+            else:
+                if date_val is None:
+                    base_style = _style_class(ROW_STYLE_UNKNOWN) or color_for_date(t.focus_date, today, date_palette)
+                elif date_val == today:
+                    base_style = _style_class(ROW_STYLE_TODAY)
+                elif date_val < today:
+                    base_style = _style_class(ROW_STYLE_PAST)
+                else:
+                    idx_map = future_map.get(date_key, 0)
+                    class_name = FUTURE_ROW_STYLE_CLASSES[idx_map % len(FUTURE_ROW_STYLE_CLASSES)]
+                    base_style = _style_class(class_name)
+                if not base_style:
+                    base_style = color_for_date(t.focus_date, today, date_palette)
             marker = '⏱ ' if running else '  '
             # Time column: current run (mm:ss) and total (H:MM)
             snapshot = task_duration_cache.get(t.url) if t.url else None
@@ -4879,7 +4928,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             priority_display = (t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else '')
             priority_cell = _pad_display(priority_display, priority_w)
             status_style = status_style_for(t.status)
-            running_style = 'ansicyan bold' if running else None
+            running_style = base_style if running else None
+            if running:
+                status_style = base_style
+            if status_style is None:
+                status_style = base_style
 
             segments: List[Tuple[str, str]] = []
 
@@ -4896,7 +4949,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 add_segment('  ', running_style if running_style and seg_style is None and not is_sel else (base_style if not is_sel else style_row))
                 add_segment(text, seg_style)
 
-            marker_style = running_style if running_style else base_style
+            marker_style = base_style if not is_sel else style_row
 
             add_segment(marker, marker_style)
             if use_iteration:
@@ -4917,7 +4970,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 start_cell = _pad_display(t.start_date, 12)
                 labels_cell = _pad_display(labels_text or '-', label_w)
                 add_segment(focus_cell, base_style)
-                add_column(start_cell)
+                add_column(start_cell, base_style)
                 add_column(status_cell, status_style)
                 add_column(priority_cell)
                 add_column(time_cell, running_style if running_style else base_style)
