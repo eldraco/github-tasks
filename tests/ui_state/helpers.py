@@ -12,6 +12,8 @@ def make_task(**overrides) -> ght.TaskRow:
         project_title='Project Alpha',
         start_field='Start date',
         start_date='2024-01-09',
+        end_field='End date',
+        end_date='2024-01-11',
         focus_field='Focus Day',
         focus_date='2024-01-10',
         title='Task One',

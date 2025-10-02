@@ -1,6 +1,26 @@
+import inspect
+
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout.dimension import Dimension as _Dimension
 
 from .helpers import closure_map, closure_value, dummy_event, ticker_update
+
+
+if not hasattr(_Dimension, 'exact'):
+    def _dimension_exact(value):
+        """Provide prompt_toolkit Dimension.exact compatibility for older versions."""
+        params = inspect.signature(_Dimension).parameters
+        kwargs = {}
+        for name in ('min', 'preferred', 'max'):
+            if name in params:
+                kwargs[name] = value
+        try:
+            return _Dimension(**kwargs) if kwargs else _Dimension(value)
+        except TypeError:
+            # Fallback: some builds expect positional args only
+            return _Dimension(value)
+
+    _Dimension.exact = _dimension_exact  # type: ignore[attr-defined]
 
 
 def get_binding(ui_context, key, *, requires=None):
