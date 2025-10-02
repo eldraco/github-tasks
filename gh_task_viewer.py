@@ -3098,6 +3098,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     status_line = ""
     pending_status_urls: Set[str] = set()
     pending_priority_urls: Set[str] = set()
+    show_start_column = True
+    show_end_column = True
+    show_assignee_column = True
     edit_task_mode = False
     task_edit_state: Dict[str, object] = {}
     task_edit_float: Optional[Float] = None
@@ -3174,6 +3177,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'v_offset': v_offset,
             'h_offset': h_offset,
             'theme_index': current_theme_index,
+            'show_start_column': show_start_column,
+            'show_end_column': show_end_column,
+            'show_assignee_column': show_assignee_column,
         }
         try:
             d = os.path.dirname(state_path)
@@ -3205,6 +3211,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     current_index = int(_st.get('current_index', current_index) or 0)
     v_offset = int(_st.get('v_offset', v_offset) or 0)
     h_offset = int(_st.get('h_offset', h_offset) or 0)
+    show_start_column = bool(_st.get('show_start_column', show_start_column))
+    show_end_column = bool(_st.get('show_end_column', show_end_column))
+    show_assignee_column = bool(_st.get('show_assignee_column', show_assignee_column))
 
     def _style_value(name: str, default: str = '') -> str:
         style_map = theme_presets[current_theme_index].style
@@ -4777,14 +4786,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if do_invalidate:
             invalidate()
 
+
     def build_table_fragments() -> List[Tuple[str,str]]:
-        nonlocal task_duration_cache
-        nonlocal current_index
-        nonlocal v_offset
+        nonlocal task_duration_cache, current_index, v_offset
         rows = filtered_rows()
         if current_index >= len(rows):
-            current_index = max(0, len(rows)-1)
-        # Determine available vertical space (rough estimate: terminal rows - status bar - maybe 0 extra)
+            current_index = max(0, len(rows) - 1)
         try:
             from prompt_toolkit.application.current import get_app
             size = get_app().output.get_size()
@@ -4793,101 +4800,131 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception:
             total_rows = 40
             total_cols = 120
-        # Reserve 1 row for status bar. Header consumes 2 lines (header + blank after).
         visible_rows = max(1, total_rows - 3)
-        # Adjust v_offset to ensure current_index visible
         if current_index < v_offset:
             v_offset = current_index
         elif current_index >= v_offset + visible_rows:
             v_offset = current_index - visible_rows + 1
-        frags: List[Tuple[str,str]] = []
-        # Determine column widths; right panel width fixed at 32 + separator.
+        frags: List[Tuple[str, str]] = []
         right_panel_width = 32 + 1
         avail_cols = max(40, total_cols - right_panel_width)
-        time_w = 12  # "mm:ss|HH:MM" (right aligned)
+        time_w = 12
         priority_w = 10
-        if use_iteration:
-            iter_min = 15
-            title_min = 20
-            label_min = 16
-            proj_min = 12
-            spaces_width = 2 * 6  # gaps between columns
-            fixed_base = 2 + 10 + priority_w + time_w + spaces_width  # marker + status + priority + time + spaces
-            dyn_total = max(iter_min + title_min + label_min + proj_min, avail_cols - fixed_base)
-            extra = dyn_total - (iter_min + title_min + label_min + proj_min)
-            weights = [1, 2, 1, 1]
-            weight_sum = sum(weights)
-            iter_w = iter_min + (extra * weights[0]) // weight_sum
-            title_w = title_min + (extra * weights[1]) // weight_sum
-            label_w = label_min + (extra * weights[2]) // weight_sum
-            proj_w = dyn_total - iter_w - title_w - label_w
-            if proj_w < proj_min:
-                deficit = proj_min - proj_w
-                take = min(deficit, max(0, label_w - label_min))
-                label_w -= take
-                deficit -= take
-                take = min(deficit, max(0, title_w - title_min))
-                title_w -= take
-                deficit -= take
-                take = min(deficit, max(0, iter_w - iter_min))
-                iter_w -= take
-                deficit -= take
-                proj_w = proj_min
-                if deficit > 0:
-                    title_w += deficit  # best-effort rebalance
-            header = (
-                "  " + _pad_display("Iteration", iter_w) +
-                "  " + _pad_display("Status", 10) +
-                "  " + _pad_display("Priority", priority_w) +
-                "  " + _pad_display("Time", time_w, align='right') +
-                "  " + _pad_display("Title", title_w) +
-                "  " + _pad_display("Labels", label_w) +
-                "  " + _pad_display("Project", proj_w)
-            )
-        else:
-            proj_min = 12
-            title_min = 20
-            label_min = 16
-            end_w = 12
-            assignee_min = 16
-            assignee_w = max(assignee_min, 18)
-            spaces_width = 2 * 9  # gaps between columns (after focus)
-            fixed = 2 + 11 + 12 + end_w + 10 + priority_w + assignee_w + time_w + spaces_width
-            dyn = max(title_min + label_min + proj_min, avail_cols - fixed)
-            extra = dyn - (title_min + label_min + proj_min)
-            weights = [2, 1, 1]
-            weight_sum = sum(weights)
-            title_w = title_min + (extra * weights[0]) // weight_sum
-            label_w = label_min + (extra * weights[1]) // weight_sum
-            proj_w = dyn - title_w - label_w
-            if proj_w < proj_min:
-                deficit = proj_min - proj_w
-                take = min(deficit, max(0, label_w - label_min))
-                label_w -= take
-                deficit -= take
-                take = min(deficit, max(0, title_w - title_min))
-                title_w -= take
-                deficit -= take
-                proj_w = proj_min
-                if deficit > 0:
-                    title_w += deficit
-            header = (
-                "  " + _pad_display("Focus Day", 11) +
-                "  " + _pad_display("Start Date", 12) +
-                "  " + _pad_display("End Date", end_w) +
-                "  " + _pad_display("Status", 10) +
-                "  " + _pad_display("Priority", priority_w) +
-                "  " + _pad_display("Assignees", assignee_w) +
-                "  " + _pad_display("Time", time_w, align='right') +
-                "  " + _pad_display("Title", title_w) +
-                "  " + _pad_display("Labels", label_w) +
-                "  " + _pad_display("Project", proj_w)
-            )
+        show_start = show_start_column
+        show_end = show_end_column
+        show_assignees = show_assignee_column
+        end_min = 18
+        assignee_min = 18
+
+        def _format_deadline(date_str: str, today: dt.date) -> str:
+            if not date_str:
+                return '-'
+            try:
+                deadline_dt = dt.date.fromisoformat(date_str)
+            except Exception:
+                return date_str
+            delta_days = (deadline_dt - today).days
+            if delta_days > 0:
+                if delta_days >= 14:
+                    weeks = delta_days // 7
+                    suffix = f"(+{weeks}w)"
+                else:
+                    suffix = f"(+{delta_days}d)"
+            elif delta_days == 0:
+                suffix = '(today)'
+            else:
+                suffix = f"({delta_days}d)"
+            return f"{date_str} {suffix}"
+
+        def _assignees_text(row: TaskRow) -> str:
+            raw = getattr(row, 'assignee_logins', '[]') or '[]'
+            try:
+                parsed = json.loads(raw)
+                if not isinstance(parsed, list):
+                    parsed = []
+            except Exception:
+                parsed = []
+            names = [('@' + s) if s and not s.startswith('@') else s for s in parsed if s]
+            if not names:
+                return '-'
+            clipped = names[:3]
+            if len(names) > 3:
+                clipped.append('…')
+            return ', '.join(clipped)
+
+        future_seen: Set[str] = set()
+        future_dates: List[Tuple[dt.date, str]] = []
+        for r in rows:
+            key = (r.focus_date or r.start_date or '').strip()
+            if not key:
+                continue
+            dt_key = _safe_date(key)
+            if dt_key and dt_key > today_date and key not in future_seen:
+                future_seen.add(key)
+                future_dates.append((dt_key, key))
+        future_dates.sort()
+        future_map: Dict[str, int] = {}
+        if future_dates:
+            variants = max(1, len(FUTURE_ROW_STYLE_CLASSES))
+            for idx, (_, date_key) in enumerate(future_dates):
+                future_map[date_key] = idx % variants
+
+        def _build_columns() -> List[Dict[str, object]]:
+            cols: List[Dict[str, object]] = []
+            if use_iteration:
+                cols.append({'id': 'iteration', 'header': 'Iteration', 'min': 15, 'dynamic': True, 'weight': 1, 'align': 'left'})
+                if show_start:
+                    cols.append({'id': 'start', 'header': 'Start Date', 'min': 12, 'dynamic': False, 'align': 'left'})
+            else:
+                cols.append({'id': 'focus', 'header': 'Focus Day', 'min': 11, 'dynamic': False, 'align': 'left'})
+                if show_start:
+                    cols.append({'id': 'start', 'header': 'Start Date', 'min': 12, 'dynamic': False, 'align': 'left'})
+            if show_end:
+                cols.append({'id': 'end', 'header': 'End Date', 'min': end_min, 'dynamic': False, 'align': 'left'})
+            cols.append({'id': 'status', 'header': 'Status', 'min': 10, 'dynamic': False, 'align': 'left'})
+            cols.append({'id': 'priority', 'header': 'Priority', 'min': priority_w, 'dynamic': False, 'align': 'left'})
+            cols.append({'id': 'time', 'header': 'Time', 'min': time_w, 'dynamic': False, 'align': 'right'})
+            if show_assignees:
+                cols.append({'id': 'assignees', 'header': 'Assignees', 'min': assignee_min, 'dynamic': False, 'align': 'left'})
+            cols.append({'id': 'title', 'header': 'Title', 'min': 20, 'dynamic': True, 'weight': 2, 'align': 'left'})
+            cols.append({'id': 'labels', 'header': 'Labels', 'min': 16, 'dynamic': True, 'weight': 1, 'align': 'left'})
+            cols.append({'id': 'project', 'header': 'Project', 'min': 12, 'dynamic': True, 'weight': 1, 'align': 'left'})
+            return cols
+
+        columns = _build_columns()
+        dynamic_cols = [c for c in columns if c.get('dynamic')]
+        total_fixed = 2 * len(columns)
+        for col in columns:
+            col['width'] = int(col.get('min', 5))
+            total_fixed += col['width']
+        extra_space = avail_cols - total_fixed
+        if dynamic_cols:
+            if extra_space > 0:
+                weight_sum = sum(int(c.get('weight', 1)) for c in dynamic_cols) or 1
+                allocated = 0
+                for col in dynamic_cols[:-1]:
+                    add = (extra_space * int(col.get('weight', 1))) // weight_sum
+                    col['width'] += add
+                    allocated += add
+                dynamic_cols[-1]['width'] += max(0, extra_space - allocated)
+            elif extra_space < 0:
+                deficit = -extra_space
+                min_floor = 6
+                while deficit > 0 and any(c['width'] > min_floor for c in dynamic_cols):
+                    for col in reversed(dynamic_cols):
+                        if deficit <= 0:
+                            break
+                        if col['width'] > min_floor:
+                            col['width'] -= 1
+                            deficit -= 1
+
+        header = ''.join('  ' + _pad_display(col['header'], col['width'], align=col.get('align', 'left')) for col in columns)
         frags.append((_style_class('table.header'), header[h_offset:]))
         frags.append(("", "\n"))
         if not rows:
             frags.append(("italic", "(no tasks match filters)"))
             return frags
+
         today = today_date
         active_urls = db.active_task_urls()
         display_slice = rows[v_offset:v_offset+visible_rows]
@@ -4900,58 +4937,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'future': _style_class('table.date.future'),
             'unknown': _style_class('table.date.unknown'),
         }
-
-        future_seen: Set[str] = set()
-        future_dates: List[Tuple[dt.date, str]] = []
-        for r in rows:
-            key = (r.focus_date or r.start_date or '').strip()
-            if not key:
-                continue
-            dt_key = _safe_date(key)
-            if dt_key and dt_key > today and key not in future_seen:
-                future_seen.add(key)
-                future_dates.append((dt_key, key))
-        future_dates.sort()
-        future_map: Dict[str, int] = {}
-        if future_dates:
-            variants = max(1, len(FUTURE_ROW_STYLE_CLASSES))
-            for idx, (_, date_key) in enumerate(future_dates):
-                future_map[date_key] = idx % variants
-
-        me_login = (cfg.user or '').strip().lower()
-
-        def assignee_text_for(row: TaskRow) -> str:
-            raw = row.assignee_logins or '[]'
-            try:
-                parsed = json.loads(raw)
-                if not isinstance(parsed, list):
-                    parsed = []
-            except Exception:
-                parsed = []
-            cleaned: List[str] = []
-            seen: Set[str] = set()
-            for value in parsed:
-                login = str(value).strip()
-                if not login:
-                    continue
-                key = login.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                cleaned.append(login)
-            if cleaned:
-                display: List[str] = []
-                for login in cleaned[:3]:
-                    marker = '*' if me_login and login.lower() == me_login else ''
-                    display.append(f"{login}{marker}")
-                if len(cleaned) > 3:
-                    display.append('…')
-                return ", ".join(display)
-            if row.assigned_to_me and me_login:
-                return f"@{cfg.user}*"
-            if row.assigned_to_me:
-                return "@me"
-            return '-'
 
         def status_style_for(name: Optional[str]) -> str:
             if not name:
@@ -5014,10 +4999,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     start = idx + n_len
             return result
 
+        column_lookup = {c['id']: c for c in columns}
+
         for rel_idx, t in enumerate(display_slice):
             idx = v_offset + rel_idx
             is_sel = (idx == current_index)
-            style_row = "reverse" if is_sel else ""
+            style_row = 'reverse' if is_sel else ''
             running = bool(t.url and (t.url in active_urls))
             date_key = (t.focus_date or t.start_date or '').strip()
             date_val = _safe_date(date_key) if date_key else None
@@ -5037,33 +5024,59 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if not base_style:
                     base_style = color_for_date(t.focus_date, today, date_palette)
             marker = '⏱ ' if running else '  '
-            # Time column: current run (mm:ss) and total (H:MM)
             snapshot = task_duration_cache.get(t.url) if t.url else None
             tot_s = snapshot.get('total', 0) if snapshot else 0
             cur_s = snapshot.get('current', 0) if snapshot else 0
             if not running:
                 cur_s = 0
             mm, ss = divmod(int(max(0, cur_s)), 60)
-            # total in H:MM (no leading zeros on hours)
             th, rem = divmod(int(max(0, tot_s)), 3600)
             tm, _ = divmod(rem, 60)
             time_text = f"{mm:02d}:{ss:02d}|{th:d}:{tm:02d}" if tot_s else f"{mm:02d}:{ss:02d}|0:00"
-            status_cell = _pad_display(t.status or '-', 10)
-            if t.status_dirty:
-                status_cell = _pad_display((t.status or '-') + '*', 10)
-            time_cell = _pad_display(time_text, time_w, align='right')
-            title_cell = _pad_display(t.title, title_w)
-            project_cell = _pad_display(t.project_title, proj_w)
-            labels_list = _task_labels(t)
-            labels_text = ", ".join(labels_list)
             priority_display = (t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else '')
-            priority_cell = _pad_display(priority_display, priority_w)
             status_style = status_style_for(t.status)
             running_style = base_style if running else None
             if running:
                 status_style = base_style
-            if status_style is None:
+            if not status_style:
                 status_style = base_style
+
+            widths = {cid: col['width'] for cid, col in column_lookup.items()}
+            values: Dict[str, str] = {}
+            if use_iteration:
+                if 'iteration' in column_lookup:
+                    iter_label = t.iteration_title or t.iteration_start or '-'
+                    if t.iteration_title and t.iteration_start:
+                        iter_label = f"{t.iteration_title} ({t.iteration_start})"
+                    values['iteration'] = _pad_display(iter_label or '-', widths['iteration'])
+                if show_start and 'start' in column_lookup:
+                    values['start'] = _pad_display(t.start_date or '-', widths['start'])
+            else:
+                if 'focus' in column_lookup:
+                    values['focus'] = _pad_display(t.focus_date or '-', widths['focus'])
+                if show_start and 'start' in column_lookup:
+                    values['start'] = _pad_display(t.start_date or '-', widths['start'])
+            if show_end and 'end' in column_lookup:
+                values['end'] = _pad_display(_format_deadline(getattr(t, 'end_date', ''), today), widths['end'])
+            status_text = (t.status or '-')
+            if t.status_dirty:
+                status_text = (t.status or '-') + '*'
+            if 'status' in column_lookup:
+                values['status'] = _pad_display(status_text, widths['status'])
+            if 'priority' in column_lookup:
+                values['priority'] = _pad_display(priority_display, widths['priority'])
+            if 'time' in column_lookup:
+                values['time'] = _pad_display(time_text, widths['time'], align='right')
+            if show_assignees and 'assignees' in column_lookup:
+                values['assignees'] = _pad_display(_assignees_text(t), widths['assignees'])
+            if 'title' in column_lookup:
+                values['title'] = _pad_display(t.title, widths['title'])
+            labels_list = _task_labels(t)
+            labels_text = ", ".join(labels_list)
+            if 'labels' in column_lookup:
+                values['labels'] = _pad_display(labels_text or '-', widths['labels'])
+            if 'project' in column_lookup:
+                values['project'] = _pad_display(t.project_title, widths['project'])
 
             segments: List[Tuple[str, str]] = []
 
@@ -5080,38 +5093,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 add_segment('  ', running_style if running_style and seg_style is None and not is_sel else (base_style if not is_sel else style_row))
                 add_segment(text, seg_style)
 
-            marker_style = base_style if not is_sel else style_row
-
-            add_segment(marker, marker_style)
-            if use_iteration:
-                iter_label = t.iteration_title or t.iteration_start or '-'
-                if t.iteration_title and t.iteration_start:
-                    iter_label = f"{t.iteration_title} ({t.iteration_start})"
-                iteration_cell = _pad_display(iter_label or '-', iter_w)
-                labels_cell = _pad_display(labels_text or '-', label_w)
-                add_segment(iteration_cell, base_style)
-                add_column(status_cell, status_style)
-                add_column(priority_cell)
-                add_column(time_cell, running_style if running_style else base_style)
-                add_column(title_cell)
-                add_column(labels_cell)
-                add_column(project_cell)
-            else:
-                focus_cell = _pad_display(t.focus_date or '-', 11)
-                start_cell = _pad_display(t.start_date, 12)
-                end_cell = _pad_display(t.end_date or '-', end_w)
-                assignee_cell = _pad_display(assignee_text_for(t), assignee_w)
-                labels_cell = _pad_display(labels_text or '-', label_w)
-                add_segment(focus_cell, base_style)
-                add_column(start_cell, base_style)
-                add_column(end_cell, base_style)
-                add_column(status_cell, status_style)
-                add_column(priority_cell)
-                add_column(assignee_cell)
-                add_column(time_cell, running_style if running_style else base_style)
-                add_column(title_cell)
-                add_column(labels_cell)
-                add_column(project_cell)
+            add_segment(marker, base_style if not is_sel else style_row)
+            style_map = {
+                'status': status_style,
+                'time': running_style if running_style else base_style,
+            }
+            for col_index, col in enumerate(columns):
+                col_id = col['id']
+                text = values.get(col_id, _pad_display('-', col['width']))
+                seg_style = style_map.get(col_id, base_style)
+                if col_index == 0:
+                    add_segment(text, seg_style)
+                else:
+                    add_column(text, seg_style)
 
             segments = trim_segments(segments, h_offset)
             active_search = search_buffer if in_search else search_term
@@ -7213,6 +7207,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_index = 0
         invalidate()
 
+    @kb.add(',', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal show_start_column, status_line
+        show_start_column = not show_start_column
+        status_line = f"Start column {'shown' if show_start_column else 'hidden'}"
+        _save_state()
+        invalidate()
+
+    @kb.add('.', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal show_end_column, status_line
+        show_end_column = not show_end_column
+        status_line = f"End column {'shown' if show_end_column else 'hidden'}"
+        _save_state()
+        invalidate()
+
+    @kb.add("'", filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal show_assignee_column, status_line
+        show_assignee_column = not show_assignee_column
+        status_line = f"Assignees column {'shown' if show_assignee_column else 'hidden'}"
+        _save_state()
+        invalidate()
+
     @kb.add('t', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
@@ -8589,6 +8613,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  N                   Hide no-date",
                 "  F                   Date ≤ YYYY-MM-DD",
                 "  t / a               Today / All",
+                "  , / . / '           Toggle Start / End / Assignees columns",
                 "  C                   Show created (no assignee)",
                 "  V                   Toggle iteration/date view",
                 "",
