@@ -130,6 +130,7 @@ Filters
 - `N`: toggle hide tasks with no date
 - `F`: set Date <= filter (YYYY-MM-DD)
 - `t / a`: show today only / show all
+- `, / . / '`: toggle Start / End / Assignees columns
 - `T`: set the selected task's focus day to today
 - `Y / y`: move the selected task's focus day forward/backward by one day
 
