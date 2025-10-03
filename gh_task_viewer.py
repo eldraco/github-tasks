@@ -18,6 +18,7 @@
 #   s/S cycle sort presets forward/backward
 #   R  open timer report (daily/weekly/monthly aggregates)
 #   X  export a JSON report (quick export)
+#   z  toggle Zen mode (minimal focus on active task)
 #   q  quit
 #
 # Config highlights
@@ -3095,6 +3096,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     v_offset = 0  # top row index currently displayed
     h_offset = 0
     detail_mode = False
+    zen_mode = False
     status_line = ""
     pending_status_urls: Set[str] = set()
     pending_priority_urls: Set[str] = set()
@@ -3264,6 +3266,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'show_start_column': show_start_column,
             'show_end_column': show_end_column,
             'show_assignee_column': show_assignee_column,
+            'zen_mode': zen_mode,
         }
         try:
             d = os.path.dirname(state_path)
@@ -3298,6 +3301,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     show_start_column = bool(_st.get('show_start_column', show_start_column))
     show_end_column = bool(_st.get('show_end_column', show_end_column))
     show_assignee_column = bool(_st.get('show_assignee_column', show_assignee_column))
+    zen_mode = bool(_st.get('zen_mode', zen_mode))
 
     def _style_value(name: str, default: str = '') -> str:
         style_map = theme_presets[current_theme_index].style
@@ -4953,6 +4957,86 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             for idx, (_, date_key) in enumerate(future_dates):
                 future_map[date_key] = idx % variants
 
+        if zen_mode:
+            frags: List[Tuple[str, str]] = []
+            date_header = 'Iteration' if use_iteration else 'Focus Day'
+            date_width = 14 if use_iteration else 12
+            status_width = 12
+            min_title_width = 20
+            spacing = 4  # two separators of two spaces each
+            prefix_width = 2
+            title_width = max(min_title_width, total_cols - (prefix_width + date_width + status_width + spacing))
+            header_cells = [
+                _pad_display(date_header, date_width),
+                _pad_display('Status', status_width),
+                _pad_display('Title', title_width),
+            ]
+            header_line = '  ' + '  '.join(header_cells)
+            header_line = header_line[h_offset:] if h_offset else header_line
+            frags.append((_style_class('table.header'), header_line))
+            frags.append(("", "\n"))
+            if not rows:
+                task_duration_cache = {}
+                frags.append(("italic", "  (no tasks match filters)"))
+                if frags and frags[-1][1] == "\n":
+                    frags.pop()
+                return frags
+            today = today_date
+            try:
+                active_urls = set(db.active_task_urls())
+            except Exception:
+                active_urls = set()
+            selected = rows[current_index]
+            selected_urls = [selected.url] if selected.url else []
+            task_duration_cache = db.task_duration_snapshot(selected_urls) if selected_urls else {}
+            if use_iteration:
+                if selected.iteration_title and selected.iteration_start:
+                    date_value = f"{selected.iteration_title} ({selected.iteration_start})"
+                else:
+                    date_value = selected.iteration_title or selected.iteration_start or '-'
+            else:
+                date_value = selected.focus_date or selected.start_date or '-'
+            status_value = (selected.status or '-') + ('*' if selected.status_dirty else '')
+            title_value = selected.title or '-'
+            row_cells = [
+                _pad_display(date_value, date_width),
+                _pad_display(status_value, status_width),
+                _pad_display(title_value, title_width),
+            ]
+            running = bool(selected.url and selected.url in active_urls)
+            prefix = '⏱ ' if running else '  '
+            row_line = prefix + '  '.join(row_cells)
+            row_line = row_line[h_offset:] if h_offset else row_line
+            date_palette = {
+                'today': _style_class('table.date.today'),
+                'past': _style_class('table.date.past'),
+                'future': _style_class('table.date.future'),
+                'unknown': _style_class('table.date.unknown'),
+            }
+            date_key = (selected.focus_date or selected.start_date or '').strip()
+            date_val = _safe_date(date_key) if date_key else None
+            if running:
+                base_style = _style_class(ROW_STYLE_RUNNING) or 'ansicyan bold'
+            else:
+                if date_val is None:
+                    base_style = _style_class(ROW_STYLE_UNKNOWN) or color_for_date(selected.focus_date, today, date_palette)
+                elif date_val == today:
+                    base_style = _style_class(ROW_STYLE_TODAY)
+                elif date_val < today:
+                    base_style = _style_class(ROW_STYLE_PAST)
+                else:
+                    idx_map = future_map.get(date_key, 0)
+                    class_name = FUTURE_ROW_STYLE_CLASSES[idx_map % len(FUTURE_ROW_STYLE_CLASSES)]
+                    base_style = _style_class(class_name)
+                if not base_style:
+                    base_style = color_for_date(selected.focus_date, today, date_palette)
+            row_style = f"{base_style} reverse".strip() if base_style else 'reverse'
+            frags.append((row_style, row_line))
+            frags.append(("", "\n"))
+            if frags and frags[-1][1] == "\n":
+                frags.pop()
+            return frags
+
         def _build_columns() -> List[Dict[str, object]]:
             cols: List[Dict[str, object]] = []
             if use_iteration:
@@ -6334,6 +6418,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             mode = "TIMER EDIT"
         elif show_help:
             mode = "❓ HELP"
+        elif zen_mode:
+            mode = "🧘 ZEN"
         else:
             mode = "🧭 BROWSE"
         # Minimal, elegant bottom bar with live timers only
@@ -6686,23 +6772,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     root_content = HSplit([top_status_window, root_body, status_window])
     container = FloatContainer(content=root_content, floats=floats)
 
-    def _refresh_root_body() -> None:
+    def _apply_layout() -> None:
         nonlocal root_body, root_content
-        new_body = _build_root_body()
-        root_body = new_body
-        updated = False
-        try:
-            if hasattr(root_content, 'children') and len(getattr(root_content, 'children')) >= 3:
-                root_content.children[1] = new_body
-                updated = True
-        except Exception:
-            updated = False
-        if not updated:
-            try:
-                root_content = HSplit([top_status_window, new_body, status_window])
-                container.content = root_content
-            except Exception:
-                pass
+        if zen_mode:
+            new_content = HSplit([table_window])
+            root_body = table_window
+        else:
+            new_body = _build_root_body()
+            root_body = new_body
+            new_content = HSplit([top_status_window, new_body, status_window])
+        root_content = new_content
+        container.content = root_content
+
+    def _refresh_root_body() -> None:
+        _apply_layout()
+
+    _apply_layout()
 
     app: Optional[Application] = None
 
@@ -7406,6 +7491,21 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal hide_no_date, current_index
         hide_no_date = not hide_no_date
         current_index = 0
+        invalidate()
+
+    @kb.add('z', filter=is_normal)
+    def _(event):
+        nonlocal zen_mode, detail_mode, show_report, in_search, in_date_filter, status_line, h_offset, show_help
+        zen_mode = not zen_mode
+        detail_mode = False
+        show_report = False
+        in_search = False
+        in_date_filter = False
+        show_help = False
+        floats.clear()
+        h_offset = 0
+        status_line = 'ZEN mode ON' if zen_mode else 'ZEN mode OFF'
+        _apply_layout()
         invalidate()
 
     @kb.add('V', filter=is_normal)
@@ -8699,6 +8799,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  t / a               Today / All",
                 "  , / . / '           Toggle Start / End / Assignees columns",
                 "  C                   Show created (no assignee)",
+                "  z                   Toggle Zen mode",
                 "  V                   Toggle iteration/date view",
                 "",
                 "🛠 Task Actions",
