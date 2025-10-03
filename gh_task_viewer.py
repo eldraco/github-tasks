@@ -3119,6 +3119,94 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     }
     issue_detail_cache: Dict[str, Dict[str, object]] = {}
     issue_detail_tasks: Dict[str, asyncio.Task] = {}
+    background_handles: List[object] = []
+
+    def _track_background(obj: object) -> None:
+        if obj is None:
+            return
+        background_handles.append(obj)
+
+    def _drain_background_tasks(application: object) -> None:
+        candidates: List[object] = []
+        seen_ids: Set[int] = set()
+
+        def _add_candidate(item: object) -> None:
+            if item is None:
+                return
+            ident = id(item)
+            if ident in seen_ids:
+                return
+            seen_ids.add(ident)
+            candidates.append(item)
+
+        for handle in background_handles:
+            _add_candidate(handle)
+
+        app_background = getattr(application, 'background_tasks', None)
+        if isinstance(app_background, (list, tuple, set)):
+            for entry in app_background:
+                _add_candidate(entry)
+
+        tasks_to_await: List[asyncio.Task] = []
+        for entry in candidates:
+            if asyncio.iscoroutine(entry):
+                try:
+                    entry.close()
+                except Exception:
+                    pass
+                continue
+            cancel = getattr(entry, 'cancel', None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
+            if not isinstance(entry, asyncio.Task):
+                coro_ref = getattr(entry, '_coro', None)
+                if asyncio.iscoroutine(coro_ref):
+                    try:
+                        coro_ref.close()
+                    except Exception:
+                        pass
+                continue
+            if entry.cancelled() or entry.done():
+                continue
+            tasks_to_await.append(entry)
+
+        if not tasks_to_await:
+            return
+
+        loop = None
+        for task in tasks_to_await:
+            getter = getattr(task, 'get_loop', None)
+            if callable(getter):
+                try:
+                    loop = getter()
+                except Exception:
+                    continue
+                if loop is not None:
+                    break
+
+        if loop is None:
+            return
+        if getattr(loop, 'is_closed', lambda: False)():
+            return
+
+        pending = [task for task in tasks_to_await if not task.done() and not task.cancelled()]
+        if not pending:
+            return
+
+        async def _await_pending(to_await: List[asyncio.Task]) -> None:
+            if to_await:
+                await asyncio.gather(*to_await, return_exceptions=True)
+
+        if getattr(loop, 'is_running', lambda: False)():
+            asyncio.run_coroutine_threadsafe(_await_pending(pending), loop)
+        else:
+            try:
+                loop.run_until_complete(_await_pending(pending))
+            except Exception:
+                pass
 
     theme_dir = Path(__file__).resolve().parent / "themes"
     theme_presets = _load_theme_presets(theme_dir)
@@ -8705,15 +8793,35 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 # don't crash on background exceptions
                 await asyncio.sleep(1)
                 continue
+
+    ticker_coro = _ticker()
+    ticker_handle: Optional[object] = None
     try:
-        app.create_background_task(_ticker())
+        ticker_handle = app.create_background_task(ticker_coro)
     except Exception:
-        # Fallback: start via asyncio if available
+        ticker_handle = None
+    else:
+        _track_background(ticker_handle if ticker_handle is not None else ticker_coro)
+        ticker_coro = None
+
+    if ticker_coro is not None:
         try:
-            asyncio.create_task(_ticker())
+            ticker_handle = asyncio.create_task(ticker_coro)
         except Exception:
-            pass
-    app.run()
+            if ticker_coro is not None:
+                try:
+                    ticker_coro.close()
+                except Exception:
+                    pass
+            ticker_handle = None
+        else:
+            _track_background(ticker_handle if ticker_handle is not None else ticker_coro)
+            ticker_coro = None
+
+    try:
+        app.run()
+    finally:
+        _drain_background_tasks(app)
     return
 
 
