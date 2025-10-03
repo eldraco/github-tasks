@@ -3150,10 +3150,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         tasks_to_await: List[asyncio.Task] = []
         for entry in candidates:
             if asyncio.iscoroutine(entry):
-                try:
-                    entry.close()
-                except Exception:
-                    pass
                 continue
             cancel = getattr(entry, 'cancel', None)
             if callable(cancel):
@@ -8783,12 +8779,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     apply_theme(current_theme_index, announce=False)
 
     # Background ticker to refresh timers & status once per second
-    async def _ticker():
+    async def _ticker(update_search_status=update_search_status, invalidate_fn=invalidate):
         while True:
             try:
                 await asyncio.sleep(1)
                 update_search_status()
-                invalidate()
+                invalidate_fn()
             except Exception:
                 # don't crash on background exceptions
                 await asyncio.sleep(1)
