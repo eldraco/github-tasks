@@ -128,7 +128,18 @@ def _install_prompt_toolkit_stub() -> None:
     sys.modules['prompt_toolkit.layout.containers'] = layout_containers
 
     layout_dimension = types.ModuleType('prompt_toolkit.layout.dimension')
-    layout_dimension.Dimension = _callable_stub
+
+    class DummyDimension:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        @classmethod
+        def exact(cls, value):
+            # Match prompt_toolkit API where Dimension.exact returns a Dimension instance
+            return cls(value)
+
+    layout_dimension.Dimension = DummyDimension
     sys.modules['prompt_toolkit.layout.dimension'] = layout_dimension
 
     widgets = types.ModuleType('prompt_toolkit.widgets')
