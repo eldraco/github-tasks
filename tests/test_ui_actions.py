@@ -628,6 +628,102 @@ def test_change_priority_no_options_and_failure_rolls_back(monkeypatch, temp_db_
 
     db.conn.close()
 
+def test_label_editor_fetch_cancel_and_error(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row(labels=json.dumps(["Existing"]))
+    db.upsert_many([row])
+
+    behaviors = [
+        [{"name": "Bug"}, {"name": "Chore"}],
+        RuntimeError("API down"),
+    ]
+    fetch_calls = []
+
+    def fake_list_repo_labels(token, repo):
+        idx = len(fetch_calls)
+        fetch_calls.append((token, repo))
+        result = behaviors[idx]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(ght, "list_repo_labels", fake_list_repo_labels)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    open_handler = _find_binding(harness.kb, "O")
+    enter_handler = _find_binding(
+        harness.kb,
+        "enter",
+        predicate=lambda func: "task_edit_state" in func.__code__.co_freevars,
+    )
+
+    enter_cells = _closure_cells(enter_handler)
+    task_edit_state_cell = enter_cells["task_edit_state"]
+    cancel_edit = enter_cells["_cancel_task_edit"].cell_contents
+
+    open_handler(SimpleNamespace())
+    task_state = task_edit_state_cell.cell_contents
+    fields = task_state["fields"]
+    label_idx = next(i for i, field in enumerate(fields) if field.get("field_key") == "labels")
+
+    # Success path
+    task_state["cursor"] = label_idx
+    enter_handler(SimpleNamespace())
+    assert task_state["mode"] == "edit-labels"
+    assert task_state["labels_loading"] is True
+    assert scheduled_tasks, "label load should schedule background task"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert fetch_calls == [("token", "octo/repo")]
+    assert task_state["message"] == "Labels loaded"
+    assert task_state["labels_loading"] is False
+    assert task_state.get("labels_task") is None
+    assert task_state["label_choices"] == ["Bug", "Chore", "Existing"]
+    assert task_state["labels_selected"] == {"Existing"}
+    assert task_state.get("labels_error") == ""
+
+    cancel_edit("Back to list")
+    assert task_state["mode"] == "list"
+    assert task_state["message"] == "Back to list"
+
+    # Cancellation while loading
+    task_state["cursor"] = label_idx
+    enter_handler(SimpleNamespace())
+    assert task_state["mode"] == "edit-labels"
+    assert task_state["labels_loading"] is True
+    assert scheduled_tasks, "second label load should schedule background task"
+
+    pending_coro = scheduled_tasks.pop()
+    pending_coro.close()
+    cancel_edit("Edit cancelled")
+    assert task_state["mode"] == "list"
+    assert task_state["message"] == "Edit cancelled"
+    assert task_state["labels_loading"] is False
+    assert task_state.get("labels_task") is None
+    assert task_state.get("labels_error") == ""
+    assert fields[label_idx]["value"] == ["Existing"]
+    assert len(fetch_calls) == 1
+
+    # Error path
+    task_state["cursor"] = label_idx
+    enter_handler(SimpleNamespace())
+    assert scheduled_tasks, "failing label load should schedule background task"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert fetch_calls == [("token", "octo/repo"), ("token", "octo/repo")]
+    assert task_state["labels_loading"] is False
+    assert task_state.get("labels_task") is None
+    assert task_state.get("labels_error") == "Label fetch failed: API down"
+    assert task_state["labels_selected"] == {"Existing"}
+
+    cancel_edit("Edit cancelled")
+    db.conn.close()
+
 def test_apply_labels_deduplicates_and_reports_errors(monkeypatch, temp_db_path, tmp_path, ui_config):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(labels=json.dumps(["old"]))
