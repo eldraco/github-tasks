@@ -378,6 +378,101 @@ def test_update_task_date_with_validation_and_success(monkeypatch, temp_db_path,
 
     db.conn.close()
 
+
+def test_update_task_date_missing_metadata_triggers_lookup(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row(start_field_id="", focus_field_id="")
+    db.upsert_many([row])
+
+    lookup_calls = []
+
+    def fake_get_project_field_id_by_name(token, project_id, name):
+        lookup_calls.append((token, project_id, name))
+        if len(lookup_calls) == 1:
+            raise RuntimeError("not found")
+        return "focus-field-resolved"
+
+    monkeypatch.setattr(ght, "get_project_field_id_by_name", fake_get_project_field_id_by_name)
+
+    date_calls = []
+
+    def fake_set_project_date(token, project_id, item_id, field_id, value):
+        date_calls.append((token, project_id, item_id, field_id, value))
+
+    monkeypatch.setattr(ght, "set_project_date", fake_set_project_date)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    open_handler = _find_binding(harness.kb, "O")
+    enter_handler = _find_binding(
+        harness.kb,
+        "enter",
+        predicate=lambda func: "task_edit_state" in func.__code__.co_freevars,
+    )
+
+    enter_cells = _closure_cells(enter_handler)
+    task_edit_state_cell = enter_cells["task_edit_state"]
+    update_task = enter_cells["_update_task_date"].cell_contents
+    update_cells = _closure_cells(update_task)
+    status_line_cell = update_cells["status_line"]
+    logger_cell = update_cells["logger"]
+
+    warnings = []
+
+    def fake_warning(msg, *args, **kwargs):
+        warnings.append((msg, args, kwargs))
+
+    monkeypatch.setattr(logger_cell.cell_contents, "warning", fake_warning, raising=False)
+
+    open_handler(SimpleNamespace())
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["mode"] == "list"
+
+    # Attempt to update Start date with missing field metadata (lookup fails)
+    task_state["cursor"] = 0
+    enter_handler(SimpleNamespace())
+    task_state = task_edit_state_cell.cell_contents
+    editing = task_state.get("editing") or {}
+    editing["calendar_date"] = "2024-01-20"
+    task_state["editing"] = editing
+
+    enter_handler(SimpleNamespace())
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert lookup_calls[0] == ("token", "proj-123", "Start")
+    assert warnings, "expected logger.warning when lookup fails"
+    assert status_line_cell.cell_contents == "No Start field id"
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["message"] == "No Start field id"
+    assert not date_calls, "start update should not proceed without field id"
+
+    # Update Focus date where lookup succeeds and new field id is used
+    task_state["cursor"] = 1
+    task_state["mode"] = "list"
+    enter_handler(SimpleNamespace())
+    task_state = task_edit_state_cell.cell_contents
+    editing = task_state.get("editing") or {}
+    editing["calendar_date"] = "2024-02-02"
+    task_state["editing"] = editing
+
+    enter_handler(SimpleNamespace())
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert lookup_calls[1] == ("token", "proj-123", "Focus")
+    assert date_calls == [("token", "proj-123", "item-123", "focus-field-resolved", "2024-02-02")]
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["message"] == "Focus Day updated"
+    assert status_line_cell.cell_contents == "Focus Day updated"
+
+    stored = db.load()[0]
+    assert stored.focus_date == "2024-02-02"
+    assert stored.focus_field_id == "focus-field-resolved"
+    assert stored.start_field_id == ""  # unchanged after failed lookup
+
+    db.conn.close()
+
 def test_change_priority_handles_fetch_and_editor(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(priority_options="[]")
