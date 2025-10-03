@@ -550,6 +550,84 @@ def test_change_priority_handles_fetch_and_editor(monkeypatch, temp_db_path, tmp
 
     db.conn.close()
 
+def test_change_priority_no_options_and_failure_rolls_back(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row(priority_options="[]")
+    db.upsert_many([row])
+
+    fetch_calls = []
+
+    def fake_get_project_field_options(token, field_id):
+        fetch_calls.append((token, field_id))
+        return []
+
+    monkeypatch.setattr(ght, "get_project_field_options", fake_get_project_field_options)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    advance_handler = _find_binding(harness.kb, "]")
+    advance_cells = _closure_cells(advance_handler)
+    change_priority = advance_cells["_change_priority"].cell_contents
+    change_cells = _closure_cells(change_priority)
+    status_line_cell = change_cells["status_line"]
+    pending_urls = change_cells["pending_priority_urls"].cell_contents
+
+    advance_handler(SimpleNamespace())
+    assert scheduled_tasks, "expected coroutine for priority change"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert fetch_calls == [("token", "priority-field")]
+    assert status_line_cell.cell_contents == "No priority options available"
+    assert row.url not in pending_urls
+
+    stored = db.load()[0]
+    assert stored.priority_option_id == "priority-medium"
+    assert stored.priority == "Medium"
+
+    priority_options = [
+        {"id": "priority-low", "name": "Low"},
+        {"id": "priority-medium", "name": "Medium"},
+        {"id": "priority-high", "name": "High"},
+    ]
+    db.update_priority_options(row.url, priority_options)
+    change_cells["all_rows"].cell_contents = db.load()
+
+    failure_calls = []
+
+    def failing_set_project_priority(token, project_id, item_id, field_id, option_id):
+        failure_calls.append((token, project_id, item_id, field_id, option_id))
+        raise RuntimeError("API down")
+
+    monkeypatch.setattr(ght, "set_project_priority", failing_set_project_priority)
+
+    original_reset = db.reset_priority
+    reset_calls = []
+
+    def tracking_reset(url, priority_text, option_id):
+        reset_calls.append((url, priority_text, option_id))
+        return original_reset(url, priority_text, option_id)
+
+    monkeypatch.setattr(db, "reset_priority", tracking_reset, raising=False)
+
+    advance_handler(SimpleNamespace())
+    assert scheduled_tasks, "expected coroutine for priority change failure"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert failure_calls == [("token", "proj-123", "item-123", "priority-field", "priority-high")]
+    assert reset_calls == [(row.url, "Medium", "priority-medium")]
+    assert status_line_cell.cell_contents == "Priority update failed: API down"
+    assert row.url not in pending_urls
+
+    stored = db.load()[0]
+    assert stored.priority_option_id == "priority-medium"
+    assert stored.priority == "Medium"
+
+    db.conn.close()
+
 def test_apply_labels_deduplicates_and_reports_errors(monkeypatch, temp_db_path, tmp_path, ui_config):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(labels=json.dumps(["old"]))
