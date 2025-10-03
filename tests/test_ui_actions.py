@@ -1,6 +1,7 @@
 import asyncio
 import datetime as dt
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,59 @@ def _make_task_row(url="https://github.com/octo/repo/issues/1", **overrides):
     )
     base.update(overrides)
     return ght.TaskRow(**base)
+
+
+def test_save_state_handles_unwritable_directory(monkeypatch, temp_db_path, tmp_path, ui_config):
+    db = ght.TaskDB(str(temp_db_path))
+    db.upsert_many([_make_task_row()])
+
+    state_path = tmp_path / "missing" / "state.json"
+    harness = _build_ui(db, ui_config, token="token", state_path=str(state_path))
+
+    called = {}
+
+    def fake_makedirs(path, exist_ok):
+        called["path"] = path
+        called["exist_ok"] = exist_ok
+        raise PermissionError("permission denied for test")
+
+    monkeypatch.setattr(ght.os, "makedirs", fake_makedirs)
+
+    handler = _find_binding(harness.kb, "!")
+    handler(SimpleNamespace())
+
+    assert called, "expected makedirs to be invoked when saving state"
+    assert called["path"] == os.path.dirname(str(state_path))
+    assert called["exist_ok"] is True
+    assert not state_path.exists()
+
+    db.conn.close()
+
+
+def test_save_state_handles_json_dump_error(monkeypatch, temp_db_path, tmp_path, ui_config):
+    db = ght.TaskDB(str(temp_db_path))
+    db.upsert_many([_make_task_row()])
+
+    state_path = tmp_path / "state.json"
+    harness = _build_ui(db, ui_config, token="token", state_path=str(state_path))
+
+    captured = {}
+
+    def fake_dump(data, fh, indent=2):
+        captured["data"] = data
+        raise TypeError("non-serializable data")
+
+    monkeypatch.setattr(ght.json, "dump", fake_dump)
+
+    handler = _find_binding(harness.kb, "!")
+    handler(SimpleNamespace())
+
+    assert captured, "expected json.dump to be invoked when saving state"
+    assert captured["data"]["theme_index"] == 0
+    assert state_path.exists()
+    assert state_path.read_text() == ""
+
+    db.conn.close()
 
 
 def test_apply_status_change_queues_and_handles_error(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
