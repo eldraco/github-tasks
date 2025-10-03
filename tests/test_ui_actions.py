@@ -1038,6 +1038,101 @@ def test_session_editor_validation_blocks_invalid_updates(monkeypatch, temp_db_p
     db.conn.close()
 
 
+def test_start_repo_metadata_fetch_handles_failure(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row()
+    db.upsert_many([row])
+
+    def failing_list_repo_labels(token, repo):
+        raise RuntimeError("label boom")
+
+    monkeypatch.setattr(ght, "list_repo_labels", failing_list_repo_labels)
+    monkeypatch.setattr(ght, "list_repo_assignees", lambda *args, **kwargs: [])
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    add_handler = _find_binding(harness.kb, "A")
+    add_handler(SimpleNamespace())
+
+    enter_handler = _find_binding(
+        harness.kb,
+        "enter",
+        predicate=lambda func: "add_state" in func.__code__.co_freevars,
+    )
+    enter_cells = _closure_cells(enter_handler)
+    add_state_cell = enter_cells["add_state"]
+    start_repo_fetch = enter_cells["_start_repo_metadata_fetch"].cell_contents
+
+    start_repo_fetch('octo/repo')
+
+    state = add_state_cell.cell_contents
+    assert state['loading_repo_metadata'] is True
+    assert state['metadata_error'] == ''
+    assert state['label_choices'] == []
+    assert scheduled_tasks, "expected metadata fetch task to be scheduled"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    state = add_state_cell.cell_contents
+    assert state['repo_metadata_source'] == 'octo/repo'
+    assert state['loading_repo_metadata'] is False
+    assert state['repo_metadata_task'] is None
+    assert state['metadata_error'] == 'Metadata error: label boom'
+    assert state['label_choices'] == []
+    assert state['priority_choices'] == []
+    assert state['assignee_choices'] == []
+
+    start_repo_fetch('octo/repo')
+    assert scheduled_tasks, "expected metadata fetch to reschedule after failure"
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+    state = add_state_cell.cell_contents
+    assert state['metadata_error'] == 'Metadata error: label boom'
+    assert state['loading_repo_metadata'] is False
+
+    db.conn.close()
+
+
+def test_update_worker_handles_fetch_error(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row()
+    db.upsert_many([row])
+
+    def failing_fetch(token, cfg, date_cutoff, progress, include_unassigned):
+        raise RuntimeError("boom fetch")
+
+    monkeypatch.setattr(ght, "fetch_tasks_github", failing_fetch)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    update_handler = _find_binding(harness.kb, "u")
+    update_cells = _closure_cells(update_handler)
+    update_worker_fn = update_cells["update_worker"].cell_contents
+    worker_cells = _closure_cells(update_worker_fn)
+    status_line_cell = worker_cells["status_line"]
+    update_flag_cell = worker_cells["update_in_progress"]
+
+    assert update_flag_cell.cell_contents is False
+
+    update_handler(SimpleNamespace())
+    assert scheduled_tasks, "expected update_worker to be scheduled"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert status_line_cell.cell_contents == "Error: boom fetch"
+    assert update_flag_cell.cell_contents is False
+
+    update_handler(SimpleNamespace())
+    assert scheduled_tasks, "expected update to reschedule after failure"
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+    assert update_flag_cell.cell_contents is False
+
+    db.conn.close()
+
+
 def test_add_mode_iteration_comment_and_confirm(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(
