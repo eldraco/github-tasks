@@ -182,6 +182,86 @@ def test_save_state_handles_json_dump_error(monkeypatch, temp_db_path, tmp_path,
     db.conn.close()
 
 
+def test_apply_status_change_sets_done_and_stops_timer(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row(status="In Progress", status_option_id="status-in-progress")
+    db.upsert_many([row])
+
+    cur = db.conn.cursor()
+    cur.execute(
+        "INSERT INTO work_sessions(task_url, project_title, started_at, ended_at, labels) VALUES (?,?,?,?,?)",
+        (row.url, row.project_title, "2024-01-01T09:00:00+00:00", None, "[]"),
+    )
+    db.conn.commit()
+
+    status_calls = []
+
+    def fake_set_project_status(token, project_id, item_id, field_id, option_id):
+        status_calls.append({
+            "token": token,
+            "project_id": project_id,
+            "item_id": item_id,
+            "field_id": field_id,
+            "option_id": option_id,
+        })
+
+    monkeypatch.setattr(ght, "set_project_status", fake_set_project_status)
+
+    label_calls = []
+    monkeypatch.setattr(ght, "fetch_labels_for_url", lambda token, url: label_calls.append((token, url)) or ["bug"])
+
+    original_stop = db.stop_session
+    stop_calls = []
+
+    def tracking_stop(task_url, project_title, repo, labels_json):
+        stop_calls.append({
+            "task_url": task_url,
+            "project_title": project_title,
+            "repo": repo,
+            "labels": labels_json,
+        })
+        return original_stop(task_url, project_title, repo, labels_json)
+
+    monkeypatch.setattr(db, "stop_session", tracking_stop, raising=False)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    handler = _find_binding(harness.kb, "D")
+    handler_cells = _closure_cells(handler)
+    apply_status = handler_cells["_apply_status_change"].cell_contents
+    apply_cells = _closure_cells(apply_status)
+    pending_urls = apply_cells["pending_status_urls"].cell_contents
+    status_line_cell = apply_cells["status_line"]
+
+    assert row.url in db.active_task_urls(), "precondition: task should have active timer"
+
+    handler(SimpleNamespace())
+    assert scheduled_tasks, "status handler should schedule coroutine"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert status_calls and status_calls[0]["option_id"] == "status-done"
+    assert label_calls == [("token", row.url)]
+    assert stop_calls and stop_calls[0]["task_url"] == row.url
+    assert row.url not in pending_urls
+    assert "Status set to" in status_line_cell.cell_contents
+
+    stored = db.load()[0]
+    assert stored.status == "Done"
+    assert stored.status_option_id == "status-done"
+    assert stored.status_dirty == 0
+    assert stored.status_pending_option_id == ""
+    assert stored.is_done == 1
+    assert row.url not in db.active_task_urls()
+
+    from prompt_toolkit import Application
+
+    assert Application.instances[-1].invalidate_calls > 0
+
+    db.conn.close()
+
+
 def test_apply_status_change_queues_and_handles_error(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row()
