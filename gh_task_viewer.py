@@ -199,7 +199,438 @@ BASE_THEME_STYLE: Dict[str, str] = {
     'summary.label': '#ffd787',
     'summary.value': '#f0f0f0',
     'summary.accent': '#87d7ff',
+    'zen.header': 'bg:default italic bold #ffd7af',
+    'zen.text': 'bg:default italic #f0f0f0',
+    'zen.focus': 'bg:default italic bold #ffd7af',
+    'zen.ascii': 'bg:default italic bold #ffd7af',
+    'zen.meta': 'bg:default italic #d7d7d7',
+    'zen.subtitle': 'bg:default italic #c0c0c0',
 }
+
+ZEN_ASCII_FONT: Dict[str, Tuple[str, ...]] = {
+    'A': (
+        "   ___   ",
+        "  / _ \\  ",
+        " / /_\\ \\ ",
+        " |  _  | ",
+        " | | | | ",
+        " |_| |_| ",
+    ),
+    'B': (
+        " ____    ",
+        "| __ )   ",
+        "|  _ \\  ",
+        "| |_) | ",
+        "|____/  ",
+        "        ",
+    ),
+    'C': (
+        "  ____   ",
+        " / ___|  ",
+        "| |      ",
+        "| |___   ",
+        " \\____| ",
+        "        ",
+    ),
+    'D': (
+        " ____    ",
+        "|  _ \\  ",
+        "| | | | ",
+        "| |_| | ",
+        "|____/  ",
+        "        ",
+    ),
+    'E': (
+        " _____   ",
+        "| ____|  ",
+        "|  _|    ",
+        "| |___   ",
+        "|_____|  ",
+        "        ",
+    ),
+    'F': (
+        " _____   ",
+        "|  ___|  ",
+        "| |_     ",
+        "|  _|    ",
+        "|_|      ",
+        "        ",
+    ),
+    'G': (
+        "  ____   ",
+        " / ___|  ",
+        "| |  _   ",
+        "| |_| |  ",
+        " \\____| ",
+        "        ",
+    ),
+    'H': (
+        " _   _   ",
+        "| | | |  ",
+        "| |_| |  ",
+        "|  _  |  ",
+        "|_| |_|  ",
+        "        ",
+    ),
+    'I': (
+        " _____   ",
+        "|_   _|  ",
+        "  | |    ",
+        "  | |    ",
+        " _| |_   ",
+        "|_____|  ",
+    ),
+    'J': (
+        "     _   ",
+        "    | |  ",
+        " _  | |  ",
+        "| |_| |  ",
+        " \\___/  ",
+        "        ",
+    ),
+    'K': (
+        " _  __   ",
+        "| |/ /   ",
+        "| ' /    ",
+        "| . \\   ",
+        "|_|\\_\\  ",
+        "        ",
+    ),
+    'L': (
+        " _       ",
+        "| |      ",
+        "| |      ",
+        "| |___   ",
+        "|_____|  ",
+        "        ",
+    ),
+    'M': (
+        " __  __  ",
+        "|  \\/  | ",
+        "| .  . | ",
+        "| |\\/| | ",
+        "|_|  |_| ",
+        "        ",
+    ),
+    'N': (
+        " _   _   ",
+        "| \\ | |  ",
+        "|  \\| |  ",
+        "| |\\  |  ",
+        "|_| \\_|  ",
+        "        ",
+    ),
+    'O': (
+        "  ___    ",
+        " / _ \\  ",
+        "| | | | ",
+        "| |_| | ",
+        " \\___/  ",
+        "        ",
+    ),
+    'P': (
+        " _____   ",
+        "|  _  |  ",
+        "| |_| |  ",
+        "|  ___|  ",
+        "|_|      ",
+        "        ",
+    ),
+    'Q': (
+        "  ___    ",
+        " / _ \\  ",
+        "| | | | ",
+        "| |_| | ",
+        " \\__\\ \\ ",
+        "     \\_| ",
+    ),
+    'R': (
+        " ____    ",
+        "|  _ \\  ",
+        "| |_| | ",
+        "|  _ <  ",
+        "|_| \\_\\ ",
+        "        ",
+    ),
+    'S': (
+        " ____    ",
+        "/ ___|   ",
+        "\\___ \\  ",
+        " ___) | ",
+        "|____/  ",
+        "        ",
+    ),
+    'T': (
+        " _____   ",
+        "|_   _|  ",
+        "  | |    ",
+        "  | |    ",
+        "  |_|    ",
+        "        ",
+    ),
+    'U': (
+        " _   _   ",
+        "| | | |  ",
+        "| | | |  ",
+        "| |_| |  ",
+        " \\___/  ",
+        "        ",
+    ),
+    'V': (
+        "__     __",
+        "\\ \\   / /",
+        " \\ \\ / / ",
+        "  \\ V /  ",
+        "   \\_/   ",
+        "        ",
+    ),
+    'W': (
+        "__        __",
+        "\\ \\  /\\ / /",
+        " \\ \\/  \\/ / ",
+        "  \\  /\\  /  ",
+        "   \\/  \\/   ",
+        "          ",
+    ),
+    'X': (
+        "__  __   ",
+        "\\ \\/ /   ",
+        " \\  /    ",
+        " /  \\   ",
+        "/_/\\_\\  ",
+        "        ",
+    ),
+    'Y': (
+        "__   __  ",
+        "\\ \\ / /  ",
+        " \\ V /   ",
+        "  | |    ",
+        "  |_|    ",
+        "        ",
+    ),
+    'Z': (
+        " ______  ",
+        "|___  /  ",
+        "  / /   ",
+        " / /__  ",
+        "/_____| ",
+        "        ",
+    ),
+    '0': (
+        "  ____   ",
+        " / __ \\  ",
+        "| |  | | ",
+        "| |  | | ",
+        " \\__| | ",
+        "  \\___/  ",
+    ),
+    '1': (
+        " _       ",
+        "| |      ",
+        "| |      ",
+        "| |      ",
+        "|_|      ",
+        "        ",
+    ),
+    '2': (
+        " _____   ",
+        "|___ /   ",
+        "  |_ \\  ",
+        " ___) | ",
+        "|____/  ",
+        "        ",
+    ),
+    '3': (
+        " ____    ",
+        "|___ \\  ",
+        "  __) | ",
+        " |__ <  ",
+        " ___) | ",
+        "|____/  ",
+    ),
+    '4': (
+        " _  _    ",
+        "| || |   ",
+        "| || |_  ",
+        "|__   _| ",
+        "   |_|   ",
+        "        ",
+    ),
+    '5': (
+        " ____    ",
+        "| ___|   ",
+        "|___ \\  ",
+        " ___) | ",
+        "|____/  ",
+        "        ",
+    ),
+    '6': (
+        "  __     ",
+        " / /_    ",
+        "| '_ \\  ",
+        "| (_) | ",
+        " \\___/  ",
+        "        ",
+    ),
+    '7': (
+        " _____   ",
+        "|___  |  ",
+        "   / /   ",
+        "  / /    ",
+        " /_/     ",
+        "        ",
+    ),
+    '8': (
+        "  ___    ",
+        " ( _ )   ",
+        " / _ \\  ",
+        "| (_) | ",
+        " \\___/  ",
+        "        ",
+    ),
+    '9': (
+        "  ___    ",
+        " / _ \\  ",
+        "| (_) | ",
+        " \\__, | ",
+        "   /_/  ",
+        "        ",
+    ),
+    '-': (
+        "        ",
+        "        ",
+        " ______  ",
+        "|______| ",
+        "        ",
+        "        ",
+    ),
+    ':': (
+        "        ",
+        "   _    ",
+        "  (_)   ",
+        "   _    ",
+        "  (_)   ",
+        "        ",
+    ),
+    '&': (
+        "  ___    ",
+        " / _ \\  ",
+        "| |_| | ",
+        " \\__ \\ ",
+        "(   / / ",
+        " |_|_/  ",
+    ),
+    '?': (
+        " ____    ",
+        "|__  |   ",
+        "  / /   ",
+        " |_|    ",
+        "  _     ",
+        " (_)    ",
+    ),
+    '!': (
+        " _      ",
+        "| |     ",
+        "| |     ",
+        "|_|     ",
+        "(_)     ",
+        "        ",
+    ),
+    "'": (
+        " _      ",
+        "( )     ",
+        "|/      ",
+        "        ",
+        "        ",
+        "        ",
+    ),
+    ',': (
+        "        ",
+        "        ",
+        "        ",
+        "  _     ",
+        " ( )    ",
+        " |/     ",
+    ),
+    '.': (
+        "        ",
+        "        ",
+        "        ",
+        "        ",
+        "  _     ",
+        " (_)    ",
+    ),
+    '/': (
+        "     /  ",
+        "    /   ",
+        "   /    ",
+        "  /     ",
+        " /      ",
+        "        ",
+    ),
+    '(': (
+        "   __   ",
+        "  / /   ",
+        " | |    ",
+        " | |    ",
+        "  \\ \\   ",
+        "   \\_\\  ",
+    ),
+    ')': (
+        " __     ",
+        " \\ \\    ",
+        "  | |   ",
+        "  | |   ",
+        " /_/    ",
+        "        ",
+    ),
+    '[': (
+        "  ___   ",
+        " | __|  ",
+        " | |    ",
+        " | |    ",
+        " |___|  ",
+        "        ",
+    ),
+    ']': (
+        " ___    ",
+        "|__ |   ",
+        "  | |   ",
+        "  | |   ",
+        " |___|  ",
+        "        ",
+    ),
+    ' ': (
+        "        ",
+        "        ",
+        "        ",
+        "        ",
+        "        ",
+        "        ",
+    ),
+}
+
+
+def build_zen_ascii_art(text: str) -> List[str]:
+    if not text:
+        return []
+    glyphs: List[Tuple[str, ...]] = []
+    for ch in text:
+        glyph = ZEN_ASCII_FONT.get(ch)
+        if glyph is None:
+            glyph = ZEN_ASCII_FONT.get(ch.upper())
+        if glyph is None:
+            glyph = ZEN_ASCII_FONT.get('?')
+        glyphs.append(glyph)
+    if not glyphs:
+        return []
+    height = len(glyphs[0])
+    width_between = 2
+    lines: List[str] = []
+    for row in range(height):
+        parts = [glyph[row] for glyph in glyphs]
+        lines.append((' ' * width_between).join(parts).rstrip())
+    return lines
 
 DEFAULT_THEME_LAYOUT = "vertical"
 SHIFTED_DIGIT_KEYS = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')']
@@ -4889,6 +5320,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             total_rows = 40
             total_cols = 120
         visible_rows = max(1, total_rows - 3)
+        if zen_mode:
+            visible_rows = max(1, total_rows)
         if current_index < v_offset:
             v_offset = current_index
         elif current_index >= v_offset + visible_rows:
@@ -4959,80 +5392,42 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         if zen_mode:
             frags: List[Tuple[str, str]] = []
-            date_header = 'Iteration' if use_iteration else 'Focus Day'
-            date_width = 14 if use_iteration else 12
-            status_width = 12
-            min_title_width = 20
-            spacing = 4  # two separators of two spaces each
-            prefix_width = 2
-            title_width = max(min_title_width, total_cols - (prefix_width + date_width + status_width + spacing))
-            header_cells = [
-                _pad_display(date_header, date_width),
-                _pad_display('Status', status_width),
-                _pad_display('Title', title_width),
-            ]
-            header_line = '  ' + '  '.join(header_cells)
-            header_line = header_line[h_offset:] if h_offset else header_line
-            frags.append((_style_class('table.header'), header_line))
-            frags.append(("", "\n"))
             if not rows:
-                task_duration_cache = {}
-                frags.append(("italic", "  (no tasks match filters)"))
-                if frags and frags[-1][1] == "\n":
-                    frags.pop()
+                empty_style = _style_class('zen.text') or 'italic'
+                frags.append((empty_style, ""))
                 return frags
-            today = today_date
-            try:
-                active_urls = set(db.active_task_urls())
-            except Exception:
-                active_urls = set()
             selected = rows[current_index]
-            selected_urls = [selected.url] if selected.url else []
-            task_duration_cache = db.task_duration_snapshot(selected_urls) if selected_urls else {}
-            if use_iteration:
-                if selected.iteration_title and selected.iteration_start:
-                    date_value = f"{selected.iteration_title} ({selected.iteration_start})"
-                else:
-                    date_value = selected.iteration_title or selected.iteration_start or '-'
-            else:
-                date_value = selected.focus_date or selected.start_date or '-'
-            status_value = (selected.status or '-') + ('*' if selected.status_dirty else '')
-            title_value = selected.title or '-'
-            row_cells = [
-                _pad_display(date_value, date_width),
-                _pad_display(status_value, status_width),
-                _pad_display(title_value, title_width),
-            ]
-            running = bool(selected.url and selected.url in active_urls)
-            prefix = '⏱ ' if running else '  '
-            row_line = prefix + '  '.join(row_cells)
-            row_line = row_line[h_offset:] if h_offset else row_line
-            date_palette = {
-                'today': _style_class('table.date.today'),
-                'past': _style_class('table.date.past'),
-                'future': _style_class('table.date.future'),
-                'unknown': _style_class('table.date.unknown'),
-            }
-            date_key = (selected.focus_date or selected.start_date or '').strip()
-            date_val = _safe_date(date_key) if date_key else None
-            if running:
-                base_style = _style_class(ROW_STYLE_RUNNING) or 'ansicyan bold'
-            else:
-                if date_val is None:
-                    base_style = _style_class(ROW_STYLE_UNKNOWN) or color_for_date(selected.focus_date, today, date_palette)
-                elif date_val == today:
-                    base_style = _style_class(ROW_STYLE_TODAY)
-                elif date_val < today:
-                    base_style = _style_class(ROW_STYLE_PAST)
-                else:
-                    idx_map = future_map.get(date_key, 0)
-                    class_name = FUTURE_ROW_STYLE_CLASSES[idx_map % len(FUTURE_ROW_STYLE_CLASSES)]
-                    base_style = _style_class(class_name)
-                if not base_style:
-                    base_style = color_for_date(selected.focus_date, today, date_palette)
-            row_style = f"{base_style} reverse".strip() if base_style else 'reverse'
-            frags.append((row_style, row_line))
-            frags.append(("", "\n"))
+            title_value = (selected.title or '').strip()
+            if not title_value:
+                title_value = '(untitled task)'
+            ascii_lines = build_zen_ascii_art(title_value)
+            if not ascii_lines:
+                ascii_lines = [title_value]
+            ascii_height = len(ascii_lines)
+
+            vertical_padding = max(0, (visible_rows - ascii_height) // 2)
+            pad_style = _style_class('zen.text') or ''
+
+            def _append_line(style: str, text: str) -> None:
+                line = text
+                if total_cols > 0:
+                    line = line.center(total_cols)
+                if h_offset:
+                    line = line[h_offset:]
+                frags.append((style, line))
+                frags.append(("", "\n"))
+
+            for _ in range(vertical_padding):
+                _append_line(pad_style, "")
+
+            ascii_style = _style_class('zen.focus', 'zen.text') or 'italic'
+            for ascii_line in ascii_lines:
+                _append_line(ascii_style, ascii_line)
+
+            bottom_padding = max(0, visible_rows - vertical_padding - ascii_height)
+            for _ in range(bottom_padding):
+                _append_line(pad_style, "")
+
             if frags and frags[-1][1] == "\n":
                 frags.pop()
             return frags
@@ -5650,6 +6045,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     table_window = Window(content=table_control, wrap_lines=False, always_hide_cursor=True)
     # Top status bar: shows date, current project, total tasks shown, and active search filter
     def build_top_status() -> List[Tuple[str,str]]:
+        if zen_mode:
+            blank_style = _style_class('zen.text') or ''
+            return [(blank_style, '')]
         rows = filtered_rows()
         total = len(rows)
         active_proj = project_cycle or 'All'
@@ -6406,6 +6804,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return f"{m:02d}:{s:02d}"
 
     def build_status_bar() -> str:
+        if zen_mode:
+            return ''
         if in_date_filter:
             mode = "🗓️ DATE"
         elif in_search:
