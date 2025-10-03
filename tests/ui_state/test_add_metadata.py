@@ -16,6 +16,10 @@ def _open_add_overlay(ui_context):
     return open_add, add_state, enter
 
 
+def _status_line(open_add):
+    return closure_value(open_add, 'status_line')
+
+
 def _advance_to_repo_step(enter, add_state):
     # mode -> project
     enter(dummy_event())
@@ -85,3 +89,70 @@ def test_add_metadata_fetch_failure(ui_context, monkeypatch):
     assert add_state['priority_choices'] == []
     assert add_state['assignee_choices'] == []
     assert add_state['metadata_error'] == 'Metadata error: boom'
+
+
+def test_add_repo_manual_requires_owner_name(ui_context):
+    open_add, add_state, enter = _open_add_overlay(ui_context)
+
+    _advance_to_repo_step(enter, add_state)
+
+    add_state['repo_choices'] = []
+    add_state['repo_manual'] = 'acme'
+    add_state['repo_cursor'] = len('acme')
+
+    enter(dummy_event())
+
+    assert add_state['step'] == 'repo'
+    assert _status_line(open_add) == 'Repository must be owner/name'
+
+
+def test_add_labels_step_validation_messages(ui_context):
+    open_add, add_state, enter = _open_add_overlay(ui_context)
+
+    add_state['step'] = 'labels'
+    add_state['loading_repo_metadata'] = True
+    add_state['label_choices'] = []
+    add_state['labels_selected'] = set()
+
+    enter(dummy_event())
+    assert add_state['step'] == 'labels'
+    assert _status_line(open_add) == 'Labels still loading…'
+
+    add_state['loading_repo_metadata'] = False
+    enter(dummy_event())
+    assert _status_line(open_add) == 'No labels available yet'
+
+    add_state['label_choices'] = ['Bug']
+    enter(dummy_event())
+    assert _status_line(open_add) == 'Select at least one label (space to toggle)'
+
+
+def test_add_priority_and_assignee_requirements(ui_context):
+    open_add, add_state, enter = _open_add_overlay(ui_context)
+
+    add_state['step'] = 'priority'
+    add_state['loading_repo_metadata'] = False
+    add_state['priority_choices'] = ['High']
+    add_state['priority_label'] = ''
+
+    enter(dummy_event())
+    assert add_state['step'] == 'priority'
+    assert _status_line(open_add) == 'Pick a priority (space to choose)'
+
+    add_state['priority_label'] = 'High'
+    enter(dummy_event())
+    assert add_state['step'] == 'assignee'
+
+    # No choices available
+    add_state['loading_repo_metadata'] = False
+    add_state['assignee_choices'] = []
+    add_state['assignees_selected'] = set()
+    enter(dummy_event())
+    assert add_state['step'] == 'assignee'
+    assert _status_line(open_add) == 'No assignable users found'
+
+    # Provide choices but no selection
+    add_state['assignee_choices'] = [{'login': 'octocat', 'display': 'Octocat'}]
+    enter(dummy_event())
+    assert add_state['step'] == 'assignee'
+    assert _status_line(open_add) == 'Select at least one assignee'
