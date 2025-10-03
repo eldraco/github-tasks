@@ -923,6 +923,121 @@ def test_session_editor_edits_adjusts_and_deletes(monkeypatch, temp_db_path, tmp
 
     db.conn.close()
 
+
+def test_session_editor_validation_blocks_invalid_updates(monkeypatch, temp_db_path, tmp_path, ui_config):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row()
+    db.upsert_many([row])
+
+    cur = db.conn.cursor()
+    cur.execute(
+        "INSERT INTO work_sessions(task_url, project_title, started_at, ended_at, labels) VALUES (?,?,?,?,?)",
+        (row.url, row.project_title, "2024-01-01T09:00:00+00:00", "2024-01-01T10:00:00+00:00", "[]"),
+    )
+    session_id = cur.lastrowid
+    db.conn.commit()
+
+    update_calls = []
+
+    def tracking_update(self, session_id_int, *, started_at=ght._UNSET, ended_at=ght._UNSET):
+        update_calls.append({
+            "session_id": session_id_int,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        })
+        return None
+
+    monkeypatch.setattr(ght.TaskDB, "update_session_times", tracking_update)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    enter_handler = _find_binding(
+        harness.kb,
+        "enter",
+        predicate=lambda func: "session_state" in func.__code__.co_freevars,
+    )
+    start_edit_handler = _find_binding(
+        harness.kb,
+        "s",
+        predicate=lambda func: "_begin_session_edit" in func.__code__.co_freevars,
+    )
+
+    enter_cells = _closure_cells(enter_handler)
+    session_state_cell = enter_cells["session_state"]
+    edit_sessions_mode_cell = enter_cells["edit_sessions_mode"]
+    commit_cells = _closure_cells(enter_cells["_commit_session_edit"].cell_contents)
+    status_line_cell = commit_cells["status_line"]
+
+    session_entry = {
+        "id": session_id,
+        "start_dt": dt.datetime(2024, 1, 1, 9, 0, tzinfo=dt.timezone.utc),
+        "end_dt": dt.datetime(2024, 1, 1, 10, 0, tzinfo=dt.timezone.utc),
+        "start_display": "2024-01-01 09:00",
+        "end_display": "2024-01-01 10:00",
+        "duration": 3600,
+        "open": False,
+        "start_raw": "2024-01-01T09:00:00+00:00",
+        "end_raw": "2024-01-01T10:00:00+00:00",
+    }
+    session_state_cell.cell_contents = {
+        "task_url": row.url,
+        "task_title": row.title,
+        "project_title": row.project_title,
+        "cursor": 0,
+        "sessions": [session_entry],
+        "edit_field": None,
+        "input": "",
+        "message": "",
+        "selected_id": session_id,
+        "total_duration": session_entry["duration"],
+    }
+    edit_sessions_mode_cell.cell_contents = True
+
+    start_edit_handler(SimpleNamespace())
+    session_state = session_state_cell.cell_contents
+    assert session_state["edit_field"] == "start"
+    session_state["input"] = "not-a-date"
+
+    enter_handler(SimpleNamespace())
+    session_state = session_state_cell.cell_contents
+    assert session_state["message"] == "Invalid start timestamp"
+    assert session_state["edit_field"] == "start"
+    assert update_calls == []
+    assert status_line_cell.cell_contents == ""
+
+    session_state["edit_field"] = None
+    session_state["input"] = ""
+    session_state["message"] = ""
+    session_state = session_state_cell.cell_contents
+    assert session_state["edit_field"] is None
+
+    enter_handler(SimpleNamespace())
+    session_state = session_state_cell.cell_contents
+    assert session_state["edit_field"] == "end"
+    session_state["input"] = "2024-01-01 08:30"
+
+    enter_handler(SimpleNamespace())
+    session_state = session_state_cell.cell_contents
+    assert session_state["message"] == "End must be after start"
+    assert session_state["edit_field"] == "end"
+    assert update_calls == []
+    assert status_line_cell.cell_contents == ""
+
+    session_state["edit_field"] = None
+    session_state["input"] = ""
+    session_state["message"] = ""
+
+    cur.execute(
+        "SELECT started_at, ended_at FROM work_sessions WHERE id=?",
+        (session_id,),
+    )
+    stored_start, stored_end = cur.fetchone()
+    assert stored_start == "2024-01-01T09:00:00+00:00"
+    assert stored_end == "2024-01-01T10:00:00+00:00"
+
+    db.conn.close()
+
+
 def test_add_mode_iteration_comment_and_confirm(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(
