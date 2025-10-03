@@ -1217,6 +1217,64 @@ def test_add_comment_validation_and_error(monkeypatch, temp_db_path, tmp_path, u
     db.conn.close()
 
 
+def test_focus_shift_hotkeys_adjust_dates_and_status(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row(focus_date="2024-01-01")
+    db.upsert_many([row])
+
+    date_calls = []
+
+    def fake_set_project_date(token, project_id, item_id, field_id, value):
+        date_calls.append((token, project_id, item_id, field_id, value))
+
+    monkeypatch.setattr(ght, "set_project_date", fake_set_project_date)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    enter_handler = _find_binding(
+        harness.kb,
+        "enter",
+        predicate=lambda func: "_update_task_date" in func.__code__.co_freevars,
+    )
+    enter_cells = _closure_cells(enter_handler)
+    status_line_cell = _closure_cells(enter_cells["_update_task_date"].cell_contents)["status_line"]
+
+    shift_down_handler = _find_binding(
+        harness.kb,
+        "y",
+        predicate=lambda func: "_focus_shift" in func.__code__.co_freevars,
+    )
+
+    shift_down_handler(SimpleNamespace())
+    assert scheduled_tasks, "focus shift should schedule update"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert date_calls == [("token", "proj-123", "item-123", "focus-field", "2023-12-31")]
+    assert status_line_cell.cell_contents == "Focus Day updated"
+    stored = db.load()[0]
+    assert stored.focus_date == "2023-12-31"
+
+    shift_up_handler = _find_binding(
+        harness.kb,
+        "Y",
+        predicate=lambda func: "_focus_shift" in func.__code__.co_freevars,
+    )
+    shift_up_handler(SimpleNamespace())
+    assert scheduled_tasks, "focus shift up should schedule update"
+
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    assert date_calls[-1] == ("token", "proj-123", "item-123", "focus-field", "2024-01-01")
+    assert status_line_cell.cell_contents == "Focus Day updated"
+    stored = db.load()[0]
+    assert stored.focus_date == "2024-01-01"
+
+    db.conn.close()
+
+
 def test_add_mode_iteration_comment_and_confirm(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(
