@@ -1440,7 +1440,6 @@ def test_add_mode_calendar_navigation_and_cancel(monkeypatch, temp_db_path, tmp_
     harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
 
     add_handler = _find_binding(harness.kb, "A")
-    add_cells = _closure_cells(add_handler)
     add_handler(SimpleNamespace())
 
     enter_handler = _find_binding(
