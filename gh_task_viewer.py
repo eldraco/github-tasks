@@ -2202,11 +2202,11 @@ def get_priority_field_metadata(token: str, project_id: str) -> Tuple[str, List[
         return "", []
     node = (resp.get("data") or {}).get("node") or {}
     fields = ((node.get("fields") or {}).get("nodes")) or []
-    for field in fields:
-        if not isinstance(field, dict):
+    for field_node in fields:
+        if not isinstance(field_node, dict):
             continue
-        field_id = (field.get("id") or "").strip()
-        name = (field.get("name") or "").strip()
+        field_id = (field_node.get("id") or "").strip()
+        name = (field_node.get("name") or "").strip()
         if not (field_id and name):
             continue
         if not _looks_like_priority_field(name):
