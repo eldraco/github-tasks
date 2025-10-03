@@ -611,25 +611,115 @@ ZEN_ASCII_FONT: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def build_zen_ascii_art(text: str) -> List[str]:
+def build_zen_ascii_art(text: str, max_width: Optional[int] = None) -> List[str]:
     if not text:
         return []
-    glyphs: List[Tuple[str, ...]] = []
-    for ch in text:
+
+    sample_glyph = next(iter(ZEN_ASCII_FONT.values()))
+    glyph_height = len(sample_glyph)
+    width_between = 1
+    space_glyph = ZEN_ASCII_FONT.get(' ')
+
+    def _glyph_for(ch: str) -> Tuple[str, ...]:
         glyph = ZEN_ASCII_FONT.get(ch)
-        if glyph is None:
+        if glyph is None and ch.upper() != ch:
             glyph = ZEN_ASCII_FONT.get(ch.upper())
         if glyph is None:
             glyph = ZEN_ASCII_FONT.get('?')
-        glyphs.append(glyph)
-    if not glyphs:
+        return glyph
+
+    def _glyph_width(glyph: Tuple[str, ...]) -> int:
+        return len(glyph[0]) if glyph and glyph[0] is not None else 0
+
+    def _line_width(glyphs: List[Tuple[str, ...]]) -> int:
+        width = 0
+        for idx, glyph in enumerate(glyphs):
+            if idx:
+                width += width_between
+            width += _glyph_width(glyph)
+        return width
+
+    def _is_space(glyph: Tuple[str, ...]) -> bool:
+        return bool(space_glyph) and glyph == space_glyph
+
+    line_blocks: List[List[Tuple[str, ...]]] = []
+    current_line: List[Tuple[str, ...]] = []
+    last_space_idx: Optional[int] = None
+
+    def _record_last_space() -> None:
+        nonlocal last_space_idx
+        last_space_idx = None
+        for idx, glyph in enumerate(current_line):
+            if _is_space(glyph):
+                last_space_idx = idx
+
+    def _flush(force_blank: bool = False) -> None:
+        nonlocal current_line, last_space_idx
+        trimmed = list(current_line)
+        while trimmed and _is_space(trimmed[-1]):
+            trimmed.pop()
+        if trimmed or force_blank:
+            line_blocks.append(trimmed)
+        current_line = []
+        last_space_idx = None
+
+    effective_max = max_width if max_width and max_width > 0 else None
+
+    for ch in text:
+        if ch == '\n':
+            _flush(force_blank=True)
+            continue
+        glyph = _glyph_for(ch)
+        glyph_width = _glyph_width(glyph)
+        if glyph_width <= 0:
+            continue
+        current_width = _line_width(current_line)
+        gap = width_between if current_line else 0
+        projected_width = glyph_width if not current_line else current_width + gap + glyph_width
+
+        if effective_max and current_line and projected_width > effective_max:
+            if last_space_idx is not None:
+                tail = current_line[last_space_idx+1:]
+                while tail and _is_space(tail[0]):
+                    tail.pop(0)
+                current_line = current_line[:last_space_idx]
+                _flush()
+                current_line = list(tail)
+                _record_last_space()
+            else:
+                _flush()
+            if not current_line and ch == ' ':
+                continue
+            current_width = _line_width(current_line)
+            gap = width_between if current_line else 0
+            projected_width = glyph_width if not current_line else current_width + gap + glyph_width
+
+        current_line.append(glyph)
+        if _is_space(glyph):
+            _record_last_space()
+
+    _flush()
+
+    if not line_blocks:
         return []
-    height = len(glyphs[0])
-    width_between = 2
+
     lines: List[str] = []
-    for row in range(height):
-        parts = [glyph[row] for glyph in glyphs]
-        lines.append((' ' * width_between).join(parts).rstrip())
+    total_blocks = len(line_blocks)
+    for idx, block in enumerate(line_blocks):
+        if not block:
+            lines.append('')
+            continue
+        for row in range(glyph_height):
+            parts: List[str] = []
+            for col_idx, glyph in enumerate(block):
+                if col_idx:
+                    parts.append(' ' * width_between)
+                parts.append(glyph[row])
+            lines.append(''.join(parts))
+        if idx != total_blocks - 1:
+            next_block = line_blocks[idx + 1]
+            if next_block:
+                lines.append('')
     return lines
 
 DEFAULT_THEME_LAYOUT = "vertical"
@@ -5400,7 +5490,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             title_value = (selected.title or '').strip()
             if not title_value:
                 title_value = '(untitled task)'
-            ascii_lines = build_zen_ascii_art(title_value)
+            ascii_wrap_width = max(8, total_cols - 4) if total_cols > 0 else None
+            ascii_lines = build_zen_ascii_art(title_value, max_width=ascii_wrap_width)
             if not ascii_lines:
                 ascii_lines = [title_value]
             ascii_height = len(ascii_lines)
@@ -5414,13 +5505,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     line = line.center(total_cols)
                 if h_offset:
                     line = line[h_offset:]
+                if total_cols > 0:
+                    line = line[:total_cols]
                 frags.append((style, line))
                 frags.append(("", "\n"))
 
             for _ in range(vertical_padding):
                 _append_line(pad_style, "")
 
-            ascii_style = _style_class('zen.focus', 'zen.text') or 'italic'
+            ascii_style = _style_class('zen.ascii', 'zen.focus') or 'italic'
             for ascii_line in ascii_lines:
                 _append_line(ascii_style, ascii_line)
 
