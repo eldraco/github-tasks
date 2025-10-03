@@ -1133,6 +1133,90 @@ def test_update_worker_handles_fetch_error(monkeypatch, temp_db_path, tmp_path, 
     db.conn.close()
 
 
+def test_add_comment_validation_and_error(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row()
+    db.upsert_many([row])
+
+    calls = []
+
+    def fake_add_issue_comment(token, url, body):
+        calls.append((token, url, body))
+
+    monkeypatch.setattr(ght, "add_issue_comment", fake_add_issue_comment)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    open_handler = _find_binding(harness.kb, "O")
+    enter_handler = _find_binding(
+        harness.kb,
+        "enter",
+        predicate=lambda func: "task_edit_state" in func.__code__.co_freevars,
+    )
+
+    enter_cells = _closure_cells(enter_handler)
+    task_edit_state_cell = enter_cells["task_edit_state"]
+    add_comment_fn = enter_cells["_add_comment"].cell_contents
+    comment_cells = _closure_cells(add_comment_fn)
+    status_line_cell = comment_cells["status_line"]
+
+    open_handler(SimpleNamespace())
+
+    task_state = task_edit_state_cell.cell_contents
+    fields = task_state["fields"]
+    comment_idx = next(i for i, field in enumerate(fields) if field.get("field_key") == "comment")
+    task_state["cursor"] = comment_idx
+
+    enter_handler(SimpleNamespace())  # begin comment edit
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["mode"] == "edit-comment"
+
+    initial_status = status_line_cell.cell_contents
+
+    enter_handler(SimpleNamespace())  # attempt empty comment
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["message"] == "Comment cannot be empty"
+    assert status_line_cell.cell_contents == initial_status
+    assert calls == []
+    assert not scheduled_tasks
+
+    task_state["input"] = "First comment"
+    enter_handler(SimpleNamespace())  # commit valid comment
+
+    assert scheduled_tasks, "posting comment should schedule coroutine"
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["message"] == "Comment posted"
+    assert status_line_cell.cell_contents == "Comment posted"
+    assert calls == [("token", row.url, "First comment")]
+
+    def failing_add_issue_comment(token, url, body):
+        calls.append((token, url, body))
+        raise RuntimeError("comment 500")
+
+    monkeypatch.setattr(ght, "add_issue_comment", failing_add_issue_comment)
+
+    task_state["cursor"] = comment_idx
+    enter_handler(SimpleNamespace())  # reopen editor
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["mode"] == "edit-comment"
+    task_state["input"] = "Boom"
+
+    enter_handler(SimpleNamespace())
+    assert scheduled_tasks, "failing comment should still schedule coroutine"
+    coro = scheduled_tasks.pop()
+    asyncio.run(coro)
+
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["message"] == "Comment failed: comment 500"
+    assert status_line_cell.cell_contents == "Comment failed: comment 500"
+    assert calls[-1] == ("token", row.url, "Boom")
+
+    db.conn.close()
+
+
 def test_add_mode_iteration_comment_and_confirm(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(
