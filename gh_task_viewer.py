@@ -53,6 +53,7 @@ import string
 import json
 import threading
 import unicodedata
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Iterable, Set
@@ -68,6 +69,7 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
 try:
     from prompt_toolkit.utils import get_cwidth as _pt_get_cwidth
 except ImportError:  # pragma: no cover - fallback when prompt_toolkit changes API
@@ -3334,6 +3336,26 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     all_rows = load_all()
 
+    def _open_task_url(row: Optional[TaskRow]) -> None:
+        nonlocal status_line
+        if row is None:
+            status_line = 'No task selected'
+            invalidate()
+            return
+        url = (row.url or '').strip()
+        if not url:
+            status_line = 'Selected task missing URL'
+            invalidate()
+            return
+        try:
+            opened = webbrowser.open(url)
+        except Exception as exc:
+            status_line = f"Open failed: {exc}"
+            invalidate()
+            return
+        status_line = 'Opened task in browser' if opened else 'Unable to open browser'
+        invalidate()
+
     def _json_list(raw: str) -> List[Dict[str, object]]:
         if not raw:
             return []
@@ -5646,7 +5668,59 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             fr[-1] = (fr[-1][0], fr[-1][1][:-1])
         return fr
 
-    table_control = FormattedTextControl(text=lambda: build_table_fragments())
+    def _row_index_from_mouse(line_no: int) -> Optional[int]:
+        if line_no is None or line_no <= 0:
+            return None
+        rows = filtered_rows()
+        if not rows:
+            return None
+        if zen_mode:
+            if line_no == 1 and 0 <= current_index < len(rows):
+                return current_index
+            return None
+        target = v_offset + (line_no - 1)
+        if 0 <= target < len(rows):
+            return target
+        return None
+
+    def _handle_table_mouse(mouse_event: MouseEvent):
+        nonlocal current_index
+        if mouse_event.event_type not in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
+            return NotImplemented
+        if mouse_event.button != MouseButton.LEFT:
+            return NotImplemented
+        target_idx = _row_index_from_mouse(mouse_event.position.y)
+        if target_idx is None:
+            return NotImplemented
+        rows = filtered_rows()
+        if not rows:
+            return NotImplemented
+        current_index = max(0, min(target_idx, len(rows)-1))
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            _open_task_url(rows[current_index])
+        else:
+            invalidate()
+        if app is not None:
+            app.layout.focus(table_window)
+        return None
+
+    class _TableFormattedTextControl(FormattedTextControl):
+        def __init__(self, *args, click_handler: Optional[Callable[[MouseEvent], object]] = None, **kwargs):
+            self._click_handler = click_handler
+            super().__init__(*args, **kwargs)
+
+        def mouse_handler(self, mouse_event: MouseEvent):
+            if self._click_handler is not None:
+                result = self._click_handler(mouse_event)
+                if result is not NotImplemented:
+                    return result
+            return super().mouse_handler(mouse_event)
+
+    table_control = _TableFormattedTextControl(
+        text=lambda: build_table_fragments(),
+        focusable=True,
+        click_handler=_handle_table_mouse,
+    )
     table_window = Window(content=table_control, wrap_lines=False, always_hide_cursor=True)
     # Top status bar: shows date, current project, total tasks shown, and active search filter
     def build_top_status() -> List[Tuple[str,str]]:
