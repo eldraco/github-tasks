@@ -9,7 +9,9 @@ layout:
   stats_comment_limit: 5
   stats_detail_width: 200
   stats_comment_wrap: 200
-  table_row_gap: 1
+  table_row_gap: 0
+  table_row_separator_char: ' '
+  table_row_separator_style: table.separator
 description: Inspired by btop's night mode with neon highlights and purple framing.
 style:
   editor.frame: 'bg:#05050a #d7d7ff'
@@ -39,6 +41,7 @@ style:
   table.status.blocked: '#ff5c5c'
   table.status.other: '#d7d7ff'
   table.status.waiting: '#f4b76b'
+  table.separator: 'bg:#0a0a18 #4ce0b3'
   table.date.today: 'bold #f4b76b'
   table.date.past: '#ff9a3c'
   table.date.future: '#4ce0b3'

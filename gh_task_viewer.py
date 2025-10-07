@@ -208,6 +208,7 @@ BASE_THEME_STYLE: Dict[str, str] = {
     'table.row.future4': '#87ffd7',
     'table.row.running': 'bold ansicyan',
     'table.row.unknown': '#d0d0d0',
+    'table.separator': '#444444',
     'summary.panel': 'bg:#1c1c1c #f0f0f0',
     'summary.title': 'bold #ffd75f',
     'summary.label': '#ffd787',
@@ -3657,9 +3658,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     issue_detail_cache: Dict[str, Dict[str, object]] = {}
     issue_detail_tasks: Dict[str, asyncio.Task] = {}
     background_handles: List[object] = []
-    table_row_gap = 0
-    table_row_stride = 1
-    table_display_rows = 0
+    table_row_gap_value = 0.0
+    table_row_offsets: List[int] = []
+    table_total_lines = 0
 
     def _track_background(obj: object) -> None:
         if obj is None:
@@ -3867,15 +3868,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return default
         return max(1, val_int)
 
-    def _layout_nonneg(name: str, default: int = 0) -> int:
+    def _layout_float(name: str, default: float = 0.0) -> float:
         value = current_layout_options.get(name) if isinstance(current_layout_options, dict) else None
         try:
             if value is None:
                 raise ValueError
-            val_int = int(value)
+            return max(0.0, float(value))
         except Exception:
-            return default
-        return max(0, val_int)
+            return float(default)
 
     def load_all():
         return db.load(today_only=show_today_only, today=today_date.isoformat())
@@ -5444,7 +5444,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
 
     def build_table_fragments() -> List[Tuple[str,str]]:
-        nonlocal task_duration_cache, current_index, v_offset, table_row_gap, table_row_stride, table_display_rows
+        nonlocal task_duration_cache, current_index, v_offset, table_row_gap_value, table_row_offsets, table_total_lines
         rows = filtered_rows()
         if current_index >= len(rows):
             current_index = max(0, len(rows) - 1)
@@ -5456,12 +5456,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception:
             total_rows = 40
             total_cols = 120
-        row_gap = _layout_nonneg('table_row_gap', 0)
-        table_row_gap = row_gap
-        row_stride = max(1, row_gap + 1)
-        table_row_stride = row_stride
+        row_gap = _layout_float('table_row_gap', 0.0)
+        table_row_gap_value = row_gap
+        stride = max(1e-6, 1.0 + row_gap)
         available_lines = max(1, total_rows - 3)
-        visible_rows = max(1, (available_lines + row_gap) // row_stride)
+        visible_rows = max(1, int(available_lines / stride))
         if zen_mode:
             visible_rows = max(1, total_rows)
         if current_index < v_offset:
@@ -5631,14 +5630,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         header = ''.join('  ' + _pad_display(col['header'], col['width'], align=col.get('align', 'left')) for col in columns)
         frags.append((_style_class('table.header'), header[h_offset:]))
         frags.append(("", "\n"))
+        line_cursor = 0
+        row_offsets: List[int] = []
+        separator_char = str(current_layout_options.get('table_row_separator_char', '') or '')
+        separator_style_name = str(current_layout_options.get('table_row_separator_style', '') or '')
+        separator_style = _style_class(separator_style_name, 'table.separator')
+        separator_width = max(1, len(header[h_offset:]) or 1)
+        row_gap_value = max(0.0, row_gap)
         if not rows:
+            table_row_offsets = []
+            table_total_lines = line_cursor
             frags.append(("italic", "(no tasks match filters)"))
             return frags
 
         today = today_date
         active_urls = db.active_task_urls()
         display_slice = rows[v_offset:v_offset+visible_rows]
-        table_display_rows = len(display_slice)
         duration_urls = [t.url for t in display_slice if t.url]
         task_duration_cache = db.task_duration_snapshot(duration_urls)
 
@@ -5711,6 +5718,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return result
 
         column_lookup = {c['id']: c for c in columns}
+        int_row_gap = int(row_gap_value)
+        fractional_row_gap = row_gap_value - int_row_gap
 
         for rel_idx, t in enumerate(display_slice):
             idx = v_offset + rel_idx
@@ -5823,14 +5832,25 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if active_search and not is_sel:
                 segments = highlight_segments(segments, active_search)
 
+            row_offsets.append(line_cursor)
             for seg_style, seg_text in segments:
                 frags.append((seg_style, seg_text))
             frags.append(("", "\n"))
-            if row_gap and rel_idx < len(display_slice) - 1:
-                for _ in range(row_gap):
+            line_cursor += 1
+            if rel_idx < len(display_slice) - 1:
+                for _ in range(max(0, int_row_gap)):
                     frags.append(("", "\n"))
+                    line_cursor += 1
+                if fractional_row_gap > 1e-9:
+                    if separator_char:
+                        sep_text = (separator_char * separator_width)[h_offset:]
+                        frags.append((separator_style, sep_text))
+                    frags.append(("", "\n"))
+                    line_cursor += 1
+        table_total_lines = line_cursor
         if frags and frags[-1][1] == "\n":
             frags.pop()
+        table_row_offsets = row_offsets
         return frags
 
     def summarize() -> List[Tuple[str,str]]:
@@ -6202,18 +6222,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if line_no == 1 and 0 <= current_index < len(rows):
                 return current_index
             return None
-        gap = max(0, table_row_gap)
-        stride = max(1, table_row_stride or (gap + 1))
-        relative = line_no - 1
-        if relative < 0:
+        offsets = table_row_offsets
+        total_lines = table_total_lines
+        if not offsets:
             return None
-        row_in_window = relative // stride
-        visible_count = table_display_rows or len(rows)
-        if row_in_window >= visible_count:
+        line_idx = line_no - 1
+        if line_idx < 0 or line_idx >= total_lines:
             return None
-        target = v_offset + row_in_window
-        if 0 <= target < len(rows):
-            return target
+        for rel_idx, start in enumerate(offsets):
+            end = offsets[rel_idx + 1] if rel_idx + 1 < len(offsets) else total_lines
+            if start <= line_idx < end:
+                target = v_offset + rel_idx
+                if 0 <= target < len(rows):
+                    return target
+                return None
         return None
 
     def _handle_table_mouse(mouse_event: MouseEvent):
