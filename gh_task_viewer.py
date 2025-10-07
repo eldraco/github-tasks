@@ -3657,6 +3657,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     issue_detail_cache: Dict[str, Dict[str, object]] = {}
     issue_detail_tasks: Dict[str, asyncio.Task] = {}
     background_handles: List[object] = []
+    table_row_gap = 0
+    table_row_stride = 1
+    table_display_rows = 0
 
     def _track_background(obj: object) -> None:
         if obj is None:
@@ -3863,6 +3866,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception:
             return default
         return max(1, val_int)
+
+    def _layout_nonneg(name: str, default: int = 0) -> int:
+        value = current_layout_options.get(name) if isinstance(current_layout_options, dict) else None
+        try:
+            if value is None:
+                raise ValueError
+            val_int = int(value)
+        except Exception:
+            return default
+        return max(0, val_int)
 
     def load_all():
         return db.load(today_only=show_today_only, today=today_date.isoformat())
@@ -5431,7 +5444,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
 
     def build_table_fragments() -> List[Tuple[str,str]]:
-        nonlocal task_duration_cache, current_index, v_offset
+        nonlocal task_duration_cache, current_index, v_offset, table_row_gap, table_row_stride, table_display_rows
         rows = filtered_rows()
         if current_index >= len(rows):
             current_index = max(0, len(rows) - 1)
@@ -5443,7 +5456,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception:
             total_rows = 40
             total_cols = 120
-        visible_rows = max(1, total_rows - 3)
+        row_gap = _layout_nonneg('table_row_gap', 0)
+        table_row_gap = row_gap
+        row_stride = max(1, row_gap + 1)
+        table_row_stride = row_stride
+        available_lines = max(1, total_rows - 3)
+        visible_rows = max(1, (available_lines + row_gap) // row_stride)
         if zen_mode:
             visible_rows = max(1, total_rows)
         if current_index < v_offset:
@@ -5620,6 +5638,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         today = today_date
         active_urls = db.active_task_urls()
         display_slice = rows[v_offset:v_offset+visible_rows]
+        table_display_rows = len(display_slice)
         duration_urls = [t.url for t in display_slice if t.url]
         task_duration_cache = db.task_duration_snapshot(duration_urls)
 
@@ -5807,6 +5826,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             for seg_style, seg_text in segments:
                 frags.append((seg_style, seg_text))
             frags.append(("", "\n"))
+            if row_gap and rel_idx < len(display_slice) - 1:
+                for _ in range(row_gap):
+                    frags.append(("", "\n"))
         if frags and frags[-1][1] == "\n":
             frags.pop()
         return frags
@@ -6180,7 +6202,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if line_no == 1 and 0 <= current_index < len(rows):
                 return current_index
             return None
-        target = v_offset + (line_no - 1)
+        gap = max(0, table_row_gap)
+        stride = max(1, table_row_stride or (gap + 1))
+        relative = line_no - 1
+        if relative < 0:
+            return None
+        row_in_window = relative // stride
+        visible_count = table_display_rows or len(rows)
+        if row_in_window >= visible_count:
+            return None
+        target = v_offset + row_in_window
         if 0 <= target < len(rows):
             return target
         return None
