@@ -69,7 +69,6 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame
-from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
 try:
     from prompt_toolkit.utils import get_cwidth as _pt_get_cwidth
 except ImportError:  # pragma: no cover - fallback when prompt_toolkit changes API
@@ -79,6 +78,19 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.filters import Condition
 import logging
 from logging.handlers import RotatingFileHandler
+
+try:
+    from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton  # type: ignore
+    _MOUSE_EVENTS_AVAILABLE = True
+except Exception:  # pragma: no cover - different prompt_toolkit layouts
+    try:
+        from prompt_toolkit.input.mouse_events import MouseEvent, MouseEventType, MouseButton  # type: ignore
+        _MOUSE_EVENTS_AVAILABLE = True
+    except Exception:  # pragma: no cover - disable mouse integration
+        MouseEvent = object  # type: ignore[assignment]
+        MouseEventType = None  # type: ignore[assignment]
+        MouseButton = None  # type: ignore[assignment]
+        _MOUSE_EVENTS_AVAILABLE = False
 
 
 # -----------------------------
@@ -5684,6 +5696,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return None
 
     def _handle_table_mouse(mouse_event: MouseEvent):
+        if not _MOUSE_EVENTS_AVAILABLE:
+            return NotImplemented
         nonlocal current_index
         if mouse_event.event_type not in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
             return NotImplemented
@@ -5719,7 +5733,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     table_control = _TableFormattedTextControl(
         text=lambda: build_table_fragments(),
         focusable=True,
-        click_handler=_handle_table_mouse,
+        click_handler=_handle_table_mouse if _MOUSE_EVENTS_AVAILABLE else None,
     )
     table_window = Window(content=table_control, wrap_lines=False, always_hide_cursor=True)
     # Top status bar: shows date, current project, total tasks shown, and active search filter
