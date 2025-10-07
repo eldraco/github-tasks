@@ -5494,6 +5494,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             ascii_lines = build_zen_ascii_art(title_value, max_width=ascii_wrap_width)
             if not ascii_lines:
                 ascii_lines = [title_value]
+            block_width = max(1, max(len(line) for line in ascii_lines))
+            ascii_lines = [line.center(block_width) if line else ' ' * block_width for line in ascii_lines]
             ascii_height = len(ascii_lines)
 
             vertical_padding = max(0, (visible_rows - ascii_height) // 2)
