@@ -80,17 +80,41 @@ from prompt_toolkit.filters import Condition
 import logging
 from logging.handlers import RotatingFileHandler
 
+_HAS_QUARTZ = False
+_CMD_KEYCODES = (55, 54)  # left and right command
 try:
-    from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton  # type: ignore
+    if sys.platform == 'darwin':
+        from Quartz import CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState  # type: ignore[attr-defined]
+        _HAS_QUARTZ = True
+    else:
+        CGEventSourceKeyState = None  # type: ignore
+        kCGEventSourceStateCombinedSessionState = None  # type: ignore
+except Exception:  # pragma: no cover - Quartz unavailable
+    CGEventSourceKeyState = None  # type: ignore
+    kCGEventSourceStateCombinedSessionState = None  # type: ignore
+    _HAS_QUARTZ = False
+
+
+def _command_key_pressed() -> bool:
+    if not _HAS_QUARTZ:
+        return False
+    try:
+        return any(CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, code) for code in _CMD_KEYCODES)
+    except Exception:
+        return False
+
+try:
+    from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton, MouseModifier  # type: ignore
     _MOUSE_EVENTS_AVAILABLE = True
 except Exception:  # pragma: no cover - different prompt_toolkit layouts
     try:
-        from prompt_toolkit.input.mouse_events import MouseEvent, MouseEventType, MouseButton  # type: ignore
+        from prompt_toolkit.input.mouse_events import MouseEvent, MouseEventType, MouseButton, MouseModifier  # type: ignore
         _MOUSE_EVENTS_AVAILABLE = True
     except Exception:  # pragma: no cover - disable mouse integration
         MouseEvent = object  # type: ignore[assignment]
         MouseEventType = None  # type: ignore[assignment]
         MouseButton = None  # type: ignore[assignment]
+        MouseModifier = None  # type: ignore[assignment]
         _MOUSE_EVENTS_AVAILABLE = False
 
 
@@ -6401,7 +6425,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return NotImplemented
         current_index = max(0, min(target_idx, len(rows)-1))
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
-            _open_task_url(rows[current_index])
+            modifiers_obj = list(getattr(mouse_event, 'modifiers', []) or [])
+            command_pressed = False
+            if modifiers_obj:
+                candidates = set()
+                if MouseModifier:
+                    for attr in ('META', 'SUPER', 'CMD', 'COMMAND', 'CONTROL', 'CTRL', 'ALT', 'OPTION'):
+                        if hasattr(MouseModifier, attr):
+                            candidates.add(getattr(MouseModifier, attr))
+                for mod in modifiers_obj:
+                    if mod in candidates:
+                        command_pressed = True
+                        break
+                    name = getattr(mod, 'name', '')
+                    if name and name.upper() in ('META', 'SUPER', 'CMD', 'COMMAND', 'CONTROL', 'CTRL', 'ALT', 'OPTION'):
+                        command_pressed = True
+                        break
+            if not command_pressed and _command_key_pressed():
+                command_pressed = True
+            if command_pressed:
+                _open_task_url(rows[current_index])
+            else:
+                invalidate()
         else:
             invalidate()
         if app is not None:
