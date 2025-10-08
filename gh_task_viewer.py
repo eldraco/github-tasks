@@ -51,6 +51,7 @@ import sqlite3
 import sys
 import string
 import json
+import uuid
 import threading
 import unicodedata
 import webbrowser
@@ -804,6 +805,7 @@ STATUS_OPTION_CACHE: Dict[str, List[Dict[str, object]]] = {}
 PRIORITY_FIELD_CACHE: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
 PEOPLE_FIELD_CACHE: Dict[str, str] = {}
 _UNSET = object()
+PENDING_URL_PREFIX = "pending://"
 
 
 def _load_target_cache() -> Dict[str, List[Dict[str, object]]]:
@@ -881,6 +883,13 @@ class TaskRow:
     assignee_user_ids: str = "[]"
     assignee_logins: str = "[]"
     content_node_id: str = ""
+
+@dataclass
+class PendingAction:
+    id: int
+    action_type: str
+    payload: Dict[str, object]
+    created_at: str
 
 
 class TaskDB:
@@ -969,12 +978,14 @@ class TaskDB:
             self._idx()
             # also ensure timer tables
             self._ensure_timer_tables()
+            self._ensure_pending_tables()
             return
         missing = [c for c in self.SCHEMA_COLUMNS if c not in cols]
         if not missing:
             self._idx()
             # still ensure timer tables exist
             self._ensure_timer_tables()
+            self._ensure_pending_tables()
             return
         cur = self.conn.cursor()
         cur.execute("ALTER TABLE tasks RENAME TO tasks_old")
@@ -1001,6 +1012,7 @@ class TaskDB:
         self.conn.commit()
         self._idx()
         self._ensure_timer_tables()
+        self._ensure_pending_tables()
 
     # --- Work session timer tables and helpers ---
     def _ensure_timer_tables(self):
@@ -1038,6 +1050,21 @@ class TaskDB:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_te_task_at ON timer_events(task_url, at)")
+        self.conn.commit()
+
+    def _ensure_pending_tables(self):
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_created ON pending_actions(created_at)")
         self.conn.commit()
 
     def start_session(self, task_url: str, project_title: Optional[str] = None, repo: Optional[str] = None, labels_json: Optional[str] = None) -> None:
@@ -1756,7 +1783,10 @@ class TaskDB:
         cur = self.conn.cursor()
         try:
             cur.execute("BEGIN")
-            cur.execute("DELETE FROM tasks")
+            cur.execute(
+                "DELETE FROM tasks WHERE url IS NULL OR url = '' OR url NOT LIKE ?",
+                (f"{PENDING_URL_PREFIX}%",),
+            )
             if rows:
                 self.upsert_many(rows, commit=False)
             cur.execute("COMMIT")
@@ -1798,6 +1828,82 @@ class TaskDB:
                 """
             )
         return [TaskRow(*r) for r in cur.fetchall()]
+
+    def upsert_task(self, row: TaskRow) -> None:
+        self.upsert_many([row])
+
+    def delete_task(self, url: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE url=?", (url,))
+        self.conn.commit()
+
+    def pending_placeholder_rows(self) -> List[TaskRow]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """            SELECT owner_type,owner,project_number,project_title,start_field,
+                   start_date,end_field,end_date,focus_field,focus_date,focus_field_id,
+                   iteration_field,iteration_title,iteration_start,iteration_duration,
+                   title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
+                   url,updated_at,status,is_done,assigned_to_me,created_by_me,
+                   item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
+                   start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
+            FROM tasks WHERE url LIKE ?
+            ORDER BY updated_at
+            """,
+            (f"{PENDING_URL_PREFIX}%",),
+        )
+        rows = cur.fetchall()
+        return [TaskRow(*r) for r in rows]
+
+    def add_pending_action(self, action_type: str, payload: Dict[str, object]) -> int:
+        try:
+            payload_json = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            payload_json = "{}"
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO pending_actions (action_type, payload) VALUES (?, ?)",
+            (action_type, payload_json),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_pending_actions(self) -> List[PendingAction]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT id, action_type, payload, created_at FROM pending_actions ORDER BY id"
+        )
+        actions: List[PendingAction] = []
+        for action_id, action_type, payload_raw, created_at in cur.fetchall():
+            payload_obj: Dict[str, object]
+            try:
+                parsed = json.loads(payload_raw)
+                payload_obj = dict(parsed) if isinstance(parsed, dict) else {}
+            except Exception:
+                payload_obj = {}
+            actions.append(PendingAction(
+                id=int(action_id),
+                action_type=str(action_type),
+                payload=payload_obj,
+                created_at=str(created_at),
+            ))
+        return actions
+
+    def remove_pending_action(self, action_id: int) -> None:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM pending_actions WHERE id=?", (int(action_id),))
+        self.conn.commit()
+
+    def clear_pending_actions(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM pending_actions")
+        self.conn.commit()
+
+    def pending_action_count(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM pending_actions")
+        row = cur.fetchone()
+        return int(row[0] if row else 0)
 
 
 # -----------------------------
@@ -3924,11 +4030,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'project_title': row.project_title or "",
                 'project_id': row.project_id or "",
                 'start_field_id': row.start_field_id or "",
+                'status_field_id': row.status_field_id or "",
                 'start_field_name': row.start_field or "",
                 'focus_field_id': row.focus_field_id or "",
                 'focus_field_name': row.focus_field or "",
                 'iteration_field_id': row.iteration_field_id or "",
                 'iteration_options': _json_list(row.iteration_options),
+                'status_options': _json_list(row.status_options),
                 'priority_field_id': row.priority_field_id or "",
                 'priority_options': _json_list(row.priority_options),
                 'assignee_field_id': row.assignee_field_id or "",
@@ -3941,6 +4049,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if not entry['start_field_id'] and row.start_field_id:
                 entry['start_field_id'] = row.start_field_id
                 entry['start_field_name'] = row.start_field
+            if (not entry.get('status_field_id')) and row.status_field_id:
+                entry['status_field_id'] = row.status_field_id
+            if not entry.get('status_options') and row.status_options:
+                entry['status_options'] = _json_list(row.status_options)
             if not entry['focus_field_id'] and row.focus_field_id:
                 entry['focus_field_id'] = row.focus_field_id
                 entry['focus_field_name'] = row.focus_field or entry.get('focus_field_name', '')
@@ -3988,6 +4100,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     existing['project_title'] = entry.get("title")
                 if not existing['project_id'] and entry.get("project_id"):
                     existing['project_id'] = entry.get("project_id")
+                if not existing.get('status_field_id') and entry.get('status_field_id'):
+                    existing['status_field_id'] = entry.get('status_field_id')
 
         choices = []
         for key, entry in meta.items():
@@ -4674,12 +4788,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = status_line
             invalidate(); return
         row = rows[current_index]
-        if not token:
-            msg = "GITHUB_TOKEN required for date updates"
-            status_line = msg
-            if edit_task_mode:
-                task_edit_state['message'] = msg
-            invalidate(); return
         project_id = row.project_id or ''
         item_id = row.item_id or ''
         if not (project_id and item_id):
@@ -4710,31 +4818,33 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     logger.warning("Failed to resolve %s field id for %s: %s", field_type, row.project_title, exc)
                 except Exception:
                     pass
-        if not field_id:
-            msg = f"No {field_name or label} field id"
-            status_line = msg
-            if edit_task_mode:
-                task_edit_state['message'] = msg
-            invalidate(); return
-
-        def _do_update():
-            set_project_date(token, project_id, item_id, field_id, new_value)
-
+        payload = {
+            'url': row.url,
+            'project_id': project_id,
+            'item_id': item_id,
+            'field_id': field_id or '',
+            'field_name': field_name or label,
+            'field_type': field_type,
+            'value': new_value,
+        }
         try:
-            await loop.run_in_executor(None, _do_update)
+            db.add_pending_action('set_project_date', payload)
         except Exception as exc:
-            msg = f"{label} update failed: {exc}"
+            msg = f"Queue failed: {exc}"
             status_line = msg
             if edit_task_mode:
                 task_edit_state['message'] = msg
             invalidate(); return
 
         if field_type == 'start':
-            db.update_start_date(row.url, new_value, field_id)
+            db.update_start_date(row.url, new_value, field_id or None)
         else:
-            db.update_focus_date(row.url, new_value, field_id)
+            db.update_focus_date(row.url, new_value, field_id or None)
         all_rows = load_all()
-        status_line = f"{label} updated"
+        status_line = f"{label} queued (press 'u' to sync)"
+        rows_after = filtered_rows()
+        if current_index >= len(rows_after):
+            current_index = max(0, len(rows_after) - 1)
         if edit_task_mode:
             task_edit_state['message'] = status_line
             _refresh_task_editor_state()
@@ -5332,6 +5442,38 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return 2
         return 99
 
+    def _select_status_option(options: List[Dict[str, object]], preferred: Optional[str] = None) -> Tuple[str, str]:
+        if not options:
+            return "", preferred or ""
+
+        def _norm(name: Optional[str]) -> str:
+            return (name or "").strip().lower()
+
+        preferred_names = []
+        if preferred:
+            preferred_names.append(preferred)
+        preferred_names.extend([
+            "todo", "to do", "not started", "backlog", "queue", "ready", "new", "pending"
+        ])
+        seen: Set[str] = set()
+        for candidate in preferred_names:
+            norm_candidate = candidate.strip().lower()
+            if not norm_candidate or norm_candidate in seen:
+                continue
+            seen.add(norm_candidate)
+            for opt in options:
+                name = (opt.get("name") or "").strip()
+                if not name:
+                    continue
+                if _norm(name) == norm_candidate:
+                    return (opt.get("id") or "", name)
+        for opt in options:
+            name = (opt.get("name") or "").strip()
+            if name:
+                return (opt.get("id") or "", name)
+        opt = options[0]
+        return (opt.get("id") or "", (opt.get("name") or "").strip())
+
     def _cycle_sort(delta: int) -> None:
         nonlocal sort_index, status_line
         count = len(sort_presets)
@@ -5416,12 +5558,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return fields
 
     def _refresh_task_editor_state(preserve_cursor: bool = True, do_invalidate: bool = True) -> None:
+        nonlocal current_index
         if not edit_task_mode:
             return
         rows = filtered_rows()
         if not rows:
             close_task_editor('No tasks available')
             return
+        if current_index >= len(rows):
+            current_index = len(rows) - 1
+        if current_index < 0:
+            current_index = 0
         row = rows[current_index]
         fields = _build_task_edit_fields_from_row(row)
         if not fields:
@@ -7484,6 +7631,306 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_duration_cache = {}
         _invalidate_summary_cache()
 
+    async def _sync_pending_date(action: PendingAction, loop: asyncio.AbstractEventLoop) -> bool:
+        nonlocal status_line, all_rows
+        payload = action.payload or {}
+        project_id = (payload.get('project_id') or '').strip()
+        item_id = (payload.get('item_id') or '').strip()
+        field_id = (payload.get('field_id') or '').strip()
+        field_name = (payload.get('field_name') or 'Date').strip() or 'Date'
+        value = payload.get('value', '')
+        field_type = (payload.get('field_type') or '').strip()
+        url = (payload.get('url') or '').strip()
+        if not (project_id and item_id):
+            db.remove_pending_action(action.id)
+            status_line = f"Skipped queued {field_name.lower()} update (missing metadata)"
+            invalidate()
+            return True
+        if not field_id:
+            try:
+                lookup = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, field_name))
+            except Exception as exc:
+                status_line = f"{field_name} sync failed: {exc}"
+                try:
+                    logger.warning("Queued date update failed (%s): %s", field_name, exc)
+                except Exception:
+                    pass
+                invalidate()
+                return False
+            field_id = lookup or ''
+            if not field_id:
+                status_line = f"{field_name} sync failed: field id unavailable"
+                invalidate()
+                return False
+        try:
+            await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, field_id, value))
+        except Exception as exc:
+            status_line = f"{field_name} sync failed: {exc}"
+            try:
+                logger.warning("Queued date update failed (%s): %s", field_name, exc)
+            except Exception:
+                pass
+            invalidate()
+            return False
+        db.remove_pending_action(action.id)
+        if field_type == 'start':
+            db.update_start_date(url, value, field_id)
+        else:
+            db.update_focus_date(url, value, field_id)
+        all_rows = load_all()
+        target_row = next((r for r in all_rows if r.url == url), None)
+        label = target_row.title if target_row else url or field_name
+        status_line = f"{field_name} synced for {label}"
+        invalidate()
+        return True
+
+    async def _sync_pending_create(action: PendingAction, loop: asyncio.AbstractEventLoop) -> bool:
+        nonlocal status_line
+        payload = action.payload or {}
+        project_id = (payload.get('project_id') or '').strip()
+        title = (payload.get('title') or '').strip() or 'Untitled'
+        if not project_id:
+            db.remove_pending_action(action.id)
+            status_line = f"Skipped queued task '{title}' (missing project)"
+            invalidate()
+            return True
+        mode = (payload.get('mode') or 'draft').strip().lower()
+        repo_source = (payload.get('repo_source') or payload.get('repo_manual') or '').strip()
+        repo_id = (payload.get('repo_id') or '').strip()
+        assignees = [str(a).strip() for a in payload.get('assignees', []) if str(a).strip()]
+        status_line = f"Syncing queued task: {title}"
+        invalidate()
+        issue_url = ''
+        item_id: Optional[str] = None
+        try:
+            if mode == 'issue':
+                if not repo_id:
+                    lookup_source = (payload.get('repo_manual') or repo_source or '').strip()
+                    if not lookup_source:
+                        raise RuntimeError('Repository metadata unavailable')
+                    repo_lookup = await loop.run_in_executor(None, lambda: get_repo_id(token, lookup_source))
+                    repo_id = repo_lookup.get('repo_id') or ''
+                if not repo_id:
+                    raise RuntimeError('Repository metadata unavailable')
+                assignee_node_ids: List[str] = []
+                for login in assignees:
+                    try:
+                        node_id = get_user_node_id(token, login)
+                        if node_id and node_id not in assignee_node_ids:
+                            assignee_node_ids.append(node_id)
+                    except Exception as exc:
+                        try:
+                            logger.warning("Could not resolve user id for %s: %s", login, exc)
+                        except Exception:
+                            pass
+                issue_result = await loop.run_in_executor(None, lambda: create_issue(token, repo_id, title, '', assignee_node_ids))
+                issue_id = issue_result.get('issue_id')
+                issue_url = issue_result.get('url') or ''
+                if not issue_id:
+                    raise RuntimeError('Issue creation did not return id')
+                item_id = await loop.run_in_executor(None, lambda: add_project_item(token, project_id, issue_id))
+            else:
+                item_id = await loop.run_in_executor(None, lambda: create_project_draft(token, project_id, title))
+                if not item_id:
+                    raise RuntimeError('GitHub did not return item id')
+            start_value = payload.get('start_value') or dt.date.today().isoformat()
+            start_field_id = (payload.get('start_field_id') or '').strip()
+            if start_field_id:
+                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, start_value))
+            end_value = (payload.get('end_value') or '').strip()
+            if end_value:
+                end_field_id = (payload.get('end_field_id') or '').strip()
+                if not end_field_id:
+                    for candidate in ('end date', 'due date', 'target date', 'finish date'):
+                        try:
+                            fid = await loop.run_in_executor(None, lambda name=candidate: get_project_field_id_by_name(token, project_id, name))
+                        except Exception:
+                            fid = None
+                        if fid:
+                            end_field_id = fid
+                            break
+                if end_field_id:
+                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, end_field_id, end_value))
+            focus_value = (payload.get('focus_value') or '').strip()
+            if focus_value:
+                focus_field_id = (payload.get('focus_field_id') or '').strip()
+                if not focus_field_id:
+                    try:
+                        focus_field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, 'focus day'))
+                    except Exception:
+                        focus_field_id = ''
+                if focus_field_id:
+                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, focus_field_id, focus_value))
+            status_field_id = (payload.get('status_field_id') or '').strip()
+            status_option_id = (payload.get('status_option_id') or '').strip()
+            status_label = (payload.get('status_label') or '').strip()
+            status_options_payload = payload.get('status_options') or []
+            if not isinstance(status_options_payload, list):
+                status_options_payload = []
+            if status_field_id:
+                if not status_option_id:
+                    status_option_id, status_label = _select_status_option(status_options_payload, status_label or 'Todo')
+                fetched_status_opts: List[Dict[str, object]] = []
+                if not status_option_id:
+                    try:
+                        fetched_status_opts = await loop.run_in_executor(None, lambda: get_project_field_options(token, status_field_id))
+                    except Exception:
+                        fetched_status_opts = []
+                    if fetched_status_opts:
+                        status_option_id, status_label = _select_status_option(fetched_status_opts, status_label or 'Todo')
+                if status_option_id:
+                    try:
+                        await loop.run_in_executor(None, lambda: set_project_status(token, project_id, item_id, status_field_id, status_option_id))
+                    except Exception as exc:
+                        try:
+                            logger.warning("Unable to set status for %s: %s", title, exc)
+                        except Exception:
+                            pass
+            iteration_id = (payload.get('iteration_id') or '').strip()
+            iteration_field_id = (payload.get('iteration_field_id') or '').strip()
+            if iteration_id and iteration_field_id:
+                await loop.run_in_executor(None, lambda: set_project_iteration(token, project_id, item_id, iteration_field_id, iteration_id))
+            priority_field_id = (payload.get('priority_field_id') or '').strip()
+            priority_label = (payload.get('priority_label') or '').strip()
+            priority_opts = payload.get('priority_options') or []
+            if priority_field_id and priority_label:
+                if not priority_opts:
+                    try:
+                        priority_opts = await loop.run_in_executor(None, lambda: get_project_field_options(token, priority_field_id))
+                    except Exception:
+                        priority_opts = []
+                def _match_priority_option(label: str, options: List[Dict[str, object]]) -> str:
+                    if not label:
+                        return ''
+                    norm = label.strip().lower()
+                    core = norm.split(':', 1)[-1].strip() if ':' in norm else norm
+                    for opt in options:
+                        name = (opt.get('name') or '').strip()
+                        if not name:
+                            continue
+                        low = name.lower()
+                        if low == norm or low == core:
+                            return opt.get('id') or ''
+                    for opt in options:
+                        name_low = (opt.get('name') or '').strip().lower()
+                        if core and core in name_low:
+                            return opt.get('id') or ''
+                    return ''
+                priority_option_id = _match_priority_option(priority_label, priority_opts)
+                if priority_option_id:
+                    await loop.run_in_executor(None, lambda: set_project_priority(token, project_id, item_id, priority_field_id, priority_option_id))
+            assignee_field_id = (payload.get('assignee_field_id') or '').strip()
+            if assignee_field_id and assignees:
+                project_user_ids: List[str] = []
+                for login in assignees:
+                    try:
+                        uid = get_user_node_id(token, login)
+                        if uid and uid not in project_user_ids:
+                            project_user_ids.append(uid)
+                    except Exception as exc:
+                        try:
+                            logger.warning("Could not resolve user id for %s: %s", login, exc)
+                        except Exception:
+                            pass
+                if project_user_ids:
+                    try:
+                        await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, project_user_ids))
+                    except Exception as exc:
+                        try:
+                            logger.warning("Unable to set project users for %s: %s", assignee_field_id, exc)
+                        except Exception:
+                            pass
+            labels = payload.get('labels') or []
+            if mode == 'issue' and labels:
+                try:
+                    await loop.run_in_executor(None, lambda: set_issue_labels(token, issue_url, labels))
+                except Exception as exc:
+                    try:
+                        logger.warning("Unable to set labels for %s: %s", issue_url, exc)
+                    except Exception:
+                        pass
+            if mode == 'issue' and assignees:
+                try:
+                    await loop.run_in_executor(None, lambda: set_issue_assignees(token, issue_url, assignees))
+                except Exception as exc:
+                    try:
+                        logger.warning("Unable to set assignees for %s: %s", issue_url, exc)
+                    except Exception:
+                        pass
+            comment_body = (payload.get('comment') or '').strip()
+            if mode == 'issue' and comment_body:
+                try:
+                    await loop.run_in_executor(None, lambda: add_issue_comment(token, issue_url, comment_body))
+                except Exception as exc:
+                    try:
+                        logger.warning("Unable to add comment for %s: %s", issue_url, exc)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            status_line = f"Queued task '{title}' failed: {exc}"
+            try:
+                logger.exception("Queued create failed for %s: %s", title, exc)
+            except Exception:
+                pass
+            invalidate()
+            return False
+        placeholder_url = (payload.get('placeholder_url') or '').strip()
+        if placeholder_url:
+            try:
+                db.delete_task(placeholder_url)
+            except Exception:
+                pass
+        db.remove_pending_action(action.id)
+        status_line = f"Queued task synced: {title}"
+        invalidate()
+        return True
+
+    async def _process_pending_actions(loop: asyncio.AbstractEventLoop) -> bool:
+        nonlocal status_line, all_rows
+        pending = db.list_pending_actions()
+        if not pending:
+            return True
+        if not token:
+            status_line = "Queued updates pending; set GITHUB_TOKEN then press 'u'"
+            invalidate()
+            return False
+        for action in pending:
+            if action.action_type == 'set_project_date':
+                ok = await _sync_pending_date(action, loop)
+            elif action.action_type == 'create_task':
+                ok = await _sync_pending_create(action, loop)
+            else:
+                db.remove_pending_action(action.id)
+                ok = True
+            if not ok:
+                return False
+        if token:
+            try:
+                missing_status_rows = [
+                    row for row in db.load(today_only=False)
+                    if not (row.status or "").strip()
+                    and row.status_field_id
+                    and row.item_id
+                    and row.project_id
+                ]
+            except Exception:
+                missing_status_rows = []
+            for row in missing_status_rows:
+                options = _json_list(row.status_options)
+                option_id, label = _select_status_option(options, 'Todo')
+                if not option_id:
+                    continue
+                try:
+                    await loop.run_in_executor(None, lambda r=row, oid=option_id: set_project_status(token, r.project_id, r.item_id, r.status_field_id, oid))
+                except Exception as exc:
+                    try:
+                        logger.warning("Default status sync failed for %s: %s", row.title or row.url, exc)
+                    except Exception:
+                        pass
+                    continue
+                db.reset_status(row.url, label, option_id, _is_done_name(label))
+        all_rows = load_all()
+        return True
     async def update_worker(status_msg: Optional[str] = None):
         nonlocal status_line, all_rows, current_index, today_date, update_in_progress, task_duration_cache
         if update_in_progress:
@@ -7502,6 +7949,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         try:
             loop = asyncio.get_running_loop()
+            pending_ok = await _process_pending_actions(loop)
+            if not pending_ok:
+                return
 
             def do_fetch():
                 if os.environ.get('MOCK_FETCH') == '1':
@@ -7604,147 +8054,185 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         assignees: List[str],
         comment: str,
     ):
-        nonlocal status_line
-        if not token:
-            status_line = "GITHUB_TOKEN required to add tasks"
+        nonlocal status_line, all_rows, current_index
+        title_clean = title.strip()
+        if not title_clean:
+            status_line = "Title is required"
             invalidate()
             return
-        loop = asyncio.get_running_loop()
-        issue_url = ''
-        try:
-            project_id = project_choice.get('project_id') or ''
-            if not project_id:
-                raise RuntimeError('Project metadata missing ID')
-            repo_source = repo_full or (repo_choice or {}).get('repo') or repo_manual or ''
-            repo_id = ''
-            assignee_node_ids: List[str] = []
-            if mode == 'issue':
-                repo_id = (repo_choice or {}).get('repo_id') or ''
-                if not repo_id:
-                    lookup_source = repo_manual or repo_source
-                    if not lookup_source:
-                        raise RuntimeError('Repository metadata unavailable')
-                    repo_lookup = await loop.run_in_executor(None, lambda: get_repo_id(token, lookup_source))
-                    repo_id = repo_lookup.get('repo_id') or ''
-                if not repo_id:
-                    raise RuntimeError('Repository metadata unavailable')
-                for login in assignees:
-                    try:
-                        user_id = get_user_node_id(token, login)
-                        if user_id and user_id not in assignee_node_ids:
-                            assignee_node_ids.append(user_id)
-                    except Exception as exc:
-                        logger.warning("Could not resolve user id for %s: %s", login, exc)
-                issue_result = await loop.run_in_executor(None, lambda: create_issue(token, repo_id, title, '', assignee_node_ids))
-                issue_id = issue_result.get('issue_id')
-                issue_url = issue_result.get('url') or ''
-                if not issue_id:
-                    raise RuntimeError('Issue creation did not return id')
-                item_id = await loop.run_in_executor(None, lambda: add_project_item(token, project_id, issue_id))
-            else:
-                item_id = await loop.run_in_executor(None, lambda: create_project_draft(token, project_id, title))
-                if not item_id:
-                    raise RuntimeError('GitHub did not return item id')
-            # Dates
-            start_field_id = project_choice.get('start_field_id') or ''
-            if start_field_id:
-                value = start_val.strip() or dt.date.today().isoformat()
-                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, value))
-            if end_val.strip():
-                end_field_id = project_choice.get('end_field_id') or ''
-                if not end_field_id:
-                    for candidate in ('end date', 'due date', 'target date', 'finish date'):
-                        fid = await loop.run_in_executor(None, lambda name=candidate: get_project_field_id_by_name(token, project_id, name))
-                        if fid:
-                            project_choice['end_field_id'] = fid
-                            end_field_id = fid
-                            break
-                if end_field_id:
-                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, end_field_id, end_val.strip()))
-            if focus_val.strip():
-                focus_field_id = project_choice.get('focus_field_id') or ''
-                if not focus_field_id:
-                    focus_field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, 'focus day'))
-                    if focus_field_id:
-                        project_choice['focus_field_id'] = focus_field_id
-                if focus_field_id:
-                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, focus_field_id, focus_val.strip()))
-            iteration_field_id = project_choice.get('iteration_field_id') or ''
-            if iteration_id and iteration_field_id:
-                await loop.run_in_executor(None, lambda: set_project_iteration(token, project_id, item_id, iteration_field_id, iteration_id))
+        project_id = project_choice.get('project_id') or ''
+        if not project_id:
+            status_line = 'Project metadata missing ID'
+            invalidate()
+            return
+        owner_type = project_choice.get('owner_type') or ''
+        owner = project_choice.get('owner') or ''
+        project_number = int(project_choice.get('project_number') or 0)
+        repo_source = repo_full or (repo_choice or {}).get('repo') or repo_manual or ''
+        repo_id = (repo_choice or {}).get('repo_id') or ''
+        start_field_name = (project_choice.get('start_field_name') or 'Start Date').strip() or 'Start Date'
+        focus_field_name = (project_choice.get('focus_field_name') or 'Focus Day').strip() or 'Focus Day'
+        iteration_options = project_choice.get('iteration_options') or []
+        iteration_title = ''
+        if iteration_id:
+            for opt in iteration_options:
+                if (opt.get('id') or '') == iteration_id:
+                    iteration_title = opt.get('title') or ''
+                    break
+        priority_field_id = project_choice.get('priority_field_id') or ''
+        priority_opts = priority_options or project_choice.get('priority_options') or []
+        status_field_id = project_choice.get('status_field_id') or ''
+        status_options_raw = project_choice.get('status_options') or []
+        if not isinstance(status_options_raw, list):
+            status_options_raw = []
+        status_options_clean: List[Dict[str, object]] = []
+        for opt in status_options_raw:
+            if isinstance(opt, dict):
+                status_options_clean.append({
+                    'id': opt.get('id'),
+                    'name': opt.get('name'),
+                })
+        status_option_id, status_label = _select_status_option(status_options_clean, 'Todo')
 
-            priority_field_id = project_choice.get('priority_field_id') or ''
-            def _match_priority_option(label: str, options: List[Dict[str, object]]) -> str:
-                if not label:
-                    return ''
-                norm = label.strip().lower()
-                core = norm.split(':', 1)[-1].strip() if ':' in norm else norm
-                for opt in options:
-                    name = (opt.get('name') or '').strip()
-                    if not name:
-                        continue
-                    low = name.lower()
-                    if low == norm or low == core:
-                        return opt.get('id') or ''
-                for opt in options:
-                    name_low = (opt.get('name') or '').strip().lower()
-                    if core and core in name_low:
-                        return opt.get('id') or ''
+        def _match_priority_option(label: str, options: List[Dict[str, object]]) -> str:
+            if not label:
                 return ''
+            norm = label.strip().lower()
+            core = norm.split(':', 1)[-1].strip() if ':' in norm else norm
+            for opt in options:
+                name = (opt.get('name') or '').strip()
+                if not name:
+                    continue
+                low = name.lower()
+                if low == norm or low == core:
+                    return opt.get('id') or ''
+            for opt in options:
+                name_low = (opt.get('name') or '').strip().lower()
+                if core and core in name_low:
+                    return opt.get('id') or ''
+            return ''
 
-            if priority_field_id and priority_label.strip():
-                options = priority_options or project_choice.get('priority_options') or []
-                if not options:
-                    options = await loop.run_in_executor(None, lambda: get_project_field_options(token, priority_field_id))
-                    if options:
-                        project_choice['priority_options'] = options
-                option_id = _match_priority_option(priority_label, options or [])
-                if option_id:
-                    await loop.run_in_executor(None, lambda: set_project_priority(token, project_id, item_id, priority_field_id, option_id))
+        priority_option_id = _match_priority_option(priority_label, priority_opts)
+        placeholder_url = f"{PENDING_URL_PREFIX}{uuid.uuid4().hex}"
+        start_date_val = start_val.strip() or dt.date.today().isoformat()
+        end_date_val = end_val.strip()
+        focus_date_val = focus_val.strip()
+        now_iso = dt.datetime.utcnow().isoformat()
+        labels_json = json.dumps(labels, ensure_ascii=False)
+        priority_options_json = json.dumps(priority_opts, ensure_ascii=False)
+        iteration_options_json = json.dumps(iteration_options, ensure_ascii=False)
+        assignee_user_ids_json = json.dumps([], ensure_ascii=False)
+        assignee_logins_json = json.dumps(assignees, ensure_ascii=False)
 
-            assignee_field_id = project_choice.get('assignee_field_id') or ''
-            if assignee_field_id and assignees:
-                project_user_ids: List[str] = []
-                for login in assignees:
-                    try:
-                        uid = get_user_node_id(token, login)
-                        if uid and uid not in project_user_ids:
-                            project_user_ids.append(uid)
-                    except Exception as exc:
-                        logger.warning("Could not resolve user id for %s: %s", login, exc)
-                if project_user_ids:
-                    try:
-                        await loop.run_in_executor(None, lambda: set_project_users(token, project_id, item_id, assignee_field_id, project_user_ids))
-                    except Exception as exc:
-                        logger.warning("Unable to set project users for %s: %s", assignee_field_id, exc)
-
-            if mode == 'issue':
-                if labels:
-                    try:
-                        await loop.run_in_executor(None, lambda: set_issue_labels(token, issue_url, labels))
-                    except Exception as exc:
-                        logger.warning("Unable to set labels for %s: %s", issue_url, exc)
-                if assignees:
-                    try:
-                        await loop.run_in_executor(None, lambda: set_issue_assignees(token, issue_url, assignees))
-                    except Exception as exc:
-                        logger.warning("Unable to set assignees for %s: %s", issue_url, exc)
-                if comment.strip():
-                    try:
-                        await loop.run_in_executor(None, lambda: add_issue_comment(token, issue_url, comment.strip()))
-                    except Exception as exc:
-                        logger.warning("Unable to add comment for %s: %s", issue_url, exc)
+        payload = {
+            'mode': mode,
+            'project_id': project_id,
+            'project_title': project_choice.get('project_title') or '',
+            'owner_type': owner_type,
+            'owner': owner,
+            'project_number': project_number,
+            'title': title_clean,
+            'start_value': start_date_val,
+            'end_value': end_date_val,
+            'focus_value': focus_date_val,
+            'iteration_id': iteration_id,
+            'iteration_field_id': project_choice.get('iteration_field_id') or '',
+            'start_field_id': project_choice.get('start_field_id') or '',
+            'focus_field_id': project_choice.get('focus_field_id') or '',
+            'priority_field_id': priority_field_id,
+            'priority_label': priority_label,
+            'priority_options': priority_opts,
+            'assignee_field_id': project_choice.get('assignee_field_id') or '',
+            'assignees': assignees,
+            'labels': labels,
+            'comment': comment,
+            'repo_id': repo_id,
+            'repo_source': repo_source,
+            'repo_manual': repo_manual or '',
+            'repo_full': repo_full,
+            'status_field_id': status_field_id,
+            'status_option_id': status_option_id,
+            'status_label': status_label,
+            'status_options': status_options_clean,
+            'placeholder_url': placeholder_url,
+        }
+        try:
+            action_id = db.add_pending_action('create_task', payload)
         except Exception as exc:
-            status_line = f"Create failed: {exc}"
+            status_line = f"Queue failed: {exc}"
             try:
-                logger.exception("Create task failed: %s", exc)
+                logger.exception("Queue create failed: %s", exc)
             except Exception:
                 pass
-        else:
-            status_line = "Issue created; refreshing…" if mode == 'issue' else "Task created; refreshing…"
-            asyncio.create_task(update_worker())
-        finally:
             invalidate()
+            return
+
+        placeholder_row = TaskRow(
+            owner_type=owner_type or 'org',
+            owner=owner or '',
+            project_number=project_number,
+            project_title=project_choice.get('project_title') or '',
+            start_field=start_field_name,
+            start_date=start_date_val,
+            end_field=project_choice.get('end_field_name') or 'Due Date',
+            end_date=end_date_val,
+            focus_field=focus_field_name,
+            focus_date=focus_date_val or '',
+            focus_field_id=project_choice.get('focus_field_id') or '',
+            iteration_field='Iteration',
+            iteration_title=iteration_title,
+            iteration_start='',
+            iteration_duration=0,
+            title=title_clean,
+            repo_id=repo_id,
+            repo=repo_source,
+            labels=labels_json,
+            priority=priority_label,
+            priority_field_id=priority_field_id,
+            priority_option_id=priority_option_id,
+            priority_options=priority_options_json,
+            priority_dirty=0,
+            priority_pending_option_id='',
+            url=placeholder_url,
+            updated_at=now_iso,
+            status=status_label or 'Todo',
+            is_done=0,
+            assigned_to_me=0,
+            created_by_me=1,
+            item_id='',
+            project_id=project_id,
+            status_field_id=status_field_id,
+            status_option_id=status_option_id,
+            status_options=json.dumps(status_options_clean, ensure_ascii=False) if status_options_clean else '[]',
+            status_dirty=0,
+            status_pending_option_id='',
+            start_field_id=project_choice.get('start_field_id') or '',
+            iteration_field_id=project_choice.get('iteration_field_id') or '',
+            iteration_options=iteration_options_json,
+            assignee_field_id=project_choice.get('assignee_field_id') or '',
+            assignee_user_ids=assignee_user_ids_json,
+            assignee_logins=assignee_logins_json,
+            content_node_id='',
+        )
+        try:
+            db.upsert_task(placeholder_row)
+        except Exception as exc:
+            db.remove_pending_action(action_id)
+            status_line = f"Local cache failed: {exc}"
+            try:
+                logger.exception("Failed to cache pending task: %s", exc)
+            except Exception:
+                pass
+            invalidate()
+            return
+
+        all_rows = load_all()
+        for idx, row in enumerate(all_rows):
+            if row.url == placeholder_url:
+                current_index = idx
+                break
+        status_line = "Task queued locally (press 'u' to sync)"
+        invalidate()
 
     @kb.add('q')
     def _(event):
@@ -8994,7 +9482,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             comment_val = add_state.get('comment', '').strip()
             mode_val = add_state.get('mode', 'issue')
             priority_options = (add_state.get('priority_options') or [])
-            close_add_mode('Creating item…')
+            close_add_mode('Queueing item…')
             asyncio.create_task(create_task_async(
                 project,
                 title_val,
@@ -9155,7 +9643,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     # Timer toggle
     @kb.add('W', filter=is_normal)
+    @kb.add('w', filter=is_normal)
     def _(event):
+        nonlocal status_line
         rows = filtered_rows()
         if not rows:
             return
@@ -9172,6 +9662,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 logger.info("Stopped timer for %s", t.url)
             except Exception:
                 pass
+            status_line = f"Timer stopped: {t.title or t.url}"
         else:
             labels = fetch_labels_for_url(token, t.url) if token else []
             db.start_session(t.url, t.project_title, t.repo, json.dumps(labels))
@@ -9180,6 +9671,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             except Exception:
                 pass
             _reset_timer_caches()
+            status_line = f"Timer started: {t.title or t.url}"
         invalidate()
 
     # Quick export from UI: writes a JSON report next to DB with timestamp
