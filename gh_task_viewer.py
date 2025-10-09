@@ -1172,6 +1172,30 @@ class TaskDB:
         )
         return self._sum_rows_seconds(cur.fetchall())
 
+    def last_session_duration_seconds(self, task_url: str) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT started_at, ended_at
+            FROM work_sessions
+            WHERE task_url=? AND ended_at IS NOT NULL
+            ORDER BY ended_at DESC, id DESC
+            LIMIT 1
+            """,
+            (task_url,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return 0
+        started_at, ended_at = row
+        st = self._parse_iso(started_at)
+        en = self._parse_iso(ended_at)
+        if st is None:
+            return 0
+        if en is None:
+            en = dt.datetime.now(dt.timezone.utc).astimezone()
+        return max(0, int((en - st).total_seconds()))
+
     def get_sessions_for_task(self, task_url: str) -> List[Dict[str, object]]:
         cur = self.conn.cursor()
         cur.execute(
@@ -7294,7 +7318,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def build_overrun_prompt_text() -> str:
         if not overrun_prompt:
             return ""
-        total = int(overrun_prompt.get('total_seconds') or 0)
+        total = int(overrun_prompt.get('session_seconds') or overrun_prompt.get('total_seconds') or 0)
         title = (overrun_prompt.get('task_title') or '').strip() or '-'
         project = (overrun_prompt.get('project_title') or '').strip() or '-'
         lines = [
@@ -7323,13 +7347,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     )
     overrun_window = Frame(body=overrun_body, title="Confirm Timer Duration")
 
-    def show_overrun_prompt(row: TaskRow, total_seconds: int) -> None:
+    def show_overrun_prompt(row: TaskRow, session_seconds: int) -> None:
         nonlocal overrun_prompt, overrun_float, status_line
         overrun_prompt = {
             'task_url': row.url,
             'task_title': row.title or row.url,
             'project_title': row.project_title or '',
-            'total_seconds': int(max(0, total_seconds)),
+            'session_seconds': int(max(0, session_seconds)),
         }
         if overrun_float and overrun_float in floats:
             floats.remove(overrun_float)
@@ -7353,36 +7377,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not overrun_prompt:
             return
         url = overrun_prompt.get('task_url')
-        total = int(overrun_prompt.get('total_seconds') or 0)
+        total = int(overrun_prompt.get('session_seconds') or overrun_prompt.get('total_seconds') or 0)
         if url:
             prior = overrun_ack.get(url, 0)
             overrun_ack[url] = max(prior, total)
         close_overrun_prompt(message)
 
-    def _maybe_prompt_long_task(row: TaskRow, total_seconds: int, allow_prompt: bool = True) -> None:
+    def _maybe_prompt_long_task(row: TaskRow, session_seconds: int, allow_prompt: bool = True) -> None:
         if not row or not row.url:
             return
         url = row.url
-        total = int(max(0, total_seconds))
-        if total < LONG_TASK_THRESHOLD_SECONDS:
+        duration = int(max(0, session_seconds))
+        if duration < LONG_TASK_THRESHOLD_SECONDS:
             overrun_ack[url] = 0
             return
         prior = overrun_ack.get(url, 0)
         if not allow_prompt:
-            overrun_ack[url] = max(prior, total)
+            overrun_ack[url] = max(prior, duration)
             return
-        if (prior == 0) or (total >= prior + LONG_TASK_REPROMPT_INCREMENT):
-            show_overrun_prompt(row, total)
+        if (prior == 0) or (duration >= prior + LONG_TASK_REPROMPT_INCREMENT):
+            show_overrun_prompt(row, duration)
         else:
-            overrun_ack[url] = max(prior, total)
+            overrun_ack[url] = max(prior, duration)
 
     def _handle_timer_stop(row: TaskRow, labels_json: Optional[str] = None, allow_prompt: bool = True) -> None:
         if not row or not row.url:
             return
         db.stop_session(row.url, row.project_title, row.repo, labels_json or "[]")
-        total = db.task_total_seconds(row.url)
+        last_duration = db.last_session_duration_seconds(row.url)
         _reset_timer_caches()
-        _maybe_prompt_long_task(row, total, allow_prompt)
+        _maybe_prompt_long_task(row, last_duration, allow_prompt)
 
     def close_add_mode(message: Optional[str] = None):
         nonlocal add_mode, add_state, add_float, status_line
