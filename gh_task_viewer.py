@@ -8162,6 +8162,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         start_date_val = start_val.strip() or dt.date.today().isoformat()
         end_date_val = end_val.strip()
         focus_date_val = focus_val.strip()
+        display_focus_date = focus_date_val or start_date_val
         now_iso = dt.datetime.utcnow().isoformat()
         labels_json = json.dumps(labels, ensure_ascii=False)
         priority_options_json = json.dumps(priority_opts, ensure_ascii=False)
@@ -8222,7 +8223,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             end_field=project_choice.get('end_field_name') or 'Due Date',
             end_date=end_date_val,
             focus_field=focus_field_name,
-            focus_date=focus_date_val or '',
+            focus_date=display_focus_date,
             focus_field_id=project_choice.get('focus_field_id') or '',
             iteration_field='Iteration',
             iteration_title=iteration_title,
