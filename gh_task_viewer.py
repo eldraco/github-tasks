@@ -3811,6 +3811,50 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     }
     issue_detail_cache: Dict[str, Dict[str, object]] = {}
     issue_detail_tasks: Dict[str, asyncio.Task] = {}
+
+    def _schedule_issue_detail_fetch(url: str, comment_limit: int) -> None:
+        if not token or not _parse_issue_url(url):
+            return
+        existing = issue_detail_cache.get(url)
+        base_tasks: List[Dict[str, object]] = []
+        base_comments: List[Dict[str, object]] = []
+        if isinstance(existing, dict):
+            base_tasks = list(existing.get('tasks') or []) if isinstance(existing.get('tasks'), list) else []
+            base_comments = list(existing.get('comments') or []) if isinstance(existing.get('comments'), list) else []
+        issue_detail_cache[url] = {
+            'tasks': base_tasks,
+            'comments': base_comments,
+            'loading': True,
+        }
+        if url in issue_detail_tasks:
+            return
+
+        async def _load() -> None:
+            try:
+                loop_inner = asyncio.get_running_loop()
+                data = await loop_inner.run_in_executor(None, lambda: fetch_issue_details(token, url, comment_limit))
+            except Exception as exc:
+                issue_detail_cache[url] = {
+                    'tasks': base_tasks,
+                    'comments': base_comments,
+                    'error': str(exc),
+                    'loading': False,
+                }
+            else:
+                if not isinstance(data, dict):
+                    data = {}
+                tasks = data.get('tasks')
+                comments = data.get('comments')
+                issue_detail_cache[url] = {
+                    'tasks': tasks if isinstance(tasks, list) else base_tasks,
+                    'comments': comments if isinstance(comments, list) else [],
+                    'loading': False,
+                }
+            finally:
+                issue_detail_tasks.pop(url, None)
+                invalidate()
+
+        issue_detail_tasks[url] = asyncio.create_task(_load())
     background_handles: List[object] = []
     table_row_gap_value = 0.0
     table_row_offsets: List[int] = []
@@ -5234,8 +5278,37 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if edit_task_mode:
                 task_edit_state['message'] = msg
             invalidate(); return
+        timestamp = dt.datetime.now(dt.timezone.utc).astimezone().isoformat()
+        new_comment = {
+            'author': (cfg.user or '').strip(),
+            'body': body,
+            'created_at': timestamp,
+        }
+        cache_entry = issue_detail_cache.get(row.url)
+        base_tasks = []
+        if isinstance(cache_entry, dict) and isinstance(cache_entry.get('tasks'), list):
+            base_tasks = cache_entry.get('tasks') or []
+        if not cache_entry or cache_entry.get('loading') or cache_entry.get('error'):
+            updated_entry = {
+                'tasks': base_tasks,
+                'comments': [new_comment],
+            }
+        else:
+            comments_cached = list(cache_entry.get('comments') or [])
+            comments_cached.insert(0, new_comment)
+            limit = _layout_int('stats_comment_limit', 5)
+            if limit > 0:
+                comments_cached = comments_cached[:limit]
+            cache_entry['comments'] = comments_cached
+            updated_entry = cache_entry
+        updated_entry['loading'] = False
+        if 'error' in updated_entry:
+            updated_entry.pop('error', None)
+        issue_detail_cache[row.url] = updated_entry
         status_line = 'Comment posted'
         if edit_task_mode:
+            if task_edit_state.get('task_url') == row.url:
+                _refresh_task_editor_state()
             task_edit_state['message'] = status_line
         invalidate()
 
@@ -5602,6 +5675,37 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'type': 'comment',
                 'field_key': 'comment',
                 'value': '',
+            })
+            comment_limit = _layout_int('stats_comment_limit', 5)
+            entry = issue_detail_cache.get(row.url)
+            comments_display: List[str] = []
+            if entry and isinstance(entry.get('comments'), list) and entry.get('comments'):
+                comments_list = entry.get('comments') or []
+                if comment_limit > 0:
+                    comments_list = comments_list[:comment_limit]
+                for comment in comments_list:
+                    author = (comment.get('author') or '').strip() if isinstance(comment, dict) else ''
+                    body = (comment.get('body') or '').strip() if isinstance(comment, dict) else ''
+                    created = (comment.get('created_at') or '').strip() if isinstance(comment, dict) else ''
+                    prefix = author or 'anon'
+                    if created:
+                        prefix = f"{prefix} ({created[:10]})"
+                    comments_display.append(f"{prefix}: {body}" if body else prefix)
+            elif entry and entry.get('error'):
+                comments_display = [f"Error loading comments: {entry.get('error')}"]
+            else:
+                if comment_limit != 0:
+                    _schedule_issue_detail_fetch(row.url, comment_limit)
+                    comments_display = ['(loading comments…)']
+            if comment_limit == 0 and not comments_display:
+                comments_display = ['(comments hidden)']
+            if not comments_display:
+                comments_display = ['(no comments)']
+            fields.append({
+                'name': 'Recent comments',
+                'type': 'comment-history',
+                'field_key': 'comment-history',
+                'value': comments_display,
             })
         return fields
 
@@ -6140,24 +6244,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             detail_url = cur.url if rows and current_index < len(rows) else ''
             detail_map: Dict[str, object] = {}
             if detail_url and _parse_issue_url(detail_url):
-                existing = issue_detail_cache.get(detail_url)
-                if existing is None:
-                    if not token:
-                        issue_detail_cache[detail_url] = {'error': 'GITHUB_TOKEN required'}
-                    else:
-                        issue_detail_cache[detail_url] = {'loading': True}
-                        if detail_url not in issue_detail_tasks:
-                            async def load_issue_detail(url: str, limit: int) -> None:
-                                try:
-                                    loop_inner = asyncio.get_running_loop()
-                                    data = await loop_inner.run_in_executor(None, lambda: fetch_issue_details(token, url, limit))
-                                except Exception as exc:
-                                    issue_detail_cache[url] = {'error': str(exc)}
-                                else:
-                                    issue_detail_cache[url] = data
-                                issue_detail_tasks.pop(url, None)
-                                invalidate()
-                            issue_detail_tasks[detail_url] = asyncio.create_task(load_issue_detail(detail_url, comment_fetch_limit))
+                entry = issue_detail_cache.get(detail_url)
+                if entry is None or entry.get('loading') or entry.get('error') or not entry.get('comments'):
+                    _schedule_issue_detail_fetch(detail_url, comment_fetch_limit)
                 detail_map = issue_detail_cache.get(detail_url, {})
             else:
                 detail_map = {}
@@ -6949,6 +7038,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             for idx, field_info in enumerate(fields):
                 marker = '➤' if idx == cursor else ' '
                 ftype = field_info.get('type')
+                extra_lines: List[str] = []
                 if ftype == 'priority':
                     opts = field_info.get('options') or []
                     index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
@@ -6981,11 +7071,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     value = field_info.get('value') or '-'
                 elif ftype == 'comment':
                     value = '(add comment)'
+                elif ftype == 'comment-history':
+                    values = field_info.get('value') or []
+                    if isinstance(values, list) and values:
+                        value = values[0]
+                        extra_lines = values[1:]
+                    elif isinstance(values, list):
+                        value = '(no comments)'
+                    else:
+                        value = str(values) or '(no comments)'
                 else:
                     value = field_info.get('value', '')
                 value = value or '-'
                 style = 'class:editor.field.cursor' if idx == cursor else 'class:editor.field'
                 add_line(f" {marker} {field_info.get('name')} : {value}", style)
+                if extra_lines:
+                    for extra in extra_lines:
+                        add_line(f"   {extra}", 'class:editor.meta')
 
         if mode == 'edit-date-calendar' and fields:
             editing = task_edit_state.get('editing') or {}
