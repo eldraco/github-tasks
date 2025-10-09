@@ -8193,6 +8193,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         iteration_options_json = json.dumps(iteration_options, ensure_ascii=False)
         assignee_user_ids_json = json.dumps([], ensure_ascii=False)
         assignee_logins_json = json.dumps(assignees, ensure_ascii=False)
+        assigned_flag = 0
+        user_login = (cfg.user or '').strip().lower()
+        if user_login:
+            for login in assignees:
+                if login.strip().lower() == user_login:
+                    assigned_flag = 1
+                    break
 
         payload = {
             'mode': mode,
@@ -8267,7 +8274,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             updated_at=now_iso,
             status=status_label or 'Todo',
             is_done=0,
-            assigned_to_me=0,
+            assigned_to_me=assigned_flag,
             created_by_me=1,
             item_id='',
             project_id=project_id,
