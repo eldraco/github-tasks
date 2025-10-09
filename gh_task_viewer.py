@@ -1579,6 +1579,14 @@ class TaskDB:
         )
         self.conn.commit()
 
+    def update_status_field(self, url: str, field_id: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET status_field_id=? WHERE url=?",
+            (field_id or '', url),
+        )
+        self.conn.commit()
+
     def update_status_options_by_field(self, field_id: str, options: List[Dict[str, object]]) -> None:
         if not field_id:
             return
@@ -4791,6 +4799,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if row.url in pending_status_urls:
             status_line = "Status update already in progress"
             invalidate(); return
+        status_options_cached = _normalize_status_options(_json_list(row.status_options))
+        if (row.project_id and not row.status_field_id) or not status_options_cached:
+            fetched_field_id, fetched_options = await _ensure_status_field_metadata(row.project_id or '', row.status_field_id or '', status_options_cached)
+            if fetched_field_id and fetched_field_id != (row.status_field_id or ''):
+                row.status_field_id = fetched_field_id
+                try:
+                    db.update_status_field(row.url, fetched_field_id)
+                except Exception:
+                    pass
+            if fetched_options:
+                status_options_cached = fetched_options
+                try:
+                    db.update_status_options(row.url, fetched_options)
+                except Exception:
+                    pass
+                row.status_options = json.dumps(fetched_options, ensure_ascii=False)
         if not (row.project_id and row.item_id and row.status_field_id):
             status_line = "Task missing status metadata"
             invalidate(); return
@@ -5594,6 +5618,48 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 return (opt.get("id") or "", name)
         opt = options[0]
         return (opt.get("id") or "", (opt.get("name") or "").strip())
+
+    def _normalize_status_options(raw: Iterable[object]) -> List[Dict[str, object]]:
+        options: List[Dict[str, object]] = []
+        for opt in raw or []:
+            if not isinstance(opt, dict):
+                continue
+            ident = (opt.get('id') or '').strip()
+            name = (opt.get('name') or '').strip()
+            if ident:
+                options.append({'id': ident, 'name': name})
+        return options
+
+    STATUS_FIELD_CANDIDATES: Tuple[str, ...] = (
+        'Status', 'Task Status', 'Status ', 'Estado', 'State', 'Progress', 'Workflow', 'Kanban Status'
+    )
+
+    async def _ensure_status_field_metadata(
+        project_id: str,
+        existing_field_id: str,
+        existing_options: Iterable[object]
+    ) -> Tuple[str, List[Dict[str, object]]]:
+        field_id = (existing_field_id or '').strip()
+        options_clean = _normalize_status_options(existing_options)
+        if not token or not project_id:
+            return field_id, options_clean
+        loop = asyncio.get_running_loop()
+        if not field_id:
+            for name in STATUS_FIELD_CANDIDATES:
+                try:
+                    candidate = await loop.run_in_executor(None, lambda n=name: get_project_field_id_by_name(token, project_id, n))
+                except Exception:
+                    candidate = None
+                if candidate:
+                    field_id = candidate.strip()
+                    break
+        if field_id and not options_clean:
+            try:
+                fetched_opts = await loop.run_in_executor(None, lambda: get_project_field_options(token, field_id))
+            except Exception:
+                fetched_opts = []
+            options_clean = _normalize_status_options(fetched_opts)
+        return field_id, options_clean
 
     def _cycle_sort(delta: int) -> None:
         nonlocal sort_index, status_line
@@ -7935,11 +8001,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_field_id = (payload.get('status_field_id') or '').strip()
             status_option_id = (payload.get('status_option_id') or '').strip()
             status_label = (payload.get('status_label') or '').strip()
-            status_options_payload = payload.get('status_options') or []
-            if not isinstance(status_options_payload, list):
-                status_options_payload = []
+            status_options_payload_raw = payload.get('status_options') or []
+            if not isinstance(status_options_payload_raw, list):
+                status_options_payload_raw = []
+            status_options_payload = _normalize_status_options(status_options_payload_raw)
+            status_field_id, status_options_payload = await _ensure_status_field_metadata(project_id, status_field_id, status_options_payload)
             if status_field_id:
-                if not status_option_id:
+                payload['status_field_id'] = status_field_id
+            if status_options_payload:
+                payload['status_options'] = status_options_payload
+            if status_field_id:
+                if not status_option_id and status_options_payload:
                     status_option_id, status_label = _select_status_option(status_options_payload, status_label or 'Todo')
                 fetched_status_opts: List[Dict[str, object]] = []
                 if not status_option_id:
@@ -8087,7 +8159,21 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             except Exception:
                 missing_status_rows = []
             for row in missing_status_rows:
-                options = _json_list(row.status_options)
+                options = _normalize_status_options(_json_list(row.status_options))
+                fetched_field_id, fetched_options = await _ensure_status_field_metadata(row.project_id or '', row.status_field_id or '', options)
+                if fetched_field_id and fetched_field_id != (row.status_field_id or ''):
+                    row.status_field_id = fetched_field_id
+                    try:
+                        db.update_status_field(row.url, fetched_field_id)
+                    except Exception:
+                        pass
+                if fetched_options:
+                    options = fetched_options
+                    try:
+                        db.update_status_options(row.url, fetched_options)
+                    except Exception:
+                        pass
+                    row.status_options = json.dumps(fetched_options, ensure_ascii=False)
                 option_id, label = _select_status_option(options, 'Todo')
                 if not option_id:
                     continue
@@ -8256,13 +8342,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         status_options_raw = project_choice.get('status_options') or []
         if not isinstance(status_options_raw, list):
             status_options_raw = []
-        status_options_clean: List[Dict[str, object]] = []
-        for opt in status_options_raw:
-            if isinstance(opt, dict):
-                status_options_clean.append({
-                    'id': opt.get('id'),
-                    'name': opt.get('name'),
-                })
+        status_options_clean = _normalize_status_options(status_options_raw)
+        status_field_id, status_options_clean = await _ensure_status_field_metadata(project_id, status_field_id, status_options_clean)
+        if status_field_id:
+            project_choice['status_field_id'] = status_field_id
+        if status_options_clean:
+            project_choice['status_options'] = status_options_clean
         status_option_id, status_label = _select_status_option(status_options_clean, 'Todo')
 
         def _match_priority_option(label: str, options: List[Dict[str, object]]) -> str:
