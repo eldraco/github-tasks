@@ -4816,8 +4816,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     pass
                 row.status_options = json.dumps(fetched_options, ensure_ascii=False)
         if not (row.project_id and row.item_id and row.status_field_id):
-            status_line = "Task missing status metadata"
-            invalidate(); return
+            if not row.project_id or not row.item_id:
+                status_line = "Task missing project metadata"
+                invalidate(); return
+            fallback_id = row.status_field_id or payload_field_id or ''
+            if fallback_id:
+                status_options_cached = _normalize_status_options(_json_list(row.status_options)) or [{'id': 'todo', 'name': 'Todo'}]
+                option_id, display_name = _select_status_option(status_options_cached, target)
+                if not option_id:
+                    option_id = fallback_id
+                    display_name = target.title()
+            else:
+                status_line = "Task missing status metadata"
+                invalidate(); return
         option_id, display_name = _match_status_option(row, target)
         if not option_id and token and row.status_field_id:
             try:
