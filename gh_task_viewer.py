@@ -1950,6 +1950,18 @@ class TaskDB:
         cur.execute("DELETE FROM pending_actions WHERE id=?", (int(action_id),))
         self.conn.commit()
 
+    def update_pending_action(self, action_id: int, payload: Dict[str, object]) -> None:
+        try:
+            payload_json = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            payload_json = "{}"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE pending_actions SET payload=? WHERE id=?",
+            (payload_json, int(action_id)),
+        )
+        self.conn.commit()
+
     def clear_pending_actions(self) -> None:
         cur = self.conn.cursor()
         cur.execute("DELETE FROM pending_actions")
@@ -4796,10 +4808,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_index = max(0, min(len(rows)-1, current_index))
         row = rows[current_index]
         selected_url = row.url
+        pending_create_action: Optional[PendingAction] = None
+        if (row.item_id or "").strip() == "" and selected_url.startswith(PENDING_URL_PREFIX):
+            try:
+                pending_actions = db.list_pending_actions()
+            except Exception:
+                pending_actions = []
+            else:
+                for action in pending_actions:
+                    if action.action_type != 'create_task':
+                        continue
+                    payload = action.payload or {}
+                    if (payload.get('placeholder_url') or '').strip() == selected_url:
+                        pending_create_action = action
+                        if not row.status_field_id:
+                            row.status_field_id = (payload.get('status_field_id') or '').strip()
+                        break
         if row.url in pending_status_urls:
             status_line = "Status update already in progress"
             invalidate(); return
         status_options_cached = _normalize_status_options(_json_list(row.status_options))
+        if not status_options_cached and pending_create_action:
+            status_options_cached = _normalize_status_options(pending_create_action.payload.get('status_options') or [])
         if (row.project_id and not row.status_field_id) or not status_options_cached:
             fetched_field_id, fetched_options = await _ensure_status_field_metadata(row.project_id or '', row.status_field_id or '', status_options_cached)
             if fetched_field_id and fetched_field_id != (row.status_field_id or ''):
@@ -4816,6 +4846,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     pass
                 row.status_options = json.dumps(fetched_options, ensure_ascii=False)
         if not (row.project_id and row.item_id and row.status_field_id):
+            if pending_create_action and row.project_id and row.status_field_id:
+                option_id, display_name = _match_status_option(row, target)
+                if not option_id and status_options_cached:
+                    preferred_name = target.replace('_', ' ').strip().title() or target
+                    option_id, display_name = _select_status_option(status_options_cached, preferred_name)
+                if not option_id:
+                    status_line = f"No status option matches '{target}'"
+                    invalidate(); return
+                new_is_done = _is_done_name(display_name)
+                try:
+                    db.reset_status(row.url, display_name, option_id, new_is_done)
+                except Exception as exc:
+                    status_line = f"Failed to cache status: {exc}"
+                    invalidate(); return
+                payload_update = dict(pending_create_action.payload or {})
+                payload_update['status_label'] = display_name
+                payload_update['status_option_id'] = option_id
+                if row.status_field_id:
+                    payload_update['status_field_id'] = row.status_field_id
+                if status_options_cached:
+                    payload_update['status_options'] = status_options_cached
+                try:
+                    db.update_pending_action(pending_create_action.id, payload_update)
+                except Exception as exc:
+                    status_line = f"Failed to update queued create: {exc}"
+                    invalidate(); return
+                all_rows = load_all()
+                status_line = f"Status set to {display_name} (queued create)"
+                invalidate()
+                return
             if not row.project_id or not row.item_id:
                 status_line = "Task missing project metadata"
                 invalidate(); return
@@ -7435,8 +7495,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return f"{m:02d}:{s:02d}"
 
     def build_status_bar() -> str:
+        try:
+            from prompt_toolkit.application.current import get_app
+            total_cols = max(0, get_app().output.get_size().columns)
+        except Exception:
+            total_cols = 120
         if zen_mode:
-            return ''
+            return " " * total_cols if total_cols else ''
         if in_date_filter:
             mode = "🗓️ DATE"
         elif in_search:
@@ -7474,9 +7539,31 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             s = int(max(0, s)); h, r = divmod(s, 3600); m, _ = divmod(r, 60); return f"{h:d}:{m:02d}"
         theme_label = theme_presets[current_theme_index].name if theme_presets else 'Default'
         base = f" {mode}  ⏱ {_mmss(now_s)}  🧩 {_hm(task_s)}  📦 {_hm(proj_s)}  🟢 {active_count}  🎨 {theme_label}"
-        if status_line:
-            base += "  " + status_line
-        return base
+        message = f"  {status_line}" if status_line else ""
+
+        def _clip(text: str, max_width: int) -> str:
+            if max_width <= 0:
+                return ""
+            out: List[str] = []
+            used = 0
+            for ch in text:
+                ch_w = _char_width(ch)
+                if used + ch_w > max_width:
+                    break
+                out.append(ch)
+                used += ch_w
+            return "".join(out)
+
+        target_width = total_cols if total_cols > 0 else _display_width(base + message)
+        clipped_base = _clip(base, target_width)
+        base_width = _display_width(clipped_base)
+        remaining = max(0, target_width - base_width)
+        clipped_message = _clip(message, remaining)
+        combined = clipped_base + clipped_message
+        combined_width = _display_width(combined)
+        if target_width > combined_width:
+            combined += " " * (target_width - combined_width)
+        return combined
 
     from prompt_toolkit.layout.containers import Float, FloatContainer
     add_control = FormattedTextControl(text=lambda: build_add_overlay())
