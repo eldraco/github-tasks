@@ -4448,15 +4448,27 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         }
         field_key, cursor_key = field_map[field]
         raw = (add_state.get(field_key) or '').strip()
+        fallback_raw = raw
+        if not raw:
+            if field == 'focus':
+                fallback_raw = (add_state.get('focus_date') or '').strip()
+                if not fallback_raw:
+                    fallback_raw = (add_state.get('start_date') or '').strip()
+            elif field == 'end':
+                fallback_raw = (add_state.get('end_date') or '').strip()
+                if not fallback_raw:
+                    fallback_raw = (add_state.get('start_date') or '').strip()
+            elif field == 'start':
+                fallback_raw = (add_state.get('start_date') or '').strip()
         try:
-            base_date = dt.date.fromisoformat(raw) if raw else dt.date.today()
+            base_date = dt.date.fromisoformat(fallback_raw) if fallback_raw else dt.date.today()
         except Exception:
             base_date = dt.date.today()
         add_state['calendar_active'] = True
         add_state['calendar_field'] = field
         add_state['calendar_prev'] = raw
         add_state['calendar_date'] = base_date.isoformat()
-        status_line = f"Select {field.capitalize()} date"
+        status_line = f"Select {field.capitalize()} date (Enter/Tab to confirm)"
         invalidate()
 
     def _cancel_add_calendar(message: Optional[str] = None) -> None:
@@ -4614,7 +4626,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 except Exception:
                     cursor_date = dt.date.today()
                 cal = calendar.Calendar(firstweekday=0)
-                body.append("Use h/l day, j/k week, </> month, t today, Enter=save, Esc=cancel")
+                body.append("Use h/l day, j/k week, </> month, t today, Enter=save, Esc=cancel, Tab=close")
                 body.append(cursor_date.strftime("%B %Y"))
                 header = ''.join(f" {calendar.day_abbr[i][:2]} " for i in range(7))
                 body.append(header)
@@ -4631,7 +4643,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                         row_cells.append(cell)
                     body.append(''.join(row_cells))
             else:
-                body.append(f"{prompt}. Enter to continue, Esc cancel, press C for calendar")
+                body.append(f"{prompt}. Enter to continue, Esc cancel, press Tab or C for calendar")
                 val = add_state.get(field_key, '')
                 cur = max(0, min(len(val), add_state.get(cursor_key, len(val))))
                 body.append(val[:cur] + "_" + val[cur:])
@@ -9642,6 +9654,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         step = add_state.get('step')
         if step in ('start', 'end', 'focus'):
+            _open_add_calendar(step)
+
+    @kb.add('tab', filter=Condition(lambda: add_mode and add_state.get('step') in ('start','end','focus')))
+    def _(event):
+        step = add_state.get('step')
+        if step not in ('start', 'end', 'focus'):
+            return
+        if add_state.get('calendar_active'):
+            if add_state.get('calendar_field') != step:
+                _confirm_add_calendar()
+                _open_add_calendar(step)
+            else:
+                _confirm_add_calendar()
+        else:
             _open_add_calendar(step)
 
     @kb.add(Keys.Any, filter=is_add_date_input)
