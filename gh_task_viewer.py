@@ -245,6 +245,16 @@ BASE_THEME_STYLE: Dict[str, str] = {
     'zen.ascii': 'bg:default italic bold #ffd7af',
     'zen.meta': 'bg:default italic #d7d7d7',
     'zen.subtitle': 'bg:default italic #c0c0c0',
+    'detail.frame': 'bg:#202020 #f0f0f0',
+    'detail.frame.border': '#5f5f5f',
+    'detail.frame.title': 'bold #ffd75f',
+    'detail.body': 'bg:#202020 #f0f0f0',
+    'detail.title': 'bold #ffd75f',
+    'detail.label': '#ffd787',
+    'detail.value': '#f0f0f0',
+    'detail.meta': '#87d7ff',
+    'detail.url': 'underline #87d7ff',
+    'detail.instructions': '#5fd7af',
 }
 
 ZEN_ASCII_FONT: Dict[str, Tuple[str, ...]] = {
@@ -6774,7 +6784,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return Window(width=stats_width, content=stats_control, wrap_lines=False, always_hide_cursor=True, style=panel_style)
 
     detail_control = FormattedTextControl(text=lambda: build_detail_text())
-    detail_window = Window(width=80, height=20, content=detail_control, wrap_lines=True, always_hide_cursor=True, style="bg:#202020 #ffffff")
+    detail_body = Window(
+        width=Dimension(preferred=88, max=120),
+        height=Dimension(preferred=22, max=32),
+        content=detail_control,
+        wrap_lines=True,
+        always_hide_cursor=True,
+        style=_style_class('detail.body', 'summary.panel'),
+    )
+    detail_window = Frame(
+        body=detail_body,
+        title="🔍 Task Snapshot",
+        style=_style_class('detail.frame', 'editor.frame'),
+    )
 
     # Report overlay
     show_report = False
@@ -7442,44 +7464,166 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not detail_mode:
             return []
         rows = filtered_rows()
+        value_style_default = _style_class('detail.value', 'summary.value') or ''
         if not rows:
-            return [("", "No selection")] 
+            return [(value_style_default, "No selection")]
         t = rows[current_index]
+
+        def _clean(value: Optional[object]) -> str:
+            if value is None:
+                return '—'
+            text = str(value).strip()
+            if not text:
+                return '—'
+            return text.replace('\n', ' ').replace('\r', ' ')
+
+        def _assignees_display(row: TaskRow) -> str:
+            raw = getattr(row, 'assignee_logins', '[]') or '[]'
+            try:
+                parsed = json.loads(raw)
+                if not isinstance(parsed, list):
+                    parsed = []
+            except Exception:
+                parsed = []
+            cleaned: List[str] = []
+            seen: Set[str] = set()
+            for entry in parsed:
+                login = str(entry).strip()
+                if not login:
+                    continue
+                if not login.startswith('@'):
+                    login_disp = '@' + login
+                else:
+                    login_disp = login
+                key = login_disp.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append(login_disp)
+                if len(cleaned) >= 5:
+                    break
+            if not cleaned:
+                return '—'
+            if len(cleaned) > 3:
+                return ', '.join(cleaned[:3]) + ', …'
+            return ', '.join(cleaned)
+
+        label_style = _style_class('detail.label', 'summary.label') or ''
+        value_style = value_style_default
+        meta_style = _style_class('detail.meta', 'summary.accent') or value_style
+        url_style = _style_class('detail.url', 'summary.accent') or value_style
+        instructions_style = _style_class('detail.instructions', 'editor.instructions') or ''
+        title_style = _style_class('detail.title', 'summary.title') or meta_style
+
         labels_list = _task_labels(t)
-        labels_display = ", ".join(labels_list) if labels_list else "-"
-        priority_display = (t.priority or '-') + ('*' if getattr(t, 'priority_dirty', 0) else '')
-        iter_parts = []
+        labels_display = ", ".join(labels_list) if labels_list else "—"
+
+        priority_base = (t.priority or '').strip()
+        if not priority_base:
+            priority_base = '—'
+        if getattr(t, 'priority_dirty', 0):
+            priority_base = f"{priority_base} ⏳"
+
+        status_text = (t.status or '').strip() or 'No status'
+        status_lower = status_text.lower()
+        if t.is_done:
+            status_icon = "✅"
+        elif "progress" in status_lower:
+            status_icon = "🏃"
+        elif "wait" in status_lower or "hold" in status_lower:
+            status_icon = "⏳"
+        elif "block" in status_lower or "stuck" in status_lower:
+            status_icon = "⛔"
+        else:
+            status_icon = "🗂️"
+        focus_summary = _clean(t.focus_date)
+        start_summary = _clean(t.start_date)
+        summary_parts = [f"{status_icon} {status_text}"]
+        if priority_base and priority_base != '—':
+            summary_parts.append(f"⭐ {priority_base}")
+        if focus_summary != '—':
+            summary_parts.append(f"🎯 {focus_summary}")
+        if start_summary != '—' and start_summary != focus_summary:
+            summary_parts.append(f"📅 {start_summary}")
+        summary_line = "   ".join(part for part in summary_parts if part.strip())
+
+        segments: List[Tuple[str, str]] = []
+        if summary_line:
+            segments.append((title_style, summary_line))
+            segments.append(('', '\n\n'))
+
+        def add_line(icon: str, label: str, value: object, style_override: Optional[str] = None) -> None:
+            segments.append((label_style, f"{icon} {label}: "))
+            segments.append((style_override or value_style, _clean(value)))
+            segments.append(('', '\n'))
+
+        project_bits: List[str] = []
+        owner = _clean(t.owner) if getattr(t, 'owner', None) else ''
+        if owner and owner != '—':
+            project_bits.append(owner)
+        if getattr(t, 'project_number', None):
+            project_bits.append(f"#{t.project_number}")
+        project_suffix = f" ({' · '.join(project_bits)})" if project_bits else ""
+        project_display = f"{_clean(t.project_title)}{project_suffix}"
+        add_line("📂", "Project", project_display)
+        task_title = (t.title or '').strip() or '(untitled task)'
+        add_line("📝", "Title", task_title)
+        add_line("📦", "Repository", t.repo or '—')
+        add_line("🏷️", "Labels", labels_display)
+        add_line("🔗", "URL", t.url or '—', url_style)
+
+        start_field = f"{_clean(t.start_field)}"
+        focus_field = f"{_clean(t.focus_field)}"
+        start_text = f"{start_summary} ({start_field})"
+        focus_text = f"{focus_summary} ({focus_field})"
+        add_line("🚀", "Start", start_text)
+        add_line("🎯", "Focus", focus_text)
+
+        iter_parts: List[str] = []
         if t.iteration_title:
-            iter_parts.append(t.iteration_title)
+            iter_parts.append(str(t.iteration_title))
         if t.iteration_start:
-            iter_parts.append(t.iteration_start)
-        iter_display = " | ".join(iter_parts) if iter_parts else "-"
-        iter_suffix = []
+            iter_parts.append(str(t.iteration_start))
+        iter_display = " · ".join(p.strip() for p in iter_parts if str(p).strip())
+        iter_suffix: List[str] = []
         if t.iteration_field:
-            iter_suffix.append(t.iteration_field)
+            iter_suffix.append(str(t.iteration_field))
         if t.iteration_duration:
             iter_suffix.append(f"{t.iteration_duration}d")
-        iter_meta = f" ({', '.join(iter_suffix)})" if iter_suffix else ""
-        lines = [
-            f"Project: {t.project_title}",
-            f"Title:   {t.title}",
-            f"Repo:    {t.repo}",
-            f"Labels:  {labels_display}",
-            f"Priority:{priority_display}",
-            f"URL:     {t.url}",
-            f"Start:   {t.start_date} ({t.start_field})",
-            f"Focus:   {t.focus_date or '-'} ({t.focus_field or '-'})",
-            f"Iter:    {iter_display}{iter_meta}",
-            f"Status:  {t.status}",
-            f"Done:    {'Yes' if t.is_done else 'No'}",
-            f"Pending: {'Yes' if t.status_dirty else 'No'}",
-            f"Assigned:{'Yes' if t.assigned_to_me else 'No'}",
-            f"Created: {'Yes' if t.created_by_me else 'No'}",
-            f"FieldID: {t.status_field_id or '-'}",
-            "",
-            "Press Enter / q / Esc to close"
-        ]
-        return [("bold", "Task Detail"), ("", "\n"+"\n".join(lines))]
+        if iter_suffix and iter_display:
+            iter_display = f"{iter_display} ({', '.join(iter_suffix)})"
+        elif iter_suffix:
+            iter_display = ", ".join(iter_suffix)
+        add_line("🧭", "Iteration", iter_display or "—")
+
+        add_line("👥", "Assignees", _assignees_display(t))
+        ownership_bits: List[str] = []
+        if t.assigned_to_me:
+            ownership_bits.append("assigned to you")
+        if t.created_by_me:
+            ownership_bits.append("created by you")
+        ownership_text = ", ".join(ownership_bits) if ownership_bits else "—"
+        add_line("🙋", "Ownership", ownership_text, meta_style if ownership_bits else value_style)
+
+        sync_bits: List[str] = []
+        if (t.url or "").startswith(PENDING_URL_PREFIX):
+            sync_bits.append("awaiting create")
+        if getattr(t, 'status_dirty', 0):
+            sync_bits.append("status queued")
+        if getattr(t, 'priority_dirty', 0):
+            sync_bits.append("priority queued")
+        sync_text = ", ".join(sync_bits) if sync_bits else "Up to date"
+        add_line("🛰", "Sync", sync_text, meta_style if sync_bits else value_style)
+
+        if t.status_field_id:
+            add_line("🆔", "Status Field", t.status_field_id, meta_style)
+
+        if segments and segments[-1][1] == '\n':
+            segments.pop()
+        segments.append(('', '\n'))
+        instructions_text = "Press Enter / q / Esc to close · D marks done · U syncs"
+        segments.append((instructions_style or value_style, instructions_text))
+        return segments
 
     status_control = FormattedTextControl(text=lambda: [("reverse", build_status_bar())])
     status_window = Window(height=1, content=status_control)
