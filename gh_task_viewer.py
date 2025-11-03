@@ -13,6 +13,7 @@
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
 #   W  toggle work timer for the selected task (multiple tasks can run)
 #   E  edit work sessions for the selected task
+#   H  open completed-tasks timer history for editing
 #   ]/[ cycle priority forward/backward for selected task
 #   O  open task field editor (start/focus date, priority)
 #   s/S cycle sort presets forward/backward
@@ -916,6 +917,9 @@ class TaskRow:
     assignee_field_id: str = ""
     assignee_user_ids: str = "[]"
     assignee_logins: str = "[]"
+    parent_url: str = ""
+    parent_title: str = ""
+    parent_node_id: str = ""
     content_node_id: str = ""
 
 @dataclass
@@ -934,7 +938,7 @@ class TaskDB:
         "iteration_field","iteration_title","iteration_start","iteration_duration",
         "title","repo_id","repo","labels","priority","priority_field_id","priority_option_id","priority_options","priority_dirty","priority_pending_option_id","url","updated_at","status","is_done","assigned_to_me","created_by_me",
         "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id",
-        "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids","assignee_logins","content_node_id"
+        "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids","assignee_logins","parent_url","parent_title","parent_node_id","content_node_id"
     ]
     CREATE_TABLE_SQL = """      CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -982,6 +986,9 @@ class TaskDB:
         assignee_field_id TEXT,
         assignee_user_ids TEXT,
         assignee_logins TEXT,
+        parent_url TEXT,
+        parent_title TEXT,
+        parent_node_id TEXT,
         content_node_id TEXT,
         UNIQUE(owner_type, owner, project_number, title, url, start_field, start_date)
       )
@@ -1035,7 +1042,7 @@ class TaskDB:
             "item_id":"''","project_id":"''","status_field_id":"''","status_option_id":"''",
             "status_options":"'[]'","status_dirty":"0","status_pending_option_id":"''",
             "start_field_id":"''","iteration_field_id":"''","iteration_options":"'[]'",
-            "assignee_field_id":"''","assignee_user_ids":"'[]'","assignee_logins":"'[]'","content_node_id":"''",
+            "assignee_field_id":"''","assignee_user_ids":"'[]'","assignee_logins":"'[]'","parent_url":"''","parent_title":"''","parent_node_id":"''","content_node_id":"''",
         }
         sel = ", ".join([c if c in cols else defaults[c] for c in self.SCHEMA_COLUMNS])
         cur.execute(
@@ -1362,6 +1369,95 @@ class TaskDB:
             out[url] = out.get(url, 0) + int((en - st).total_seconds())
         return out
 
+    def completed_task_history(self, limit: int = 200, done_only: bool = True) -> List[Dict[str, object]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT task_url, project_title, started_at, ended_at
+            FROM work_sessions
+            WHERE task_url IS NOT NULL AND task_url <> ''
+            ORDER BY COALESCE(ended_at, started_at) DESC
+            """
+        )
+        entries: Dict[str, Dict[str, object]] = {}
+        for task_url, project_title, started_at, ended_at in cur.fetchall():
+            if not task_url:
+                continue
+            entry = entries.get(task_url)
+            if entry is None:
+                entry = {
+                    'task_url': task_url,
+                    'project_title': project_title or '',
+                    'total_seconds': 0,
+                    'last_end': None,
+                    'is_done': None,
+                    'title': '',
+                }
+                entries[task_url] = entry
+            if project_title and not entry.get('project_title'):
+                entry['project_title'] = project_title
+            start_dt = self._parse_iso(started_at)
+            end_dt = self._parse_iso(ended_at) if ended_at else None
+            if start_dt is None or end_dt is None:
+                continue
+            delta = end_dt - start_dt
+            entry['total_seconds'] += max(0, int(delta.total_seconds()))
+            current_last = entry.get('last_end')
+            if current_last is None or end_dt > current_last:
+                entry['last_end'] = end_dt
+
+        if not entries:
+            return []
+
+        cur.execute(
+            """
+            SELECT url, title, project_title, is_done
+            FROM tasks
+            WHERE url IS NOT NULL AND url <> ''
+            ORDER BY updated_at DESC
+            """
+        )
+        seen: Set[str] = set()
+        for url, title, project_title, is_done in cur.fetchall():
+            if not url or url in seen:
+                continue
+            entry = entries.get(url)
+            if not entry:
+                continue
+            seen.add(url)
+            if title and not entry.get('title'):
+                entry['title'] = title
+            if project_title and not entry.get('project_title'):
+                entry['project_title'] = project_title
+            entry['is_done'] = bool(is_done)
+
+        sorted_entries = sorted(
+            (entry for entry in entries.values() if entry['total_seconds'] > 0 and entry.get('last_end')),
+            key=lambda item: item['last_end'],
+            reverse=True,
+        )
+        results: List[Dict[str, object]] = []
+        for entry in sorted_entries:
+            is_done_raw = entry.get('is_done')
+            is_done_val = True if is_done_raw is None else bool(is_done_raw)
+            if done_only and not is_done_val:
+                continue
+            last_end_dt = entry['last_end']
+            if not isinstance(last_end_dt, dt.datetime):
+                continue
+            last_end_local = last_end_dt.astimezone()
+            results.append({
+                'task_url': entry['task_url'],
+                'title': entry.get('title') or '',
+                'project_title': entry.get('project_title') or '',
+                'total_seconds': int(entry['total_seconds']),
+                'last_end': last_end_local.isoformat(timespec='seconds'),
+                'is_done': is_done_val,
+            })
+            if limit and limit > 0 and len(results) >= limit:
+                break
+        return results
+
     def task_titles(self) -> Dict[str, str]:
         cur = self.conn.cursor()
         try:
@@ -1550,6 +1646,42 @@ class TaskDB:
                 key = self._period_key(cur_dt, granularity)
                 bucket = out.setdefault(proj, {})
                 bucket[key] = bucket.get(key, 0) + int((seg_end - cur_dt).total_seconds())
+                cur_dt = seg_end
+        return out
+
+    def aggregate_label_period_totals(self, granularity: str, since_days: Optional[int] = None) -> Dict[str, Dict[str, int]]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT labels, started_at, ended_at FROM work_sessions")
+        rows = cur.fetchall()
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
+        out: Dict[str, Dict[str, int]] = {}
+        for labels_json, st_s, en_s in rows:
+            st = self._parse_iso(st_s)
+            en = self._parse_iso(en_s) if en_s else None
+            if not st:
+                continue
+            if en is None:
+                en = now
+            st, en, keep = self._clip_range(st, en, since_dt)
+            if not keep or st >= en:
+                continue
+            try:
+                labels_data = json.loads(labels_json or "[]")
+                label_names = [str(x) for x in labels_data if isinstance(x, str) and x]
+            except Exception:
+                label_names = []
+            if not label_names:
+                label_names = ['(no label)']
+            cur_dt = st
+            while cur_dt < en:
+                boundary = self._next_boundary(cur_dt, granularity)
+                seg_end = min(boundary, en)
+                key = self._period_key(cur_dt, granularity)
+                delta = int((seg_end - cur_dt).total_seconds())
+                for name in label_names:
+                    bucket = out.setdefault(name, {})
+                    bucket[key] = bucket.get(key, 0) + delta
                 cur_dt = seg_end
         return out
 
@@ -1746,12 +1878,12 @@ class TaskDB:
               title, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
               url, updated_at, status, is_done, assigned_to_me, created_by_me,
               item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
-              start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids, assignee_logins, content_node_id
+              start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids, assignee_logins, parent_url, parent_title, parent_node_id, content_node_id
             ) VALUES (
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
@@ -1788,6 +1920,9 @@ class TaskDB:
                           assignee_field_id=excluded.assignee_field_id,
                           assignee_user_ids=excluded.assignee_user_ids,
                           assignee_logins=excluded.assignee_logins,
+                          parent_url=excluded.parent_url,
+                          parent_title=excluded.parent_title,
+                          parent_node_id=excluded.parent_node_id,
                           content_node_id=excluded.content_node_id
             """,
             [
@@ -1836,6 +1971,9 @@ class TaskDB:
                     r.assignee_field_id,
                     r.assignee_user_ids,
                     r.assignee_logins,
+                    r.parent_url,
+                    r.parent_title,
+                    r.parent_node_id,
                     r.content_node_id,
                 )
                 for r in rows
@@ -1874,7 +2012,7 @@ class TaskDB:
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
-                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
+                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,parent_url,parent_title,parent_node_id,content_node_id
                 FROM tasks WHERE focus_date = ?
                 ORDER BY project_title, focus_date, repo, title
                 """,
@@ -1888,7 +2026,7 @@ class TaskDB:
                        title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
-                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
+                       start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,parent_url,parent_title,parent_node_id,content_node_id
                 FROM tasks
                 ORDER BY project_title, focus_date, repo, title
                 """
@@ -1912,7 +2050,7 @@ class TaskDB:
                    title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                    url,updated_at,status,is_done,assigned_to_me,created_by_me,
                    item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
-                   start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
+                   start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,parent_url,parent_title,parent_node_id,content_node_id
             FROM tasks WHERE url LIKE ?
             ORDER BY updated_at
             """,
@@ -2021,6 +2159,15 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
               assignees(first:50){ nodes{ id login } }
               author { login }
               labels(first:50){ nodes{ name color } }
+              trackedInIssues(first:5){
+                nodes{
+                  id
+                  number
+                  title
+                  url
+                  repository{ nameWithOwner }
+                }
+              }
             }
             ... on PullRequest {
               title url repository{ id nameWithOwner }
@@ -2066,7 +2213,7 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
                                   }
                                 }
                             }
-                        }
+                                                    }
                     }
           project{ title url id }
         }
@@ -2093,6 +2240,15 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
               assignees(first:50){ nodes{ id login } }
               author { login }
               labels(first:50){ nodes{ name color } }
+              trackedInIssues(first:5){
+                nodes{
+                  id
+                  number
+                  title
+                  url
+                  repository{ nameWithOwner }
+                }
+              }
             }
             ... on PullRequest {
               title url repository{ id nameWithOwner }
@@ -2138,7 +2294,7 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
                                   }
                                 }
                             }
-                        }
+                                                    }
                     }
           project{ title url id }
         }
@@ -2265,6 +2421,13 @@ GQL_MUTATION_CREATE_ISSUE = """mutation($repositoryId:ID!, $title:String!, $body
 GQL_MUTATION_ADD_PROJECT_ITEM = """mutation($projectId:ID!, $contentId:ID!) {
   addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
     item{ id }
+  }
+}
+"""
+
+GQL_MUTATION_ADD_ISSUE_TO_ISSUE = """mutation($issueId:ID!, $contentId:ID!) {
+  addIssueToIssue(input:{issueId:$issueId, contentId:$contentId}){
+    issue{ id }
   }
 }
 """
@@ -2825,6 +2988,19 @@ def add_project_item(token: str, project_id: str, content_id: str) -> str:
     return item.get("id") or ""
 
 
+def add_issue_parent(token: str, parent_issue_id: str, child_issue_id: str) -> None:
+    if not token:
+        raise RuntimeError('GITHUB_TOKEN required to link parent issue')
+    if not (parent_issue_id and child_issue_id):
+        return
+    session = _session(token)
+    variables = {"issueId": parent_issue_id, "contentId": child_issue_id}
+    resp = _graphql_with_backoff(session, GQL_MUTATION_ADD_ISSUE_TO_ISSUE, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Linking parent issue failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+
+
 def get_repo_id(token: str, full_name: str) -> Dict[str, str]:
     if '/' not in (full_name or ''):
         raise RuntimeError('Repository must be in owner/name format')
@@ -2840,6 +3016,32 @@ def get_repo_id(token: str, full_name: str) -> Dict[str, str]:
     if not repo_id:
         raise RuntimeError('Repository not found')
     return {"repo_id": repo_id, "repo": repo.get("nameWithOwner") or full_name.strip()}
+
+
+def list_project_fields(token: str, project_id: str) -> List[Dict[str, str]]:
+    if not project_id:
+        return []
+    session = _session(token)
+    resp = _graphql_with_backoff(session, GQL_PROJECT_FIELDS, {"id": project_id})
+    errs = resp.get("errors") or []
+    if errs:
+        try:
+            logging.getLogger('gh_task_viewer').warning("list_project_fields error for %s: %s", project_id, errs)
+        except Exception:
+            pass
+        return []
+    node = (resp.get("data") or {}).get("node") or {}
+    fields = ((node.get("fields") or {}).get("nodes")) or []
+    out: List[Dict[str, str]] = []
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        field_id = (field.get("id") or "").strip()
+        name = (field.get("name") or "").strip()
+        if field_id and name:
+            out.append({"id": field_id, "name": name})
+    return out
+
 
 def discover_open_projects(session: requests.Session, owner_type: str, owner: str) -> List[Dict]:
     if owner_type == "org":
@@ -2863,18 +3065,12 @@ def discover_open_projects(session: requests.Session, owner_type: str, owner: st
 def get_project_field_id_by_name(token: str, project_id: str, name_lower: str) -> Optional[str]:
     if not project_id:
         return None
-    session = _session(token)
-    resp = _graphql_with_backoff(session, GQL_PROJECT_FIELDS, {"id": project_id})
-    errs = resp.get("errors") or []
-    if errs:
-        return None
-    node = (resp.get("data") or {}).get("node") or {}
-    fields = ((node.get("fields") or {}).get("nodes")) or []
+    fields = list_project_fields(token, project_id)
     target = (name_lower or '').strip().lower()
-    for f in fields:
-        nm = (f.get("name") or '').strip().lower()
+    for field in fields:
+        nm = (field.get("name") or '').strip().lower()
         if nm == target:
-            return f.get("id") or None
+            return field.get("id") or None
     return None
 
 
@@ -3238,10 +3434,44 @@ def fetch_tasks_github(
                 project_id = project_info.get("id") or ""
                 repo = None
                 repo_id = ""
+                content_node_id = (content.get("id") or "") if isinstance(content, dict) else ""
+                parent_url: str = ""
+                parent_title: str = ""
+                parent_node_id: str = ""
+                parent_titles_accum: List[str] = []
+                parent_titles_seen: Set[str] = set()
                 if ctype in ("Issue", "PullRequest"):
                     rep = content.get("repository") or {}
                     repo = rep.get("nameWithOwner")
                     repo_id = rep.get("id") or ""
+                    tracked_nodes = (content.get("trackedInIssues") or {}).get("nodes") or []
+                    for node in tracked_nodes:
+                        if not isinstance(node, dict):
+                            continue
+                        p_id = (node.get("id") or "").strip()
+                        p_url = (node.get("url") or "").strip()
+                        raw_title = (node.get("title") or "").strip()
+                        repo_name = ((node.get("repository") or {}).get("nameWithOwner") or "").strip()
+                        number = node.get("number")
+                        if repo_name and number:
+                            display = f"{repo_name}#{number} {raw_title}".strip()
+                        elif number:
+                            display = f"#{number} {raw_title}".strip()
+                        elif repo_name:
+                            display = f"{repo_name} • {raw_title}".strip()
+                        else:
+                            display = raw_title or p_url
+                        if display and display not in parent_titles_seen:
+                            parent_titles_accum.append(display)
+                            parent_titles_seen.add(display)
+                        if not parent_node_id and p_id:
+                            parent_node_id = p_id
+                            parent_url = p_url
+                    if parent_titles_accum:
+                        if len(parent_titles_accum) > 3:
+                            parent_title = ", ".join(parent_titles_accum[:3]) + ", …"
+                        else:
+                            parent_title = ", ".join(parent_titles_accum)
 
                 label_names: List[str] = []
                 if ctype in ("Issue", "PullRequest"):
@@ -3345,6 +3575,30 @@ def fetch_tasks_github(
                             priority_field_id = field_data.get("id") or priority_field_id
                             priority_text = (fv.get("name") or "").strip()
                             priority_option_id = option_id_val
+                    if fv and fv.get("__typename") == "ProjectV2ItemFieldIssueValue":
+                        field_info = fv.get("field") or {}
+                        field_name_issue = (field_info.get("name") or "").strip()
+                        issue_value = fv.get("issue") or {}
+                        candidate_node_id = (issue_value.get("id") or "").strip()
+                        candidate_url = (issue_value.get("url") or "").strip()
+                        repo_name = ((issue_value.get("repository") or {}).get("nameWithOwner") or "").strip()
+                        issue_number = issue_value.get("number")
+                        issue_title = (issue_value.get("title") or "").strip()
+                        display = issue_title
+                        if repo_name and issue_number:
+                            display = f"{repo_name}#{issue_number} {issue_title}".strip()
+                        elif issue_number is not None:
+                            display = f"#{issue_number} {issue_title}".strip()
+                        elif repo_name:
+                            display = f"{repo_name} • {issue_title}".strip()
+                        if display and display not in parent_titles_seen:
+                            parent_titles_accum.append(display)
+                            parent_titles_seen.add(display)
+                        if candidate_node_id and (not parent_node_id or 'parent' in field_name_issue.lower()):
+                            parent_node_id = candidate_node_id
+                            parent_url = candidate_url or parent_url
+                            if display:
+                                parent_title = display
                     if fv and fv.get("__typename") == "ProjectV2ItemFieldDateValue":
                         field_info = fv.get("field") or {}
                         start_field_id = field_info.get("id") or start_field_id
@@ -3512,6 +3766,10 @@ def fetch_tasks_github(
                                 assignee_field_id=assignee_field_id,
                                 assignee_user_ids=json.dumps(assignee_user_ids, ensure_ascii=False),
                                 assignee_logins=assignee_logins_json,
+                                parent_url=parent_url or "",
+                                parent_title=parent_title or "",
+                                parent_node_id=parent_node_id or "",
+                                content_node_id=content_node_id or "",
                             )
                         )
                         found_date = True
@@ -3560,6 +3818,10 @@ def fetch_tasks_github(
                             assignee_field_id=assignee_field_id,
                             assignee_user_ids=json.dumps(assignee_user_ids, ensure_ascii=False),
                             assignee_logins=assignee_logins_json,
+                            parent_url=parent_url or "",
+                            parent_title=parent_title or "",
+                            parent_node_id=parent_node_id or "",
+                            content_node_id=content_node_id or "",
                         )
                     )
 
@@ -3823,6 +4085,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     show_start_column = True
     show_end_column = True
     show_assignee_column = True
+    show_parent_column = True
     edit_task_mode = False
     task_edit_state: Dict[str, object] = {}
     task_edit_float: Optional[Float] = None
@@ -3832,6 +4095,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     edit_sessions_mode = False
     session_state: Dict[str, object] = {}
     session_float: Optional[Float] = None
+    history_mode = False
+    history_state: Dict[str, object] = {}
+    history_float: Optional[Float] = None
     update_in_progress = False
     task_duration_cache: Dict[str, Dict[str, int]] = {}
     summary_cache_ttl = 5.0  # seconds; avoid recomputing heavy aggregates on every repaint
@@ -3841,6 +4107,109 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     }
     issue_detail_cache: Dict[str, Dict[str, object]] = {}
     issue_detail_tasks: Dict[str, asyncio.Task] = {}
+    project_field_cache: Dict[str, Dict[str, object]] = {}
+
+    def _normalize_field_key(name: Optional[str]) -> str:
+        if not name:
+            return ''
+        collapsed = re.sub(r'[^0-9A-Za-z]+', ' ', str(name)).strip().lower()
+        return re.sub(r'\s+', ' ', collapsed)
+
+    def _date_field_candidates(field_type: str, field_name: Optional[str]) -> List[str]:
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def _add(candidate: Optional[str]) -> None:
+            if not candidate:
+                return
+            trimmed = candidate.strip()
+            if not trimmed:
+                return
+            key = trimmed.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(trimmed)
+
+        _add(field_name or '')
+        if field_type == 'start':
+            for alt in ('Start date', 'Start Date', 'Start', 'Begin Date', 'Kickoff'):
+                _add(alt)
+        elif field_type == 'focus':
+            for alt in ('Focus Day', 'Focus day', 'Focus Date', 'Focus', 'Target Date', 'Target'):
+                _add(alt)
+        elif field_type == 'end':
+            for alt in ('End Date', 'Due Date', 'Deadline', 'Finish Date', 'Completion Date'):
+                _add(alt)
+        return candidates
+
+    async def _load_project_fields_metadata(project_id: str) -> List[Dict[str, str]]:
+        if not (token and project_id):
+            return []
+        cached = project_field_cache.get(project_id)
+        now = time.monotonic()
+        if cached:
+            cached_ts = float(cached.get('ts') or 0.0)
+            if now - cached_ts < 300:
+                fields_cached = cached.get('fields')
+                if isinstance(fields_cached, list):
+                    return [dict(entry) for entry in fields_cached if isinstance(entry, dict)]
+        loop_local = asyncio.get_running_loop()
+        try:
+            fields = await loop_local.run_in_executor(None, lambda: list_project_fields(token, project_id))
+        except Exception:
+            fields = []
+        project_field_cache[project_id] = {'ts': time.monotonic(), 'fields': fields}
+        return fields
+
+    async def _resolve_project_field_id(project_id: str, field_type: str, field_name: str) -> Tuple[str, str]:
+        fields = await _load_project_fields_metadata(project_id)
+        if not fields:
+            return ("", "")
+        normalized_fields: List[Tuple[str, str, str]] = []
+        for entry in fields:
+            if not isinstance(entry, dict):
+                continue
+            fid = (entry.get('id') or '').strip()
+            name = (entry.get('name') or '').strip()
+            if not fid or not name:
+                continue
+            normalized_fields.append((_normalize_field_key(name), fid, name))
+        if not normalized_fields:
+            return ("", "")
+
+        candidates = _date_field_candidates(field_type, field_name)
+        candidate_norms = [_normalize_field_key(cand) for cand in candidates if cand]
+
+        for key in candidate_norms:
+            if not key:
+                continue
+            for norm, fid, name in normalized_fields:
+                if norm == key:
+                    return fid, name
+
+        for key in candidate_norms:
+            if not key:
+                continue
+            for norm, fid, name in normalized_fields:
+                if key in norm or norm in key:
+                    return fid, name
+
+        heuristics_map = {
+            'start': ['start', 'begin', 'kickoff'],
+            'focus': ['focus', 'target'],
+            'end': ['end', 'due', 'deadline', 'finish', 'complete'],
+        }
+        heuristics = heuristics_map.get(field_type, [])
+        if heuristics:
+            for norm, fid, name in normalized_fields:
+                if any(h in norm for h in heuristics):
+                    return fid, name
+
+        for norm, fid, name in normalized_fields:
+            if any(term in norm for term in ('date', 'day')):
+                return fid, name
+        return ("", "")
 
     def _schedule_issue_detail_fetch(url: str, comment_limit: int) -> None:
         if not token or not _parse_issue_url(url):
@@ -4033,6 +4402,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'show_start_column': show_start_column,
             'show_end_column': show_end_column,
             'show_assignee_column': show_assignee_column,
+            'show_parent_column': show_parent_column,
             'zen_mode': zen_mode,
         }
         try:
@@ -4068,6 +4438,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     show_start_column = bool(_st.get('show_start_column', show_start_column))
     show_end_column = bool(_st.get('show_end_column', show_end_column))
     show_assignee_column = bool(_st.get('show_assignee_column', show_assignee_column))
+    show_parent_column = bool(_st.get('show_parent_column', show_parent_column))
     zen_mode = bool(_st.get('zen_mode', zen_mode))
 
     def _style_value(name: str, default: str = '') -> str:
@@ -4237,6 +4608,39 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         choices.sort(key=lambda e: e.get('project_title', '').lower())
         return choices
 
+    def build_parent_choices_for_project(project: Optional[Dict[str, object]]) -> List[Dict[str, str]]:
+        if not project:
+            return []
+        project_id = (project.get('project_id') or '').strip()
+        if not project_id:
+            return []
+        candidates: List[Dict[str, str]] = []
+        for row in all_rows:
+            if (row.project_id or '').strip() != project_id:
+                continue
+            if not row.content_node_id or not (row.url or '').strip():
+                continue
+            if row.url.startswith(PENDING_URL_PREFIX):
+                continue
+            issue_meta = _parse_issue_url(row.url or '')
+            display_title = (row.title or row.url or '(untitled)').strip()
+            if issue_meta:
+                owner, name, number = issue_meta
+                repo_name = f"{owner}/{name}"
+                display = f"{repo_name}#{number} {display_title}"
+            elif row.repo:
+                display = f"{row.repo} • {display_title}"
+            else:
+                display = display_title
+            candidates.append({
+                'display': display,
+                'title': display_title,
+                'url': row.url or '',
+                'node_id': row.content_node_id or '',
+            })
+        candidates.sort(key=lambda entry: entry.get('display', '').lower())
+        return [{'display': '(no parent)', 'title': '(no parent)', 'url': '', 'node_id': ''}] + candidates
+
     def _set_project_choices_for_mode(mode: str) -> None:
         all_choices = add_state.get('project_choices_all') or []
         if mode == 'issue':
@@ -4254,6 +4658,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_state['iteration_index'] = 0
         add_state['repo_manual'] = ''
         add_state['priority_options'] = (project.get('priority_options') if project else []) or []
+        add_state['parent_choices'] = []
+        add_state['parent_index'] = 0
+        add_state['parent_selected_id'] = ''
+        add_state['parent_selected_title'] = ''
+        add_state['parent_selected_url'] = ''
         _reset_repo_metadata_state()
 
     def _current_add_project() -> Optional[Dict[str, object]]:
@@ -4705,6 +5114,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 prefix = "➤" if i == idx else " "
                 marker = '✔' if entry.get('login') in selected else ' '
                 body.append(f" {prefix} [{marker}] {entry.get('display') or entry.get('login')}")
+        elif step == 'parent':
+            parent_choices = add_state.get('parent_choices') or []
+            idx = max(0, min(len(parent_choices)-1, add_state.get('parent_index', 0))) if parent_choices else 0
+            body.append("Use j/k to move, Enter to select, Esc cancel")
+            if not parent_choices:
+                body.append("  (no parent tasks available)")
+            for i, choice in enumerate(parent_choices):
+                prefix = "➤" if i == idx else " "
+                body.append(f" {prefix} {choice.get('display') or choice.get('title') or '(no parent)'}")
         elif step == 'comment':
             body.append("Type an optional comment, Enter to continue, Esc cancel")
             comment = add_state.get('comment', '')
@@ -4752,9 +5170,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             body.append(f"🎯 Focus    : {focus_val}")
             body.append(f"🔁 Iteration: {iter_label}")
             if add_state.get('mode', 'issue') == 'issue':
+                parent_selected_id = (add_state.get('parent_selected_id') or '').strip()
+                parent_display = add_state.get('parent_selected_title') or ''
+                if not parent_display:
+                    parent_choices = add_state.get('parent_choices') or []
+                    if parent_choices:
+                        idx = max(0, min(len(parent_choices)-1, add_state.get('parent_index', 0)))
+                        parent_display = parent_choices[idx].get('title') or ''
+                if not parent_selected_id:
+                    parent_display = '(no parent)'
                 body.append(f"🏷️ Labels   : {', '.join(label_list) if label_list else '(none)'}")
                 body.append(f"⚡ Priority : {priority_label}")
                 body.append(f"👥 Assignees: {', '.join(assignee_display) if assignee_display else '(none)'}")
+                body.append(f"🧩 Parent   : {parent_display}")
                 body.append(f"💬 Comment  : {comment_val}")
 
         def boxed(title: str, lines: List[str], width: int = 92) -> str:
@@ -5014,19 +5442,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if edit_task_mode:
                 task_edit_state['message'] = msg
             invalidate(); return
-        field_id = row.start_field_id if field_type == 'start' else getattr(row, 'focus_field_id', '')
-        field_name = row.start_field if field_type == 'start' else (row.focus_field or 'Focus Day')
-        loop = asyncio.get_running_loop()
-        if not field_id and token:
-            try:
-                lookup_name = (field_name or '').strip() or ('Focus Day' if field_type == 'focus' else 'Start date')
-                field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, lookup_name)) or ''
-            except Exception as exc:
-                field_id = ''
-                try:
-                    logger.warning("Failed to resolve %s field id for %s: %s", field_type, row.project_title, exc)
-                except Exception:
-                    pass
+        field_id = (row.start_field_id if field_type == 'start' else getattr(row, 'focus_field_id', '')).strip()
+        field_name = (row.start_field if field_type == 'start' else (row.focus_field or 'Focus Day')) or ''
+        if token:
+            if not field_id:
+                resolved_id, resolved_name = await _resolve_project_field_id(project_id, field_type, field_name)
+                if resolved_id:
+                    field_id = resolved_id
+                    if resolved_name:
+                        field_name = resolved_name
+                    if field_type == 'start':
+                        row.start_field_id = resolved_id
+                        if resolved_name:
+                            row.start_field = resolved_name
+                    else:
+                        row.focus_field_id = resolved_id
+                        if resolved_name:
+                            row.focus_field = resolved_name
+                else:
+                    try:
+                        logger.warning("Could not resolve %s field id for %s (field '%s')", field_type, row.project_title, field_name)
+                    except Exception:
+                        pass
         payload = {
             'url': row.url,
             'project_id': project_id,
@@ -5650,6 +6087,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         except Exception:
             return []
 
+    def _parent_display(row: TaskRow) -> str:
+        title = (row.parent_title or '').strip()
+        if title:
+            return title
+        parent_url = (row.parent_url or '').strip()
+        if parent_url:
+            parts = _parse_issue_url(parent_url)
+            if parts:
+                owner, name, number = parts
+                return f"{owner}/{name}#{number}"
+            return parent_url
+        return '(no parent)'
+
     def _priority_options(row: TaskRow) -> List[Dict[str, object]]:
         try:
             data = json.loads(row.priority_options or "[]")
@@ -6054,6 +6504,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if show_assignees:
                 cols.append({'id': 'assignees', 'header': 'Assignees', 'min': assignee_min, 'dynamic': False, 'align': 'left'})
             cols.append({'id': 'title', 'header': 'Title', 'min': 20, 'dynamic': True, 'weight': 2, 'align': 'left'})
+            if show_parent_column:
+                cols.append({'id': 'parent', 'header': 'Parent', 'min': 24, 'dynamic': True, 'weight': 1, 'align': 'left'})
             cols.append({'id': 'labels', 'header': 'Labels', 'min': 16, 'dynamic': True, 'weight': 1, 'align': 'left'})
             cols.append({'id': 'project', 'header': 'Project', 'min': 12, 'dynamic': True, 'weight': 1, 'align': 'left'})
             return cols
@@ -6249,6 +6701,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 values['assignees'] = _pad_display(_assignees_text(t), widths['assignees'])
             if 'title' in column_lookup:
                 values['title'] = _pad_display(t.title, widths['title'])
+            if 'parent' in column_lookup:
+                parent_cell = _parent_display(t)
+                if not (t.parent_node_id or '').strip():
+                    parent_cell = '-' if parent_cell == '(no parent)' else parent_cell
+                values['parent'] = _pad_display(parent_cell, widths['parent'])
             labels_list = _task_labels(t)
             labels_text = ", ".join(labels_list)
             if 'labels' in column_lookup:
@@ -6332,12 +6789,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         # Timer snapshot
         now_s = task_s = proj_s = 0
         active_count = 0
+        parent_display = '(no parent)'
         try:
             active_count = len(db.active_task_urls())
         except Exception:
             active_count = 0
         if rows:
             cur = rows[current_index]
+            parent_display = _parent_display(cur)
             if cur.url:
                 snapshot = task_duration_cache.get(cur.url)
                 if snapshot is None:
@@ -6548,6 +7007,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 ('🕒', 'Now', _fmt_mmss(now_s)),
                 ('🧩', 'Task', _fmt_hm(task_s)),
                 ('📦', 'Project', _fmt_hm(proj_s)),
+                ('🧬', 'Parent', parent_display),
                 ('⚡', 'Active', str(active_count)),
             ]
             add_two_column(overview_rows)
@@ -6603,6 +7063,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             ('🕒', 'Now', _fmt_mmss(now_s)),
             ('🧩', 'Task', _fmt_hm(task_s)),
             ('📦', 'Project', _fmt_hm(proj_s)),
+            ('🧬', 'Parent', parent_display),
             ('⚡', 'Active', str(active_count)),
         ]
         render_rows(overview_rows, label_width=12)
@@ -6942,29 +7403,32 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         session_state['selected_id'] = sessions[idx].get('id')  # type: ignore[index]
         invalidate()
 
-    def open_session_editor() -> None:
+    def open_session_editor_for_task(task_url: str, task_title: str, project_title: str) -> None:
         nonlocal edit_sessions_mode, session_float, session_state, status_line, detail_mode, show_report, in_search, in_date_filter
-        rows = filtered_rows()
-        if not rows:
-            status_line = "No task selected"
-            invalidate()
-            return
-        task = rows[current_index]
-        if not task.url:
+        task_url = (task_url or '').strip()
+        if not task_url:
             status_line = "Selected task missing URL"
             invalidate()
             return
         if edit_task_mode:
             close_task_editor(None)
+        if edit_sessions_mode and session_state.get('task_url') == task_url:
+            _refresh_session_editor()
+            if session_float and session_float in floats:
+                floats.remove(session_float)
+                floats.append(session_float)
+            status_line = 'Timer sessions editor refreshed'
+            invalidate()
+            return
         edit_sessions_mode = True
         detail_mode = False
         show_report = False
         in_search = False
         in_date_filter = False
         session_state = {
-            'task_url': task.url,
-            'task_title': task.title or task.url,
-            'project_title': task.project_title or '',
+            'task_url': task_url,
+            'task_title': task_title or task_url,
+            'project_title': project_title or '',
             'cursor': 0,
             'sessions': [],
             'edit_field': None,
@@ -6980,6 +7444,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         floats.append(session_float)
         status_line = 'Timer sessions editor open'
         invalidate()
+
+    def open_session_editor() -> None:
+        nonlocal status_line
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate()
+            return
+        task = rows[current_index]
+        open_session_editor_for_task(task.url or '', task.title or (task.url or ''), task.project_title or '')
 
     def close_session_editor(message: Optional[str] = None) -> None:
         nonlocal edit_sessions_mode, session_float, session_state, status_line
@@ -7171,6 +7645,218 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     session_control = FormattedTextControl(text=lambda: build_session_editor_text())
     session_window = Window(width=96, height=24, content=session_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
+
+    def _history_page_size() -> int:
+        try:
+            from prompt_toolkit.application.current import get_app
+            total_rows = get_app().output.get_size().rows
+        except Exception:
+            total_rows = 40
+        usable = max(12, min(36, total_rows - 6))
+        return max(5, usable - 8)
+
+    def _ensure_history_visible() -> None:
+        rows = history_state.get('rows') if history_state else []
+        total = len(rows)
+        cursor = int(history_state.get('cursor', 0) or 0)
+        page_size = int(history_state.get('page_size', _history_page_size()) or _history_page_size())
+        offset = int(history_state.get('offset', 0) or 0)
+        if cursor < offset:
+            offset = cursor
+        elif cursor >= offset + page_size:
+            offset = cursor - page_size + 1
+        max_offset = max(0, total - page_size)
+        offset = max(0, min(offset, max_offset))
+        history_state['offset'] = offset  # type: ignore[index]
+        history_state['page_size'] = page_size  # type: ignore[index]
+
+    def _reload_history_rows(preserve_cursor: bool = False) -> None:
+        nonlocal history_state
+        prev_cursor = int(history_state.get('cursor', 0) or 0)
+        try:
+            limit = int(history_state.get('limit', 200) or 200)
+        except Exception:
+            limit = 200
+        try:
+            rows = db.completed_task_history(limit=limit, done_only=True)
+        except Exception as exc:
+            history_state['rows'] = []
+            history_state['cursor'] = 0
+            history_state['message'] = f"History load failed: {exc}"
+            invalidate()
+            return
+        history_state['rows'] = rows
+        history_state.setdefault('offset', 0)
+        history_state.setdefault('page_size', _history_page_size())
+        if rows:
+            if preserve_cursor and 0 <= prev_cursor < len(rows):
+                history_state['cursor'] = prev_cursor
+            else:
+                history_state['cursor'] = 0
+        else:
+            history_state['cursor'] = 0
+        _ensure_history_visible()
+        history_state['message'] = ''
+        invalidate()
+
+    def _current_history_entry() -> Optional[Dict[str, object]]:
+        rows = history_state.get('rows') if history_state else []
+        if not rows:
+            return None
+        cursor = int(history_state.get('cursor', 0) or 0)
+        cursor = max(0, min(cursor, len(rows)-1))
+        return rows[cursor]
+
+    def _move_history_cursor(delta: int) -> None:
+        rows = history_state.get('rows') if history_state else []
+        total = len(rows)
+        if not total:
+            history_state['cursor'] = 0  # type: ignore[index]
+            history_state['offset'] = 0  # type: ignore[index]
+            invalidate()
+            return
+        cursor = int(history_state.get('cursor', 0) or 0)
+        cursor = (cursor + delta) % total
+        history_state['cursor'] = cursor  # type: ignore[index]
+        _ensure_history_visible()
+        invalidate()
+
+    def open_history_window() -> None:
+        nonlocal history_mode, history_state, history_float, detail_mode, show_report, in_search, in_date_filter, status_line
+        if history_mode:
+            _reload_history_rows(preserve_cursor=True)
+            status_line = 'History refreshed'
+            return
+        if edit_task_mode:
+            close_task_editor(None)
+        if edit_sessions_mode:
+            close_session_editor(None)
+        if add_mode:
+            close_add_mode(None)
+        detail_mode = False
+        show_report = False
+        in_search = False
+        in_date_filter = False
+        history_mode = True
+        page_size = _history_page_size()
+        history_state = {
+            'rows': [],
+            'cursor': 0,
+            'limit': 200,
+            'page_size': page_size,
+            'offset': 0,
+            'message': '',
+        }
+        _reload_history_rows(preserve_cursor=False)
+        if history_float and history_float in floats:
+            floats.remove(history_float)
+        if floats:
+            floats.clear()
+        history_float = Float(content=history_window, top=2, left=4)
+        floats.append(history_float)
+        status_line = 'Completed tasks history'
+        invalidate()
+
+    def close_history_window(message: Optional[str] = None) -> None:
+        nonlocal history_mode, history_float, history_state, status_line
+        if history_float and history_float in floats:
+            floats.remove(history_float)
+        history_float = None
+        history_mode = False
+        history_state = {}
+        if message is not None:
+            status_line = message
+        invalidate()
+
+    def _open_history_entry_in_editor() -> None:
+        entry = _current_history_entry()
+        if not entry:
+            history_state['message'] = 'No task selected'  # type: ignore[index]
+            invalidate()
+            return
+        task_url = str(entry.get('task_url') or '').strip()
+        if not task_url:
+            history_state['message'] = 'Selected entry missing task URL'  # type: ignore[index]
+            invalidate()
+            return
+        task_title = str(entry.get('title') or '').strip() or task_url
+        project_title = str(entry.get('project_title') or '').strip()
+        close_history_window(None)
+        open_session_editor_for_task(task_url, task_title, project_title)
+
+    def build_history_text() -> List[Tuple[str, str]]:
+        if not history_mode:
+            return []
+        rows = history_state.get('rows') or []
+        cursor = int(history_state.get('cursor', 0) or 0)
+        page_size = int(history_state.get('page_size', _history_page_size()) or _history_page_size())
+        offset = int(history_state.get('offset', 0) or 0)
+        total = len(rows)
+        if total:
+            max_offset = max(0, total - page_size)
+            offset = max(0, min(offset, max_offset))
+            history_state['offset'] = offset  # type: ignore[index]
+            history_state['page_size'] = page_size  # type: ignore[index]
+        else:
+            offset = 0
+        message = history_state.get('message', '')
+        total_secs = sum(int(entry.get('total_seconds') or 0) for entry in rows)
+        lines: List[str] = []
+        lines.append("Completed Tasks - Timer History")
+        lines.append(f"  Tasks: {len(rows)}   Total logged: {_fmt_hms_full(total_secs)}")
+        lines.append("")
+        if not rows:
+            lines.append("  No completed tasks with recorded sessions.")
+        else:
+            end_index = min(total, offset + page_size)
+            lines.append(f"  Showing {offset+1}-{end_index} of {total}")
+            lines.append("")
+            if offset > 0:
+                lines.append("  ↑ more above")
+            for idx_abs in range(offset, end_index):
+                entry = rows[idx_abs]
+                marker = '>' if idx_abs == cursor else ' '
+                title = (entry.get('title') or '').strip() or (entry.get('task_url') or '')
+                project = (entry.get('project_title') or '').strip()
+                total_display = _fmt_hms_full(int(entry.get('total_seconds') or 0))
+                done_flag = '✅' if entry.get('is_done') else '•'
+                dt_raw = entry.get('last_end')
+                dt_disp = '-'
+                parsed = _parse_session_dt(dt_raw) if isinstance(dt_raw, str) else None
+                if parsed:
+                    dt_disp = parsed.strftime('%Y-%m-%d %H:%M')
+                elif isinstance(dt_raw, str) and dt_raw:
+                    dt_disp = dt_raw
+                lines.append(f"{marker} {done_flag} {dt_disp:<16}  {total_display:>10}  {title}")
+                if project:
+                    lines.append(f"    {project}")
+            if end_index < total:
+                lines.append("  ↓ more below")
+        lines.append("")
+        lines.append("Commands: Enter/E edit sessions   r refresh   Esc/q close")
+        if message:
+            lines.append("")
+            lines.append(str(message))
+        block = "\n".join(lines)
+        if '\n' in block:
+            head, rest = block.split('\n', 1)
+            return [("bold", head), ("", "\n" + rest)]
+        return [("bold", block)]
+
+    history_control = FormattedTextControl(text=lambda: build_history_text())
+    history_window = Window(width=110, height=28, content=history_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
+
+    def _invalidate_summary_cache() -> None:
+        summary_cache['project'].update({'ts': 0.0, 'data': {}, 'tops': []})
+        summary_cache['label'].update({'ts': 0.0, 'data': {}, 'tops': []})
+
+    def _reset_timer_caches() -> None:
+        nonlocal task_duration_cache
+        task_duration_cache = {}
+        _invalidate_summary_cache()
+        if show_report:
+            report_control.text = lambda: build_report_text()
+            invalidate()
 
     def build_task_edit_text() -> List[Tuple[str, str]]:
         if not edit_task_mode:
@@ -7578,6 +8264,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         project_suffix = f" ({' · '.join(project_bits)})" if project_bits else ""
         project_display = f"{_clean(t.project_title)}{project_suffix}"
         add_line("📂", "Project", project_display)
+        parent_display = _parent_display(t)
+        add_line("🧩", "Parent", parent_display)
         task_title = (t.title or '').strip() or '(untitled task)'
         add_line("📝", "Title", task_title)
         add_line("📦", "Repository", t.repo or '—')
@@ -8078,7 +8766,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_task_edit_labels = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-labels')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_overrun_prompt = Condition(lambda: overrun_prompt is not None)
-    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
+    is_history_mode = Condition(lambda: history_mode)
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt or history_mode))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -8113,15 +8802,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         def _(event, index=idx):
             apply_theme(index)
 
-    def _invalidate_summary_cache() -> None:
-        summary_cache['project'].update({'ts': 0.0, 'data': {}, 'tops': []})
-        summary_cache['label'].update({'ts': 0.0, 'data': {}, 'tops': []})
-
-    def _reset_timer_caches() -> None:
-        nonlocal task_duration_cache
-        task_duration_cache = {}
-        _invalidate_summary_cache()
-
     async def _sync_pending_date(action: PendingAction, loop: asyncio.AbstractEventLoop) -> bool:
         nonlocal status_line, all_rows
         payload = action.payload or {}
@@ -8137,10 +8817,71 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = f"Skipped queued {field_name.lower()} update (missing metadata)"
             invalidate()
             return True
+        async def _ensure_field_id(current_id: str, current_name: str) -> Tuple[str, str]:
+            resolved_id = current_id.strip()
+            resolved_name = current_name
+            if token and project_id and not resolved_id:
+                guessed_type = field_type or ('focus' if 'focus' in current_name.lower() else 'start')
+                new_id, new_name = await _resolve_project_field_id(project_id, guessed_type, current_name)
+                if new_id:
+                    resolved_id = new_id
+                    if new_name:
+                        resolved_name = new_name
+                    payload['field_id'] = resolved_id
+                    payload['field_name'] = resolved_name
+                    try:
+                        db.update_pending_action(action.id, payload)
+                    except Exception:
+                        pass
+            return resolved_id, resolved_name
+
+        field_id, field_name = await _ensure_field_id(field_id, field_name)
         if not field_id:
-            try:
-                lookup = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, field_name))
-            except Exception as exc:
+            status_line = f"{field_name} sync failed: field id unavailable"
+            invalidate()
+            return False
+
+        async def _apply_date(field_id_to_use: str) -> None:
+            await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, field_id_to_use, value))
+
+        try:
+            await _apply_date(field_id)
+        except Exception as exc:
+            message = str(exc)
+            needs_refresh = 'field does not exist' in message.lower() or 'could not resolve' in message.lower()
+            if token and needs_refresh:
+                project_field_cache.pop(project_id, None)
+                guessed_type = field_type or ('focus' if 'focus' in field_name.lower() else 'start')
+                new_id, new_name = await _resolve_project_field_id(project_id, guessed_type, field_name)
+                if new_id and new_id != field_id:
+                    field_id = new_id
+                    if new_name:
+                        field_name = new_name
+                    payload['field_id'] = field_id
+                    payload['field_name'] = field_name
+                    try:
+                        db.update_pending_action(action.id, payload)
+                    except Exception:
+                        pass
+                    try:
+                        await _apply_date(field_id)
+                    except Exception as exc_retry:
+                        status_line = f"{field_name} sync failed: {exc_retry}"
+                        try:
+                            logger.warning("Queued date update failed (%s): %s", field_name, exc_retry)
+                        except Exception:
+                            pass
+                        invalidate()
+                        return False
+                else:
+                    status_line = f"{field_name} sync failed: {exc}"
+                    try:
+                        logger.warning("Queued date update failed (%s): %s", field_name, exc)
+                    except Exception:
+                        pass
+                    invalidate()
+                    return False
+            else:
                 status_line = f"{field_name} sync failed: {exc}"
                 try:
                     logger.warning("Queued date update failed (%s): %s", field_name, exc)
@@ -8148,21 +8889,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     pass
                 invalidate()
                 return False
-            field_id = lookup or ''
-            if not field_id:
-                status_line = f"{field_name} sync failed: field id unavailable"
-                invalidate()
-                return False
-        try:
-            await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, field_id, value))
-        except Exception as exc:
-            status_line = f"{field_name} sync failed: {exc}"
-            try:
-                logger.warning("Queued date update failed (%s): %s", field_name, exc)
-            except Exception:
-                pass
-            invalidate()
-            return False
         db.remove_pending_action(action.id)
         if field_type == 'start':
             db.update_start_date(url, value, field_id)
@@ -8188,6 +8914,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         mode = (payload.get('mode') or 'draft').strip().lower()
         repo_source = (payload.get('repo_source') or payload.get('repo_manual') or '').strip()
         repo_id = (payload.get('repo_id') or '').strip()
+        parent_node_id = (payload.get('parent_node_id') or '').strip()
+        parent_url = (payload.get('parent_url') or '').strip()
+        parent_title = (payload.get('parent_title') or '').strip()
         assignees = [str(a).strip() for a in payload.get('assignees', []) if str(a).strip()]
         status_line = f"Syncing queued task: {title}"
         invalidate()
@@ -8220,10 +8949,26 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if not issue_id:
                     raise RuntimeError('Issue creation did not return id')
                 item_id = await loop.run_in_executor(None, lambda: add_project_item(token, project_id, issue_id))
+                if parent_node_id and issue_id:
+                    try:
+                        await loop.run_in_executor(None, lambda: add_issue_parent(token, parent_node_id, issue_id))
+                    except Exception as exc:
+                        try:
+                            logger.warning("Unable to link parent for %s: %s", issue_url or title, exc)
+                        except Exception:
+                            pass
             else:
                 item_id = await loop.run_in_executor(None, lambda: create_project_draft(token, project_id, title))
                 if not item_id:
                     raise RuntimeError('GitHub did not return item id')
+            if mode == 'issue' and parent_node_id and issue_id:
+                try:
+                    await loop.run_in_executor(None, lambda: add_issue_parent(token, parent_node_id, issue_id))
+                except Exception as exc:
+                    try:
+                        logger.warning("Unable to link parent for %s: %s", issue_url or title_clean, exc)
+                    except Exception:
+                        pass
             start_value = payload.get('start_value') or dt.date.today().isoformat()
             start_field_id = (payload.get('start_field_id') or '').strip()
             if start_field_id:
@@ -8564,6 +9309,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         priority_options: List[Dict[str, object]],
         assignees: List[str],
         comment: str,
+        parent_node_id: Optional[str] = None,
+        parent_url: Optional[str] = None,
+        parent_title: Optional[str] = None,
     ):
         nonlocal status_line, all_rows, current_index
         title_clean = title.strip()
@@ -8603,6 +9351,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if status_options_clean:
             project_choice['status_options'] = status_options_clean
         status_option_id, status_label = _select_status_option(status_options_clean, 'Todo')
+        parent_node_id_val = (parent_node_id or '').strip()
+        parent_url_val = (parent_url or '').strip()
+        parent_title_val = (parent_title or '').strip()
 
         def _match_priority_option(label: str, options: List[Dict[str, object]]) -> str:
             if not label:
@@ -8624,6 +9375,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         priority_option_id = _match_priority_option(priority_label, priority_opts)
         placeholder_url = f"{PENDING_URL_PREFIX}{uuid.uuid4().hex}"
+        issue_id: str = ""
+        issue_url = ""
         start_date_val = start_val.strip() or dt.date.today().isoformat()
         end_date_val = end_val.strip()
         focus_date_val = focus_val.strip()
@@ -8672,6 +9425,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'status_option_id': status_option_id,
             'status_label': status_label,
             'status_options': status_options_clean,
+            'parent_node_id': parent_node_id_val,
+            'parent_url': parent_url_val,
+            'parent_title': parent_title_val,
             'placeholder_url': placeholder_url,
         }
         try:
@@ -8730,6 +9486,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             assignee_field_id=project_choice.get('assignee_field_id') or '',
             assignee_user_ids=assignee_user_ids_json,
             assignee_logins=assignee_logins_json,
+            parent_url=parent_url_val,
+            parent_title=parent_title_val,
+            parent_node_id=parent_node_id_val,
             content_node_id='',
         )
         try:
@@ -8755,6 +9514,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('q')
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
+        if history_mode:
+            close_history_window('History closed')
+            return
         if edit_task_mode:
             if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select'):
                 _cancel_task_edit('Edit cancelled')
@@ -8823,6 +9585,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('enter')
     def _(event):
         nonlocal detail_mode, show_report
+        if history_mode:
+            _open_history_entry_in_editor()
+            return
         if edit_task_mode:
             mode = task_edit_state.get('mode')
             fields = task_edit_state.get('fields') or []
@@ -9048,6 +9813,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         _save_state()
         invalidate()
 
+    @kb.add(';', filter=is_normal)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        nonlocal show_parent_column, status_line
+        show_parent_column = not show_parent_column
+        status_line = f"Parent column {'shown' if show_parent_column else 'hidden'}"
+        _save_state()
+        invalidate()
+
     @kb.add('t', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
@@ -9171,6 +9946,31 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_index = 0
         status_line = 'Including created tasks' if include_created else 'Hiding created-only tasks'
         invalidate()
+
+    @kb.add('H', filter=is_normal)
+    def _(event):
+        open_history_window()
+
+    @kb.add('j', filter=is_history_mode)
+    @kb.add('down', filter=is_history_mode)
+    def _(event):
+        _move_history_cursor(1)
+
+    @kb.add('k', filter=is_history_mode)
+    @kb.add('up', filter=is_history_mode)
+    def _(event):
+        _move_history_cursor(-1)
+
+    @kb.add('r', filter=is_history_mode)
+    def _(event):
+        nonlocal status_line
+        _reload_history_rows(preserve_cursor=True)
+        status_line = 'History refreshed'
+
+    @kb.add('E', filter=is_history_mode)
+    @kb.add('e', filter=is_history_mode)
+    def _(event):
+        _open_history_entry_in_editor()
 
     @kb.add('E', filter=is_normal)
     def _(event):
@@ -9434,6 +10234,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'assignees_selected': set(),
             'comment': '',
             'comment_cursor': 0,
+            'parent_choices': [],
+            'parent_index': 0,
+            'parent_selected_id': '',
+            'parent_selected_title': '',
+            'parent_selected_url': '',
             'loading_repo_metadata': False,
             'metadata_error': '',
             'repo_metadata_source': '',
@@ -9620,8 +10425,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             idx = (add_state.get('assignee_index', 0) + delta) % len(choices)
             add_state['assignee_index'] = idx
 
-    @kb.add('j', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee')))
-    @kb.add('down', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee')))
+    @kb.add('j', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee','parent')))
+    @kb.add('down', filter=Condition(lambda: add_mode and add_state.get('step') in ('mode','project','repo','iteration','labels','priority','assignee','parent')))
     def _(event):
         _cycle_add(1)
         invalidate()
@@ -9813,6 +10618,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_state['priority_options'] = (project.get('priority_options') if project else []) or []
             add_state['priority_label'] = ''
             add_state['labels_selected'] = set()
+            add_state['parent_choices'] = build_parent_choices_for_project(project) if project else []
+            add_state['parent_index'] = 0
+            add_state['parent_selected_id'] = ''
+            add_state['parent_selected_title'] = ''
+            add_state['parent_selected_url'] = ''
             add_state['assignees_selected'] = set()
             add_state['comment'] = add_state.get('comment', '')
             if add_state.get('mode', 'issue') == 'issue':
@@ -9954,6 +10764,31 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 status_line = 'Select at least one assignee'
                 invalidate(); return
             add_state['assignees_selected'] = selected
+            if add_state.get('mode', 'issue') == 'issue':
+                parent_choices = add_state.get('parent_choices') or []
+                if not parent_choices:
+                    parent_choices = [{'display': '(no parent)', 'title': '(no parent)', 'url': '', 'node_id': ''}]
+                    add_state['parent_choices'] = parent_choices
+                add_state['parent_index'] = max(0, min(add_state.get('parent_index', 0), len(parent_choices)-1))
+                add_state['parent_selected_id'] = add_state.get('parent_selected_id', '')
+                add_state['parent_selected_title'] = add_state.get('parent_selected_title', '')
+                add_state['parent_selected_url'] = add_state.get('parent_selected_url', '')
+                add_state['step'] = 'parent'
+                status_line = 'Select parent task (Enter to confirm)'
+            else:
+                add_state['step'] = 'comment'
+                add_state['comment_cursor'] = len(add_state.get('comment', ''))
+                status_line = 'Add optional comment'
+        elif step == 'parent':
+            parent_choices = add_state.get('parent_choices') or []
+            if not parent_choices:
+                parent_choices = [{'display': '(no parent)', 'title': '(no parent)', 'url': '', 'node_id': ''}]
+                add_state['parent_choices'] = parent_choices
+            idx = max(0, min(len(parent_choices)-1, add_state.get('parent_index', 0)))
+            selection = parent_choices[idx] if parent_choices else {'node_id': '', 'title': '', 'url': ''}
+            add_state['parent_selected_id'] = selection.get('node_id', '')
+            add_state['parent_selected_title'] = selection.get('title', '')
+            add_state['parent_selected_url'] = selection.get('url', '')
             add_state['step'] = 'comment'
             add_state['comment_cursor'] = len(add_state.get('comment', ''))
             status_line = 'Add optional comment'
@@ -10014,6 +10849,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             comment_val = add_state.get('comment', '').strip()
             mode_val = add_state.get('mode', 'issue')
             priority_options = (add_state.get('priority_options') or [])
+            parent_selected_id = (add_state.get('parent_selected_id') or '').strip()
+            parent_selected_title = add_state.get('parent_selected_title') or ''
+            parent_selected_url = add_state.get('parent_selected_url') or ''
+            parent_choices = add_state.get('parent_choices') or []
+            if parent_choices and (not parent_selected_title and mode_val == 'issue'):
+                idx = max(0, min(len(parent_choices)-1, add_state.get('parent_index', 0)))
+                choice = parent_choices[idx]
+                parent_selected_title = choice.get('title') or parent_selected_title
+                parent_selected_url = choice.get('url') or parent_selected_url
+                parent_selected_id = (choice.get('node_id') or parent_selected_id or '').strip()
+            parent_title_to_store = parent_selected_title if parent_selected_id else ''
+            parent_url_to_store = parent_selected_url if parent_selected_id else ''
+            parent_display = parent_selected_title or '(no parent)'
             close_add_mode('Queueing item…')
             asyncio.create_task(create_task_async(
                 project,
@@ -10031,6 +10879,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 priority_options,
                 assignees_ordered,
                 comment_val,
+                parent_selected_id,
+                parent_url_to_store,
+                parent_title_to_store,
             ))
             return
         invalidate()
@@ -10065,6 +10916,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
         if overrun_prompt:
             close_overrun_prompt(None)
+            return
+        if history_mode:
+            close_history_window(None)
             return
         if add_mode and add_state.get('calendar_active'):
             _cancel_add_calendar('Calendar cancelled')
@@ -10230,10 +11084,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             payload['overall'] = overall
             proj_totals_window = db.aggregate_project_totals(since_days=since_days)
             payload['projects_total_window'] = proj_totals_window
+            label_totals_window = db.aggregate_label_totals(since_days=since_days)
+            payload['labels_total_window'] = label_totals_window
             projects_periods: Dict[str, Dict[str, Dict[str,int]]] = {}
+            labels_periods: Dict[str, Dict[str, Dict[str,int]]] = {}
             for g in gran_opts:
                 projects_periods[g] = db.aggregate_project_period_totals(g, since_days=since_days)
+                labels_periods[g] = db.aggregate_label_period_totals(g, since_days=since_days)
             payload['projects_periods'] = projects_periods
+            payload['labels_periods'] = labels_periods
             with open(out_path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, indent=2)
             status_line = f"Exported {out_path}"
@@ -10373,7 +11232,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             c.drawString(20*mm, y, 'Per Task')
             y -= 6*mm
             max_rows_task = max(10, int((y - 20*mm)/9) - 2)
-            table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]])
+            y = table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]]) - 4
+            if label_rows_all:
+                c.setStrokeColor(colors.HexColor('#dddddd'))
+                c.line(20*mm, y, 190*mm, y)
+                y -= 6*mm
+                cols_label = [("Label", 90*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
+                c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+                c.drawString(20*mm, y, 'Per Label')
+                y -= 6*mm
+                max_rows_label = max(10, int((y - 20*mm)/9) - 2)
+                table(c, 20*mm, y, cols_label, [r[2] for r in label_rows_all[:max_rows_label]])
             c.setFont('Helvetica', 8); c.setFillColor(colors.HexColor('#888888'))
             c.drawRightString(200*mm, 12*mm, 'Times are H:MM over last D=1/W=7/M=30/Y=365 days. Top rows shown.')
             c.showPage(); c.save()
@@ -10457,7 +11326,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  N                   Hide no-date",
                 "  F                   Date ≤ YYYY-MM-DD",
                 "  t / a               Today / All",
-                "  , / . / '           Toggle Start / End / Assignees columns",
+                "  , / . / ' / ;       Toggle Start / End / Assignees / Parent columns",
                 "  C                   Show created (no assignee)",
                 "  z                   Toggle Zen mode",
                 "  V                   Toggle iteration/date view",
@@ -10471,8 +11340,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "  O                   Edit task fields",
                 "  E                   Edit work sessions",
                 "",
+                "➕ Add Mode",
+                "  Enter               Advance to next step",
+                "  Space               Toggle labels / priority / assignees",
+                "  Parent step         Select parent or '(no parent)'",
+                "  Esc                 Cancel add flow",
+                "",
                 "⏱ Timers & Reports",
                 "  W                   Toggle work timer",
+                "  H                   Completed tasks history",
                 "  R                   Open timer report",
                 "  d / w / m (report)  Day / Week / Month view",
                 "  X                   Export JSON report",
@@ -10758,10 +11634,15 @@ def main() -> None:
         task_totals_window = db.aggregate_task_totals(since_days=since_days)
         payload["tasks_total_window"] = task_totals_window
         payload["task_titles"] = db.task_titles()
+        label_totals_window = db.aggregate_label_totals(since_days=since_days)
+        payload["labels_total_window"] = label_totals_window
         projects_periods: Dict[str, Dict[str, Dict[str,int]]] = {}
+        labels_periods: Dict[str, Dict[str, Dict[str,int]]] = {}
         for g in gran_opts:
             projects_periods[g] = db.aggregate_project_period_totals(g, since_days=since_days)
+            labels_periods[g] = db.aggregate_label_period_totals(g, since_days=since_days)
         payload["projects_periods"] = projects_periods
+        payload["labels_periods"] = labels_periods
         # Optional: single project filter summary
         if proj:
             proj_section: Dict[str, Dict[str,int]] = {}
@@ -10898,6 +11779,7 @@ def main() -> None:
         since_map = {'D':1, 'W':7, 'M':30, 'Y':365}
         proj_totals = {k: db.aggregate_project_totals(v) for k,v in since_map.items()}
         task_totals = {k: db.aggregate_task_totals(v) for k,v in since_map.items()}
+        label_totals = {k: db.aggregate_label_totals(v) for k,v in since_map.items()}
         task_titles = payload.get('task_titles', {})
 
         # Build project rows sorted by yearly desc
@@ -10926,6 +11808,20 @@ def main() -> None:
             y = task_totals['Y'].get(url,0)
             task_rows_all.append((name, y, [name and (name[:48]+('…' if len(name)>48 else '')) or '-', fmt_hm(d), fmt_hm(w), fmt_hm(m), fmt_hm(y)]))
         task_rows_all.sort(key=lambda t: t[1], reverse=True)
+
+        # Build label rows sorted by yearly desc
+        label_names = set()
+        for d in label_totals.values():
+            label_names.update(d.keys())
+        label_rows_all = []
+        for label in label_names:
+            d = label_totals['D'].get(label, 0)
+            w = label_totals['W'].get(label, 0)
+            m = label_totals['M'].get(label, 0)
+            y = label_totals['Y'].get(label, 0)
+            safe_label = label or '(no label)'
+            label_rows_all.append((safe_label, y, [_truncate(safe_label, 48), fmt_hm(d), fmt_hm(w), fmt_hm(m), fmt_hm(y)]))
+        label_rows_all.sort(key=lambda t: t[1], reverse=True)
 
         # Compose page
         c = canvas.Canvas(args.export_pdf, pagesize=A4)
@@ -10973,7 +11869,17 @@ def main() -> None:
         c.drawString(20*mm, y, 'Per Task')
         y -= 6*mm
         max_rows_task = max(10, int((y - 20*mm)/9) - 2)
-        table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]])
+        y = table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]]) - 4
+        if label_rows_all:
+            c.setStrokeColor(colors.HexColor('#dddddd'))
+            c.line(20*mm, y, 190*mm, y)
+            y -= 6*mm
+            cols_label = [("Label", 90*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
+            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+            c.drawString(20*mm, y, 'Per Label')
+            y -= 6*mm
+            max_rows_label = max(10, int((y - 20*mm)/9) - 2)
+            table(c, 20*mm, y, cols_label, [r[2] for r in label_rows_all[:max_rows_label]])
 
         # Footer note
         c.setFont('Helvetica', 8); c.setFillColor(colors.HexColor('#888888'))
