@@ -836,6 +836,7 @@ def _load_theme_presets(theme_dir: Path) -> List[ThemePreset]:
 
 TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
 USER_ID_CACHE: Dict[str, str] = {}
+ISSUE_PARENT_CACHE: Dict[str, List[Dict[str, str]]] = {}
 STATUS_OPTION_CACHE: Dict[str, List[Dict[str, object]]] = {}
 PRIORITY_FIELD_CACHE: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
 PEOPLE_FIELD_CACHE: Dict[str, str] = {}
@@ -1521,6 +1522,25 @@ class TaskDB:
         start2 = max(start, since)
         return start2, end, True
 
+    def _label_names_from_json(self, labels_json: Optional[str]) -> List[str]:
+        """Decode stored label metadata into a simple list of label names."""
+        try:
+            data = json.loads(labels_json or "[]")
+        except Exception:
+            return []
+        names: List[str] = []
+        if isinstance(data, list):
+            for entry in data:
+                if isinstance(entry, str):
+                    name = entry.strip()
+                    if name:
+                        names.append(name)
+                elif isinstance(entry, dict):
+                    name = str(entry.get('name') or '').strip()
+                    if name:
+                        names.append(name)
+        return names
+
     def _load_sessions(self, project_title: Optional[str] = None, task_url: Optional[str] = None) -> List[Tuple[str, Optional[str], Optional[str]]]:
         # Returns list of (project_title, started_at, ended_at)
         cur = self.conn.cursor()
@@ -1583,14 +1603,18 @@ class TaskDB:
                                project_title: Optional[str] = None,
                                task_url: Optional[str] = None) -> Dict[str, int]:
         cur = self.conn.cursor()
-        query = "SELECT task_url, project_title, labels, started_at, ended_at FROM work_sessions"
+        query = (
+            "SELECT ws.task_url, ws.project_title, ws.labels, ws.started_at, ws.ended_at, t.labels "
+            "FROM work_sessions ws "
+            "LEFT JOIN tasks t ON t.url = ws.task_url"
+        )
         params: List[object] = []
         conditions: List[str] = []
         if project_title:
-            conditions.append("project_title=?")
+            conditions.append("ws.project_title=?")
             params.append(project_title)
         if task_url:
-            conditions.append("task_url=?")
+            conditions.append("ws.task_url=?")
             params.append(task_url)
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
@@ -1599,7 +1623,7 @@ class TaskDB:
         now = dt.datetime.now(dt.timezone.utc).astimezone()
         since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
         out: Dict[str, int] = {}
-        for _, _, labels_json, st_s, en_s in rows:
+        for _, _, labels_json, st_s, en_s, task_labels_json in rows:
             st = self._parse_iso(st_s)
             en = self._parse_iso(en_s) if en_s else None
             if not st:
@@ -1610,11 +1634,9 @@ class TaskDB:
             if not keep or st >= en:
                 continue
             duration = int((en - st).total_seconds())
-            try:
-                data = json.loads(labels_json or "[]")
-                names = [str(x) for x in data if isinstance(x, str) and x]
-            except Exception:
-                names = []
+            names = self._label_names_from_json(labels_json)
+            if not names:
+                names = self._label_names_from_json(task_labels_json)
             if not names:
                 names = ['(no label)']
             for name in set(names):
@@ -1651,12 +1673,16 @@ class TaskDB:
 
     def aggregate_label_period_totals(self, granularity: str, since_days: Optional[int] = None) -> Dict[str, Dict[str, int]]:
         cur = self.conn.cursor()
-        cur.execute("SELECT labels, started_at, ended_at FROM work_sessions")
+        cur.execute(
+            "SELECT ws.labels, ws.started_at, ws.ended_at, t.labels "
+            "FROM work_sessions ws "
+            "LEFT JOIN tasks t ON t.url = ws.task_url"
+        )
         rows = cur.fetchall()
         now = dt.datetime.now(dt.timezone.utc).astimezone()
         since_dt = (now - dt.timedelta(days=since_days)) if since_days else None
         out: Dict[str, Dict[str, int]] = {}
-        for labels_json, st_s, en_s in rows:
+        for labels_json, st_s, en_s, task_labels_json in rows:
             st = self._parse_iso(st_s)
             en = self._parse_iso(en_s) if en_s else None
             if not st:
@@ -1666,11 +1692,9 @@ class TaskDB:
             st, en, keep = self._clip_range(st, en, since_dt)
             if not keep or st >= en:
                 continue
-            try:
-                labels_data = json.loads(labels_json or "[]")
-                label_names = [str(x) for x in labels_data if isinstance(x, str) and x]
-            except Exception:
-                label_names = []
+            label_names = self._label_names_from_json(labels_json)
+            if not label_names:
+                label_names = self._label_names_from_json(task_labels_json)
             if not label_names:
                 label_names = ['(no label)']
             cur_dt = st
@@ -2950,6 +2974,70 @@ def get_user_node_id(token: str, login: str) -> str:
     return user_id
 
 
+def fetch_issue_parents_rest(token: str, issue_url: str) -> List[Dict[str, str]]:
+    cache_key = (issue_url or '').strip().lower()
+    if not token or not issue_url:
+        return []
+    cached = ISSUE_PARENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    parts = _parse_issue_url(issue_url)
+    if not parts:
+        ISSUE_PARENT_CACHE[cache_key] = []
+        return []
+    owner, name, number = parts
+    api_url = f"https://api.github.com/repos/{owner}/{name}/issues/{number}/tracked_in_issues"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+    except Exception:
+        ISSUE_PARENT_CACHE[cache_key] = []
+        return []
+    if resp.status_code != 200:
+        ISSUE_PARENT_CACHE[cache_key] = []
+        return []
+    try:
+        data = resp.json() or []
+    except Exception:
+        ISSUE_PARENT_CACHE[cache_key] = []
+        return []
+    parents: List[Dict[str, str]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        issue = entry.get('issue')
+        if not isinstance(issue, dict):
+            issue = entry
+        url = (issue.get('html_url') or issue.get('url') or '').strip()
+        title = (issue.get('title') or '').strip()
+        repo_full = ''
+        repo_info = issue.get('repository')
+        if isinstance(repo_info, dict):
+            repo_full = (repo_info.get('full_name') or repo_info.get('nameWithOwner') or '').strip()
+        if not repo_full and isinstance(entry.get('repository'), dict):
+            repo_full = (entry['repository'].get('full_name') or entry['repository'].get('nameWithOwner') or '').strip()
+        number_val = issue.get('number')
+        display = ''
+        if repo_full and number_val is not None:
+            display = f"{repo_full}#{number_val} {title}".strip()
+        elif number_val is not None:
+            display = f"#{number_val} {title}".strip()
+        else:
+            display = title or url
+        parents.append({
+            'url': url,
+            'title': title,
+            'repo': repo_full,
+            'number': str(number_val) if number_val is not None else '',
+            'display': display,
+        })
+    ISSUE_PARENT_CACHE[cache_key] = parents
+    return parents
+
+
 def create_issue(token: str, repository_id: str, title: str, body: str, assignee_ids: List[str]) -> Dict[str, str]:
     session = _session(token)
     variables = {
@@ -3472,6 +3560,28 @@ def fetch_tasks_github(
                             parent_title = ", ".join(parent_titles_accum[:3]) + ", …"
                         else:
                             parent_title = ", ".join(parent_titles_accum)
+                    elif token and url:
+                        rest_parents = fetch_issue_parents_rest(token, url)
+                        for parent_entry in rest_parents:
+                            display = parent_entry.get('display')
+                            if not display:
+                                repo_full = parent_entry.get('repo', '')
+                                number_str = parent_entry.get('number', '')
+                                title_raw = parent_entry.get('title', '')
+                                if repo_full and number_str:
+                                    display = f"{repo_full}#{number_str} {title_raw}".strip()
+                                elif number_str:
+                                    display = f"#{number_str} {title_raw}".strip()
+                                else:
+                                    display = title_raw or parent_entry.get('url', '')
+                            display = (display or '').strip()
+                            if display and display not in parent_titles_seen:
+                                parent_titles_accum.append(display)
+                                parent_titles_seen.add(display)
+                        if parent_titles_accum:
+                            parent_title = ", ".join(parent_titles_accum[:3]) + (", …" if len(parent_titles_accum) > 3 else "")
+                            if not parent_url and rest_parents:
+                                parent_url = (rest_parents[0].get('url') or '').strip()
 
                 label_names: List[str] = []
                 if ctype in ("Issue", "PullRequest"):
@@ -11182,6 +11292,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             since_map = {'D':1, 'W':7, 'M':30, 'Y':365}
             proj_totals = {k: db.aggregate_project_totals(v) for k,v in since_map.items()}
             task_totals = {k: db.aggregate_task_totals(v) for k,v in since_map.items()}
+            label_totals = {k: db.aggregate_label_totals(v) for k,v in since_map.items()}
             task_titles = db.task_titles()
             proj_names = set().union(*[set(d.keys()) for d in proj_totals.values()])
             proj_rows_all = []
@@ -11196,6 +11307,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 d = task_totals['D'].get(url,0); wv = task_totals['W'].get(url,0); m = task_totals['M'].get(url,0); yv = task_totals['Y'].get(url,0)
                 task_rows_all.append((nm, yv, [nm[:48] + ('…' if len(nm)>48 else ''), fmt_hm(d), fmt_hm(wv), fmt_hm(m), fmt_hm(yv)]))
             task_rows_all.sort(key=lambda t: t[1], reverse=True)
+            label_names = set().union(*[set(d.keys()) for d in label_totals.values()])
+            label_rows_all = []
+            for label in label_names:
+                d = label_totals['D'].get(label, 0)
+                wv = label_totals['W'].get(label, 0)
+                m = label_totals['M'].get(label, 0)
+                yv = label_totals['Y'].get(label, 0)
+                safe_label = label or '(no label)'
+                label_rows_all.append((safe_label, yv, [_truncate(safe_label, 48), fmt_hm(d), fmt_hm(wv), fmt_hm(m), fmt_hm(yv)]))
+            label_rows_all.sort(key=lambda t: t[1], reverse=True)
             c = canvas.Canvas(out_path, pagesize=A4)
             draw_header(c)
             # pies row
@@ -11207,6 +11328,36 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if other>0:
                     top.append(("Other", other))
                 return top
+            def render_label_sections(c, start_y, rows, cols):
+                if not rows:
+                    return start_y
+                remaining = list(rows)
+                y = start_y
+                section_idx = 0
+                same_page_as_tasks = True
+                line_height = 9
+                min_space = 6*mm + line_height + 4
+                while remaining:
+                    if (y - 20*mm) < min_space:
+                        c.showPage()
+                        draw_header(c)
+                        y = 260*mm
+                        same_page_as_tasks = False
+                    if section_idx == 0 and same_page_as_tasks:
+                        c.setStrokeColor(colors.HexColor('#dddddd'))
+                        c.line(20*mm, y, 190*mm, y)
+                        y -= 6*mm
+                    title = 'Per Label' if section_idx == 0 else 'Per Label (cont.)'
+                    c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+                    c.drawString(20*mm, y, title)
+                    y -= 6*mm
+                    max_rows_label = max(1, int((y - 20*mm)/line_height) - 2)
+                    chunk = remaining[:max_rows_label]
+                    remaining = remaining[max_rows_label:]
+                    y = table(c, 20*mm, y, cols, [r[2] for r in chunk]) - 4
+                    section_idx += 1
+                    same_page_as_tasks = False
+                return y
             c.setFillColor(colors.HexColor('#222222')); c.setFont('Helvetica-Bold', 12)
             c.drawString(20*mm, 250*mm, 'Distribution by Period (project share)')
             pies_y = 235*mm
@@ -11234,15 +11385,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             max_rows_task = max(10, int((y - 20*mm)/9) - 2)
             y = table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]]) - 4
             if label_rows_all:
-                c.setStrokeColor(colors.HexColor('#dddddd'))
-                c.line(20*mm, y, 190*mm, y)
-                y -= 6*mm
                 cols_label = [("Label", 90*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
-                c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-                c.drawString(20*mm, y, 'Per Label')
-                y -= 6*mm
-                max_rows_label = max(10, int((y - 20*mm)/9) - 2)
-                table(c, 20*mm, y, cols_label, [r[2] for r in label_rows_all[:max_rows_label]])
+                y = render_label_sections(c, y, label_rows_all, cols_label)
             c.setFont('Helvetica', 8); c.setFillColor(colors.HexColor('#888888'))
             c.drawRightString(200*mm, 12*mm, 'Times are H:MM over last D=1/W=7/M=30/Y=365 days. Top rows shown.')
             c.showPage(); c.save()
@@ -11775,6 +11919,37 @@ def main() -> None:
         def palette():
             return [colors.HexColor(h) for h in ['#5B8FF9','#61DDAA','#65789B','#F6BD16','#7262FD','#78D3F8','#9661BC','#F6903D','#E86452','#6DC8EC']]
 
+        def render_label_sections(c, start_y, rows, cols):
+            if not rows:
+                return start_y
+            remaining = list(rows)
+            y = start_y
+            section_idx = 0
+            same_page_as_tasks = True
+            line_height = 9
+            min_space = 6*mm + line_height + 4
+            while remaining:
+                if (y - 20*mm) < min_space:
+                    c.showPage()
+                    draw_header(c)
+                    y = 260*mm
+                    same_page_as_tasks = False
+                if section_idx == 0 and same_page_as_tasks:
+                    c.setStrokeColor(colors.HexColor('#dddddd'))
+                    c.line(20*mm, y, 190*mm, y)
+                    y -= 6*mm
+                title = 'Per Label' if section_idx == 0 else 'Per Label (cont.)'
+                c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
+                c.drawString(20*mm, y, title)
+                y -= 6*mm
+                max_rows_label = max(1, int((y - 20*mm)/line_height) - 2)
+                chunk = remaining[:max_rows_label]
+                remaining = remaining[max_rows_label:]
+                y = table(c, 20*mm, y, cols, [r[2] for r in chunk]) - 4
+                section_idx += 1
+                same_page_as_tasks = False
+            return y
+
         # Collect totals for D/W/M/Y windows
         since_map = {'D':1, 'W':7, 'M':30, 'Y':365}
         proj_totals = {k: db.aggregate_project_totals(v) for k,v in since_map.items()}
@@ -11853,6 +12028,7 @@ def main() -> None:
                 pie_legend(c, cx - pie_r, pies_y - pie_r - 6*mm, items, pal, max_lines=3)
         cols_proj = [("Project", 70*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
         cols_task = [("Task", 100*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
+        cols_label = [("Label", 90*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
 
         # Start positions
         y = 195*mm
@@ -11871,15 +12047,7 @@ def main() -> None:
         max_rows_task = max(10, int((y - 20*mm)/9) - 2)
         y = table(c, 20*mm, y, cols_task, [r[2] for r in task_rows_all[:max_rows_task]]) - 4
         if label_rows_all:
-            c.setStrokeColor(colors.HexColor('#dddddd'))
-            c.line(20*mm, y, 190*mm, y)
-            y -= 6*mm
-            cols_label = [("Label", 90*mm), ("D", 15*mm), ("W", 15*mm), ("M", 15*mm), ("Y", 20*mm)]
-            c.setFont('Helvetica-Bold', 12); c.setFillColor(colors.HexColor('#222222'))
-            c.drawString(20*mm, y, 'Per Label')
-            y -= 6*mm
-            max_rows_label = max(10, int((y - 20*mm)/9) - 2)
-            table(c, 20*mm, y, cols_label, [r[2] for r in label_rows_all[:max_rows_label]])
+            y = render_label_sections(c, y, label_rows_all, cols_label)
 
         # Footer note
         c.setFont('Helvetica', 8); c.setFillColor(colors.HexColor('#888888'))
