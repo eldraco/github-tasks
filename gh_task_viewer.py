@@ -81,6 +81,11 @@ from prompt_toolkit.filters import Condition
 import logging
 from logging.handlers import RotatingFileHandler
 
+
+class ProjectFieldMissingError(RuntimeError):
+    """Raised when a requested project field no longer exists on GitHub."""
+    pass
+
 _HAS_QUARTZ = False
 _CMD_KEYCODES = (55, 54)  # left and right command
 try:
@@ -2363,6 +2368,19 @@ GQL_MUTATION_SET_DATE = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $
 }
 """
 
+GQL_MUTATION_CLEAR_FIELD = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!) {
+  clearProjectV2ItemFieldValue(
+    input:{
+      projectId:$projectId,
+      itemId:$itemId,
+      fieldId:$fieldId
+    }
+  ){
+    projectV2Item{ id }
+  }
+}
+"""
+
 GQL_MUTATION_SET_ITERATION = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $iterationId:ID!) {
   updateProjectV2ItemFieldValue(
     input:{
@@ -2684,16 +2702,16 @@ def _graphql_with_backoff(
                     wait_s = min(300, backoff)
                     backoff = min(300, backoff * 2)
                 if total_wait + wait_s > max_total_wait:
-                    raise
+                    raise RuntimeError(f"GitHub API request failed after retries (HTTP {status})") from e
                 _retry_sleep(wait_s, on_wait)
                 total_wait += wait_s
                 continue
             raise
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             wait_s = min(60, backoff)
             backoff = min(300, backoff * 2)
             if total_wait + wait_s > max_total_wait:
-                raise
+                raise RuntimeError("GitHub API unreachable after retries; check your network connection") from e
             _retry_sleep(wait_s, on_wait)
             total_wait += wait_s
             continue
@@ -2788,7 +2806,49 @@ def set_project_date(token: str, project_id: str, item_id: str, field_id: str, d
             logging.getLogger('gh_task_viewer').error("set_project_date error: %s", errs)
         except Exception:
             pass
-        raise RuntimeError("Setting date failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+        messages: List[str] = []
+        field_missing = False
+        for err in errs:
+            msg_text = (err.get("message") if isinstance(err, dict) else None) or str(err)
+            messages.append(msg_text)
+            lowered = msg_text.lower()
+            if 'field does not exist' in lowered or 'could not resolve' in lowered:
+                field_missing = True
+        detail = "Setting date failed: " + "; ".join(messages)
+        if field_missing:
+            raise ProjectFieldMissingError(detail)
+        raise RuntimeError(detail)
+
+
+def clear_project_field_value(token: str, project_id: str, item_id: str, field_id: str) -> None:
+    if not (project_id and item_id and field_id):
+        return
+    session = _session(token)
+    variables = {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+    }
+    resp = _graphql_with_backoff(session, GQL_MUTATION_CLEAR_FIELD, variables)
+    errs = resp.get("errors") or []
+    if errs:
+        import logging
+        try:
+            logging.getLogger('gh_task_viewer').error("clear_project_field_value error: %s", errs)
+        except Exception:
+            pass
+        messages: List[str] = []
+        field_missing = False
+        for err in errs:
+            msg_text = (err.get("message") if isinstance(err, dict) else None) or str(err)
+            messages.append(msg_text)
+            lowered = msg_text.lower()
+            if 'field does not exist' in lowered or 'could not resolve' in lowered:
+                field_missing = True
+        detail = "Clearing field failed: " + "; ".join(messages)
+        if field_missing:
+            raise ProjectFieldMissingError(detail)
+        raise RuntimeError(detail)
 
 
 def set_project_iteration(token: str, project_id: str, item_id: str, field_id: str, iteration_id: str) -> None:
@@ -4922,6 +4982,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         finally:
             add_state['loading_repo_metadata'] = False
             add_state['repo_metadata_task'] = None
+            _update_add_window_height()
             invalidate()
 
     def _start_repo_metadata_fetch(repo_full_name: str) -> None:
@@ -5574,6 +5635,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                         logger.warning("Could not resolve %s field id for %s (field '%s')", field_type, row.project_title, field_name)
                     except Exception:
                         pass
+        is_clearing = not bool(new_value)
         payload = {
             'url': row.url,
             'project_id': project_id,
@@ -5597,7 +5659,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         else:
             db.update_focus_date(row.url, new_value, field_id or None)
         all_rows = load_all()
-        status_line = f"{label} queued (press 'u' to sync)"
+        action_text = "clear queued" if is_clearing else "queued"
+        status_line = f"{label} {action_text} (press 'u' to sync)"
         rows_after = filtered_rows()
         if current_index >= len(rows_after):
             current_index = max(0, len(rows_after) - 1)
@@ -5631,6 +5694,34 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         fields[idx]['value'] = current.isoformat()
         task_edit_state['editing'] = editing
         task_edit_state['message'] = current.isoformat()
+        invalidate()
+
+    def _clear_focus_day_from_calendar() -> None:
+        if not edit_task_mode or task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        fields = task_edit_state.get('fields') or []
+        editing = task_edit_state.get('editing') or {}
+        idx = editing.get('field_idx')
+        if idx is None or idx >= len(fields):
+            task_edit_state['message'] = 'No date field active'
+            invalidate(); return
+        field = fields[idx]
+        if (field.get('field_key') or '') != 'focus':
+            task_edit_state['message'] = 'Clearing is only available for Focus Day'
+            invalidate(); return
+        current_val = (editing.get('calendar_date') or field.get('value') or '').strip()
+        if not current_val:
+            task_edit_state['mode'] = 'list'
+            task_edit_state['editing'] = None
+            task_edit_state['message'] = 'Focus Day already empty'
+            invalidate(); return
+        field['value'] = ''
+        task_edit_state['cursor'] = idx
+        task_edit_state['mode'] = 'list'
+        task_edit_state['editing'] = None
+        task_edit_state['message'] = 'Clearing Focus Day…'
+        _update_task_editor_height()
+        asyncio.create_task(_update_task_date('focus', ''))
         invalidate()
 
     async def _apply_assignees(logins: List[str]) -> None:
@@ -5853,6 +5944,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['labels_error'] = 'GITHUB_TOKEN required for labels'
                 task_edit_state['labels_loading'] = False
                 task_edit_state['labels_task'] = None
+                _update_task_editor_height()
                 invalidate()
             return
         try:
@@ -5868,6 +5960,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['labels_error'] = f'Label fetch failed: {exc}'
                 task_edit_state['labels_loading'] = False
                 task_edit_state['labels_task'] = None
+                _update_task_editor_height()
                 invalidate()
             return
         names: List[str] = []
@@ -5902,6 +5995,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = 'Labels loaded'
             else:
                 task_edit_state['message'] = task_edit_state['labels_error']
+            _update_task_editor_height()
             invalidate()
 
     async def _add_comment(comment: str) -> None:
@@ -8082,7 +8176,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     row_cells.append(cell)
                 add_line("".join(row_cells), 'class:editor.calendar')
             add_blank()
-            add_line("Enter=save · Esc=cancel", 'class:editor.instructions')
+            hint = "Enter=save · Esc=cancel"
+            target_field = fields[cursor] if cursor < len(fields) else None
+            if target_field and (target_field.get('field_key') or '') == 'focus':
+                hint += " · Del clears Focus Day"
+            add_line(hint, 'class:editor.instructions')
         elif mode == 'priority-select':
             field = fields[cursor] if cursor < len(fields) else None
             opts = (field or {}).get('options') or []
@@ -8157,15 +8255,29 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return segments
 
     task_edit_control = FormattedTextControl(text=lambda: build_task_edit_text())
+    TASK_EDIT_HEIGHT_PREF = 32
+    TASK_EDIT_HEIGHT_MAX = 50
+    LABEL_EDITOR_PADDING_LINES = 14
+    LABEL_EDITOR_MAX_HEIGHT = 72
     task_edit_body = Window(
         width=Dimension(preferred=100, max=120),
-        height=Dimension(preferred=32, max=50),
+        height=Dimension(preferred=TASK_EDIT_HEIGHT_PREF, max=TASK_EDIT_HEIGHT_MAX),
         content=task_edit_control,
         wrap_lines=True,
         always_hide_cursor=True,
         style="class:editor.body",
     )
     task_edit_window = Frame(body=task_edit_body, title="🛠 Task Field Editor", style="class:editor.frame")
+
+    def _update_task_editor_height() -> None:
+        pref = TASK_EDIT_HEIGHT_PREF
+        max_height = TASK_EDIT_HEIGHT_MAX
+        if edit_task_mode and task_edit_state.get('mode') == 'edit-labels':
+            choices = task_edit_state.get('label_choices') or []
+            target = LABEL_EDITOR_PADDING_LINES + len(choices)
+            pref = min(LABEL_EDITOR_MAX_HEIGHT, max(pref, target))
+            max_height = pref
+        task_edit_body.height = Dimension(preferred=pref, max=max_height)
 
     def build_report_text() -> List[Tuple[str,str]]:
         lines: List[str] = []
@@ -8521,7 +8633,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     from prompt_toolkit.layout.containers import Float, FloatContainer
     add_control = FormattedTextControl(text=lambda: build_add_overlay())
-    add_window = Window(width=92, height=Dimension(preferred=26, max=44), content=add_control, wrap_lines=False, always_hide_cursor=True, style="bg:#202020 #ffffff")
+    ADD_WINDOW_HEIGHT_PREF = 26
+    ADD_WINDOW_HEIGHT_MAX = 44
+    ADD_LABEL_WINDOW_PADDING = 12
+    ADD_LABEL_WINDOW_MAX_HEIGHT = 60
+    add_window = Window(
+        width=92,
+        height=Dimension(preferred=ADD_WINDOW_HEIGHT_PREF, max=ADD_WINDOW_HEIGHT_MAX),
+        content=add_control,
+        wrap_lines=False,
+        always_hide_cursor=True,
+        style="bg:#202020 #ffffff",
+    )
+
+    def _update_add_window_height() -> None:
+        pref = ADD_WINDOW_HEIGHT_PREF
+        max_height = ADD_WINDOW_HEIGHT_MAX
+        if add_mode and add_state.get('step') == 'labels':
+            labels = add_state.get('label_choices') or []
+            target = ADD_LABEL_WINDOW_PADDING + len(labels)
+            pref = min(ADD_LABEL_WINDOW_MAX_HEIGHT, max(pref, target))
+            max_height = pref
+        add_window.height = Dimension(preferred=pref, max=max_height)
     floats = []
     overrun_prompt: Optional[Dict[str, object]] = None
     overrun_float: Optional[Float] = None
@@ -8640,6 +8773,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task.cancel()
         add_mode = False
         add_state = {}
+        _update_add_window_height()
         if message is not None:
             status_line = message
         invalidate()
@@ -8654,6 +8788,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task.cancel()
         edit_task_mode = False
         task_edit_state = {}
+        _update_task_editor_height()
         if message is not None:
             status_line = message
         invalidate()
@@ -8690,6 +8825,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'priority_loading': False,
             'assignee_loading': False,
         }
+        _update_task_editor_height()
         if task_edit_float and task_edit_float in floats:
             floats.remove(task_edit_float)
         task_edit_float = Float(content=task_edit_window, top=3, left=4)
@@ -8728,6 +8864,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['priority_loading'] = False
         task_edit_state['assignee_loading'] = False
         task_edit_state['message'] = message or 'Edit cancelled'
+        _update_task_editor_height()
         invalidate()
 
     def _start_task_field_edit() -> None:
@@ -8819,6 +8956,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['labels_repo'] = repo_full
             task_edit_state['labels_task'] = asyncio.create_task(_load_label_choices_for_editor(repo_full, set(selected)))
             task_edit_state['message'] = f'Loading labels for {repo_full}…'
+            _update_task_editor_height()
         elif ftype == 'comment':
             task_edit_state['mode'] = 'edit-comment'
             task_edit_state['input'] = ''
@@ -8952,13 +9090,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return False
 
         async def _apply_date(field_id_to_use: str) -> None:
-            await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, field_id_to_use, value))
+            if value:
+                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, field_id_to_use, value))
+            else:
+                await loop.run_in_executor(None, lambda: clear_project_field_value(token, project_id, item_id, field_id_to_use))
 
         try:
             await _apply_date(field_id)
+        except ProjectFieldMissingError as exc:
+            message = str(exc)
+            needs_refresh = True
         except Exception as exc:
             message = str(exc)
             needs_refresh = 'field does not exist' in message.lower() or 'could not resolve' in message.lower()
+        else:
+            message = ''
+            needs_refresh = False
+        if message:
             if token and needs_refresh:
                 project_field_cache.pop(project_id, None)
                 guessed_type = field_type or ('focus' if 'focus' in field_name.lower() else 'start')
@@ -8992,9 +9140,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     invalidate()
                     return False
             else:
-                status_line = f"{field_name} sync failed: {exc}"
+                status_line = f"{field_name} sync failed: {message}"
                 try:
-                    logger.warning("Queued date update failed (%s): %s", field_name, exc)
+                    logger.warning("Queued date update failed (%s): %s", field_name, message)
                 except Exception:
                     pass
                 invalidate()
@@ -9032,6 +9180,43 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         invalidate()
         issue_url = ''
         item_id: Optional[str] = None
+        async def _apply_date_field(field_kind: str, value: str, field_id_raw: str, field_label: str) -> None:
+            if not value:
+                return
+            label = (field_label or '').strip()
+            if not label:
+                label = 'Start Date' if field_kind == 'start' else ('Focus Day' if field_kind == 'focus' else 'End Date')
+            resolved_id = (field_id_raw or '').strip()
+            async def _resolve_missing(current_id: str) -> Tuple[str, str]:
+                if current_id:
+                    return current_id, label
+                new_id, new_name = await _resolve_project_field_id(project_id, field_kind, label)
+                if new_id:
+                    return new_id, new_name or label
+                return "", label
+            resolved_id, resolved_label = await _resolve_missing(resolved_id)
+            if not resolved_id:
+                try:
+                    logger.warning("Project %s missing %s field; skipping update for %s", project_id, resolved_label, title)
+                except Exception:
+                    pass
+                return
+            try:
+                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, resolved_id, value))
+            except ProjectFieldMissingError as exc:
+                project_field_cache.pop(project_id, None)
+                new_id, new_name = await _resolve_project_field_id(project_id, field_kind, resolved_label)
+                if new_id and new_id != resolved_id:
+                    resolved_id = new_id
+                    resolved_label = new_name or resolved_label
+                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, resolved_id, value))
+                else:
+                    try:
+                        logger.warning("Skipping %s update for %s: %s", resolved_label, title, exc)
+                    except Exception:
+                        pass
+            except Exception:
+                raise
         try:
             if mode == 'issue':
                 if not repo_id:
@@ -9081,32 +9266,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                         pass
             start_value = payload.get('start_value') or dt.date.today().isoformat()
             start_field_id = (payload.get('start_field_id') or '').strip()
-            if start_field_id:
-                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, start_value))
+            start_field_name_payload = (payload.get('start_field_name') or 'Start Date').strip() or 'Start Date'
+            await _apply_date_field('start', start_value, start_field_id, start_field_name_payload)
             end_value = (payload.get('end_value') or '').strip()
             if end_value:
                 end_field_id = (payload.get('end_field_id') or '').strip()
-                if not end_field_id:
-                    for candidate in ('end date', 'due date', 'target date', 'finish date'):
-                        try:
-                            fid = await loop.run_in_executor(None, lambda name=candidate: get_project_field_id_by_name(token, project_id, name))
-                        except Exception:
-                            fid = None
-                        if fid:
-                            end_field_id = fid
-                            break
-                if end_field_id:
-                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, end_field_id, end_value))
+                end_field_name_payload = (payload.get('end_field_name') or 'End Date').strip() or 'End Date'
+                await _apply_date_field('end', end_value, end_field_id, end_field_name_payload)
             focus_value = (payload.get('focus_value') or '').strip()
             if focus_value:
                 focus_field_id = (payload.get('focus_field_id') or '').strip()
-                if not focus_field_id:
-                    try:
-                        focus_field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, 'focus day'))
-                    except Exception:
-                        focus_field_id = ''
-                if focus_field_id:
-                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, focus_field_id, focus_value))
+                focus_field_name_payload = (payload.get('focus_field_name') or 'Focus Day').strip() or 'Focus Day'
+                await _apply_date_field('focus', focus_value, focus_field_id, focus_field_name_payload)
             status_field_id = (payload.get('status_field_id') or '').strip()
             status_option_id = (payload.get('status_option_id') or '').strip()
             status_label = (payload.get('status_label') or '').strip()
@@ -9519,7 +9690,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'iteration_id': iteration_id,
             'iteration_field_id': project_choice.get('iteration_field_id') or '',
             'start_field_id': project_choice.get('start_field_id') or '',
+            'start_field_name': start_field_name,
+            'end_field_id': project_choice.get('end_field_id') or '',
+            'end_field_name': project_choice.get('end_field_name') or 'Due Date',
             'focus_field_id': project_choice.get('focus_field_id') or '',
+            'focus_field_name': focus_field_name,
             'priority_field_id': priority_field_id,
             'priority_label': priority_label,
             'priority_options': priority_opts,
@@ -9772,6 +9947,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['labels_loading'] = False
                 task_edit_state['labels_error'] = ''
                 task_edit_state['message'] = 'Updating labels…'
+                _update_task_editor_height()
                 asyncio.create_task(_apply_labels(labels_list))
             elif mode == 'edit-comment':
                 comment = (task_edit_state.get('input', '') or '').strip()
@@ -10235,6 +10411,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return
         _calendar_adjust(months=1)
 
+    @kb.add('delete', filter=is_task_edit_calendar)
+    @kb.add('backspace', filter=is_task_edit_calendar)
+    def _(event):
+        _clear_focus_day_from_calendar()
+
     @kb.add('j', filter=is_session_idle)
     @kb.add('down', filter=is_session_idle)
     def _(event):
@@ -10363,6 +10544,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             floats.remove(add_float)
         add_float = Float(content=add_window, top=3, left=4)
         floats.append(add_float)
+        _update_add_window_height()
         status_line = 'Select item type'
         invalidate()
 
@@ -10994,6 +11176,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 parent_title_to_store,
             ))
             return
+        _update_add_window_height()
         invalidate()
 
     # search mode
