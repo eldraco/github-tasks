@@ -2583,25 +2583,57 @@ def create_project_draft(token: str, project_id: str, title: str, body: str = ""
         return ""
 
 
-def set_project_date(token: str, project_id: str, item_id: str, field_id: str, date_val: str) -> None:
-    if not (project_id and item_id and field_id and date_val):
-        return
+def _is_missing_project_field_error(errs: List[Dict[str, object]]) -> bool:
+    for err in errs:
+        msg = str(err.get("message") or "").lower()
+        if "field does not exist in the project" in msg:
+            return True
+    return False
+
+
+def set_project_date(
+    token: str,
+    project_id: str,
+    item_id: str,
+    field_id: str,
+    date_val: str,
+    field_name: Optional[str] = None,
+) -> str:
+    if not (project_id and item_id and date_val):
+        return field_id or ""
+    if not field_id:
+        return ""
     session = _session(token)
-    variables = {
-        "projectId": project_id,
-        "itemId": item_id,
-        "fieldId": field_id,
-        "date": date_val,
-    }
-    resp = _graphql_with_backoff(session, GQL_MUTATION_SET_DATE, variables)
-    errs = resp.get("errors") or []
-    if errs:
-        import logging
+
+    def _attempt(fid: str) -> List[Dict[str, object]]:
+        variables = {
+            "projectId": project_id,
+            "itemId": item_id,
+            "fieldId": fid,
+            "date": date_val,
+        }
+        resp = _graphql_with_backoff(session, GQL_MUTATION_SET_DATE, variables)
+        return resp.get("errors") or []
+
+    errs = _attempt(field_id)
+    if not errs:
+        return field_id
+    if field_name and _is_missing_project_field_error(errs):
+        lookup_id = None
         try:
-            logging.getLogger('gh_task_viewer').error("set_project_date error: %s", errs)
+            lookup_id = get_project_field_id_by_name(token, project_id, field_name)
         except Exception:
-            pass
-        raise RuntimeError("Setting date failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+            lookup_id = None
+        if lookup_id and lookup_id != field_id:
+            errs = _attempt(lookup_id)
+            if not errs:
+                return lookup_id
+    import logging
+    try:
+        logging.getLogger('gh_task_viewer').error("set_project_date error: %s", errs)
+    except Exception:
+        pass
+    raise RuntimeError("Setting date failed: " + "; ".join(e.get("message", str(e)) for e in errs))
 
 
 def set_project_iteration(token: str, project_id: str, item_id: str, field_id: str, iteration_id: str) -> None:
@@ -8154,7 +8186,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 invalidate()
                 return False
         try:
-            await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, field_id, value))
+            updated_field_id = await loop.run_in_executor(
+                None,
+                lambda: set_project_date(token, project_id, item_id, field_id, value, field_name),
+            )
+            if updated_field_id:
+                field_id = updated_field_id
         except Exception as exc:
             status_line = f"{field_name} sync failed: {exc}"
             try:
@@ -8193,6 +8230,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         invalidate()
         issue_url = ''
         item_id: Optional[str] = None
+        start_field_name = (payload.get('start_field_name') or '').strip()
+        end_field_name = (payload.get('end_field_name') or '').strip()
+        focus_field_name = (payload.get('focus_field_name') or '').strip()
         try:
             if mode == 'issue':
                 if not repo_id:
@@ -8227,7 +8267,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             start_value = payload.get('start_value') or dt.date.today().isoformat()
             start_field_id = (payload.get('start_field_id') or '').strip()
             if start_field_id:
-                await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, start_field_id, start_value))
+                await loop.run_in_executor(
+                    None,
+                    lambda: set_project_date(
+                        token,
+                        project_id,
+                        item_id,
+                        start_field_id,
+                        start_value,
+                        start_field_name or None,
+                    ),
+                )
             end_value = (payload.get('end_value') or '').strip()
             if end_value:
                 end_field_id = (payload.get('end_field_id') or '').strip()
@@ -8241,7 +8291,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                             end_field_id = fid
                             break
                 if end_field_id:
-                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, end_field_id, end_value))
+                    await loop.run_in_executor(
+                        None,
+                        lambda: set_project_date(
+                            token,
+                            project_id,
+                            item_id,
+                            end_field_id,
+                            end_value,
+                            end_field_name or None,
+                        ),
+                    )
             focus_value = (payload.get('focus_value') or '').strip()
             if focus_value:
                 focus_field_id = (payload.get('focus_field_id') or '').strip()
@@ -8251,7 +8311,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     except Exception:
                         focus_field_id = ''
                 if focus_field_id:
-                    await loop.run_in_executor(None, lambda: set_project_date(token, project_id, item_id, focus_field_id, focus_value))
+                    await loop.run_in_executor(
+                        None,
+                        lambda: set_project_date(
+                            token,
+                            project_id,
+                            item_id,
+                            focus_field_id,
+                            focus_value,
+                            focus_field_name or None,
+                        ),
+                    )
             status_field_id = (payload.get('status_field_id') or '').strip()
             status_option_id = (payload.get('status_option_id') or '').strip()
             status_label = (payload.get('status_label') or '').strip()
@@ -8583,6 +8653,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         repo_id = (repo_choice or {}).get('repo_id') or ''
         start_field_name = (project_choice.get('start_field_name') or 'Start Date').strip() or 'Start Date'
         focus_field_name = (project_choice.get('focus_field_name') or 'Focus Day').strip() or 'Focus Day'
+        end_field_name = (project_choice.get('end_field_name') or 'Due Date').strip() or 'Due Date'
         iteration_options = project_choice.get('iteration_options') or []
         iteration_title = ''
         if iteration_id:
@@ -8657,6 +8728,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'iteration_field_id': project_choice.get('iteration_field_id') or '',
             'start_field_id': project_choice.get('start_field_id') or '',
             'focus_field_id': project_choice.get('focus_field_id') or '',
+            'start_field_name': start_field_name,
+            'end_field_name': end_field_name,
+            'focus_field_name': focus_field_name,
             'priority_field_id': priority_field_id,
             'priority_label': priority_label,
             'priority_options': priority_opts,
@@ -8692,7 +8766,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             project_title=project_choice.get('project_title') or '',
             start_field=start_field_name,
             start_date=start_date_val,
-            end_field=project_choice.get('end_field_name') or 'Due Date',
+            end_field=end_field_name,
             end_date=end_date_val,
             focus_field=focus_field_name,
             focus_date=display_focus_date,
