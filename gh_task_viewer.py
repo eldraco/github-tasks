@@ -2299,6 +2299,79 @@ def _session(token: str) -> requests.Session:
     return s
 
 
+def _safe_response_text(resp: Optional[requests.Response], limit: int = 200) -> str:
+    if not resp:
+        return ""
+    try:
+        text = resp.text or ""
+    except Exception:
+        return ""
+    return text[:limit]
+
+
+def _response_json(resp: Optional[requests.Response]) -> Optional[Dict[str, object]]:
+    if not resp:
+        return None
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _http_error_message(resp: Optional[requests.Response]) -> str:
+    if not resp:
+        return "no response body"
+    bits: List[str] = []
+    data = _response_json(resp)
+    if data:
+        msg = data.get("message")
+        if msg:
+            bits.append(str(msg))
+        errs = data.get("errors")
+        if isinstance(errs, list):
+            err_msgs = []
+            for err in errs:
+                if isinstance(err, dict):
+                    text = err.get("message") or ""
+                else:
+                    text = str(err)
+                if text:
+                    err_msgs.append(str(text))
+            if err_msgs:
+                bits.append("; ".join(err_msgs))
+    text = _safe_response_text(resp, 200)
+    if text and text not in bits:
+        bits.append(text)
+    if bits:
+        return " | ".join(bits)
+    return f"HTTP {resp.status_code}"
+
+
+def _should_retry_http_400(resp: Optional[requests.Response]) -> bool:
+    data = _response_json(resp) or {}
+    msg = str(data.get("message") or "").lower()
+    if not msg:
+        msg = _safe_response_text(resp, 300).lower()
+    if not msg or msg == "bad request":
+        return True
+    if "something went wrong" in msg or "timeout" in msg or "temporarily" in msg:
+        return True
+    errs = data.get("errors") or []
+    for err in errs:
+        if not isinstance(err, dict):
+            continue
+        err_type = str(err.get("type") or "").upper()
+        err_msg = str(err.get("message") or "").lower()
+        if err_type in ("INTERNAL", "SERVER_ERROR", "SERVICE_ERROR", "UNKNOWN"):
+            return True
+        if "something went wrong" in err_msg or "timeout" in err_msg:
+            return True
+    return False
+
+
 def _parse_issue_url(url: str) -> Optional[tuple[str,str,int]]:
     try:
         m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/(issues|pull)/([0-9]+)", url or "")
@@ -2484,6 +2557,7 @@ def _graphql_with_backoff(
     backoff = 10
     total_wait = 0
     attempt = 0
+    bad_request_retries = 0
     while True:
         attempt += 1
         try:
@@ -2491,6 +2565,18 @@ def _graphql_with_backoff(
         except requests.exceptions.HTTPError as e:
             # Handle HTTP-level rate limits/abuse and transient errors
             status = e.response.status_code if e.response is not None else None
+            if status == 400:
+                if _should_retry_http_400(e.response) and bad_request_retries < 2:
+                    bad_request_retries += 1
+                    wait_s = min(60, backoff)
+                    backoff = min(300, backoff * 2)
+                    if total_wait + wait_s > max_total_wait:
+                        raise
+                    _retry_sleep(wait_s, on_wait)
+                    total_wait += wait_s
+                    continue
+                detail = _http_error_message(e.response)
+                raise RuntimeError(f"GraphQL HTTP 400: {detail}") from e
             if status in (403, 429, 502, 503, 504):
                 wait_s = _parse_retry_after_seconds(e.response)
                 if wait_s is None:
@@ -2502,7 +2588,7 @@ def _graphql_with_backoff(
                 total_wait += wait_s
                 continue
             raise
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError):
             wait_s = min(60, backoff)
             backoff = min(300, backoff * 2)
             if total_wait + wait_s > max_total_wait:
