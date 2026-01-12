@@ -317,7 +317,7 @@ def test_update_task_date_with_validation_and_success(monkeypatch, temp_db_path,
 
     date_calls = []
 
-    def fake_set_project_date(token, project_id, item_id, field_id, value):
+    def fake_set_project_date(token, project_id, item_id, field_id, value, field_name=None):
         date_calls.append((token, project_id, item_id, field_id, value))
 
     monkeypatch.setattr(ght, "set_project_date", fake_set_project_date)
@@ -396,7 +396,7 @@ def test_update_task_date_missing_metadata_triggers_lookup(monkeypatch, temp_db_
 
     date_calls = []
 
-    def fake_set_project_date(token, project_id, item_id, field_id, value):
+    def fake_set_project_date(token, project_id, item_id, field_id, value, field_name=None):
         date_calls.append((token, project_id, item_id, field_id, value))
 
     monkeypatch.setattr(ght, "set_project_date", fake_set_project_date)
@@ -1224,7 +1224,7 @@ def test_focus_shift_hotkeys_adjust_dates_and_status(monkeypatch, temp_db_path, 
 
     date_calls = []
 
-    def fake_set_project_date(token, project_id, item_id, field_id, value):
+    def fake_set_project_date(token, project_id, item_id, field_id, value, field_name=None):
         date_calls.append((token, project_id, item_id, field_id, value))
 
     monkeypatch.setattr(ght, "set_project_date", fake_set_project_date)
