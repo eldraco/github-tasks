@@ -8,6 +8,7 @@
 #   Y  shift focus day +1 day
 #   y  shift focus day -1 day
 #   a  show all cached tasks
+#   n  quick add task (StratoAdmin, today, P0, @eldraco)
 #   P  clear project filter (show all projects again)
 #   N  toggle hide tasks with no date
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
@@ -4355,6 +4356,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         choices.sort(key=lambda e: e.get('project_title', '').lower())
         return choices
 
+    def _find_project_choice(choices: List[Dict[str, object]], title: str) -> Optional[Dict[str, object]]:
+        target = (title or '').strip().lower()
+        if not target:
+            return None
+        for entry in choices:
+            name = (entry.get('project_title') or '').strip().lower()
+            if name == target:
+                return entry
+        for entry in choices:
+            name = (entry.get('project_title') or '').strip().lower()
+            if target in name:
+                return entry
+        return None
+
     def _set_project_choices_for_mode(mode: str) -> None:
         all_choices = add_state.get('project_choices_all') or []
         if mode == 'issue':
@@ -5383,6 +5398,37 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _refresh_task_editor_state(preserve_cursor=False)
             invalidate()
 
+    def _collect_project_assignees(project_id: str) -> List[str]:
+        if not project_id:
+            return []
+        try:
+            rows = db.load(today_only=False)
+        except Exception:
+            return []
+        seen: Set[str] = set()
+        out: List[str] = []
+        for row in rows:
+            if (row.project_id or '') != project_id:
+                continue
+            raw = row.assignee_logins or "[]"
+            try:
+                parsed = json.loads(raw)
+                if not isinstance(parsed, list):
+                    parsed = []
+            except Exception:
+                parsed = []
+            for entry in parsed:
+                login = str(entry).strip().lstrip('@')
+                if not login:
+                    continue
+                key = login.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(login)
+        out.sort(key=lambda x: x.lower())
+        return out
+
     async def _ensure_assignee_field(row: TaskRow) -> None:
         nonlocal all_rows, status_line
         if not edit_task_mode:
@@ -5417,6 +5463,96 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['assignee_loading'] = False
             _refresh_task_editor_state(preserve_cursor=False)
             invalidate()
+
+    async def _load_assignee_choices_for_editor(row: TaskRow, initial_selection: Set[str]) -> None:
+        if not edit_task_mode:
+            return
+        target_url = row.url
+        task_edit_state['assignee_loading'] = True
+        task_edit_state['assignee_error'] = ''
+        task_edit_state['assignee_choices'] = []
+        task_edit_state['assignee_index'] = 0
+        task_edit_state['assignees_selected'] = set(initial_selection)
+        invalidate()
+        try:
+            loop = asyncio.get_running_loop()
+            entries: Dict[str, Dict[str, str]] = {}
+
+            def _add_entry(login_val: str, display_val: Optional[str] = None) -> None:
+                login_clean = (login_val or '').strip().lstrip('@')
+                if not login_clean:
+                    return
+                key = login_clean.lower()
+                display = (display_val or login_clean).strip() or login_clean
+                existing = entries.get(key)
+                if existing:
+                    if existing.get('display') == existing.get('login') and display != login_clean:
+                        existing['display'] = display
+                    return
+                entries[key] = {'login': login_clean, 'display': display}
+
+            for login in _collect_project_assignees(row.project_id or ''):
+                _add_entry(login, login)
+
+            repo_full = (row.repo or '').strip()
+            parts = _parse_issue_url(row.url)
+            if (not repo_full) and parts:
+                repo_full = f"{parts[0]}/{parts[1]}"
+            if repo_full and token:
+                try:
+                    assignees_raw = await loop.run_in_executor(None, lambda: list_repo_assignees(token, repo_full))
+                except Exception as exc:
+                    task_edit_state['assignee_error'] = f'Assignee fetch failed: {exc}'
+                else:
+                    for item in assignees_raw:
+                        if not isinstance(item, dict):
+                            continue
+                        login_val = (item.get('login') or '').strip()
+                        if not login_val:
+                            continue
+                        real_name = (item.get('name') or '').strip()
+                        if real_name and real_name.lower() != login_val.lower():
+                            display = f"{login_val} ({real_name})"
+                        else:
+                            display = login_val
+                        _add_entry(login_val, display)
+
+            for login in initial_selection:
+                _add_entry(login, login)
+
+            if not edit_task_mode or task_edit_state.get('task_url') != target_url:
+                return
+            choices = sorted(entries.values(), key=lambda x: (x.get('display') or x.get('login') or '').lower())
+            task_edit_state['assignee_choices'] = choices
+            if choices:
+                selected = task_edit_state.get('assignees_selected') or set()
+                if not isinstance(selected, set):
+                    selected = set(selected)
+                task_edit_state['assignees_selected'] = selected
+                idx = 0
+                for i, entry in enumerate(choices):
+                    if entry.get('login') in selected:
+                        idx = i
+                        break
+                task_edit_state['assignee_index'] = idx
+                task_edit_state['message'] = 'Assignees loaded'
+                task_edit_state['assignee_error'] = ''
+            else:
+                task_edit_state['assignee_index'] = 0
+                if not task_edit_state.get('assignee_error'):
+                    task_edit_state['assignee_error'] = 'No project assignees found'
+                task_edit_state['message'] = task_edit_state['assignee_error']
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            if edit_task_mode and task_edit_state.get('task_url') == target_url:
+                task_edit_state['assignee_error'] = f'Assignee fetch failed: {exc}'
+                task_edit_state['message'] = task_edit_state['assignee_error']
+        finally:
+            if edit_task_mode and task_edit_state.get('task_url') == target_url:
+                task_edit_state['assignee_loading'] = False
+                task_edit_state['assignee_task'] = None
+                invalidate()
 
     async def _load_label_choices_for_editor(repo_full: str, initial_selection: Set[str]) -> None:
         if not token:
@@ -6010,6 +6146,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['task_url'] = row.url
         task_edit_state['priority_loading'] = False
         task_edit_state['assignee_loading'] = False
+        task_edit_state['assignee_choices'] = []
+        task_edit_state['assignee_index'] = 0
+        task_edit_state['assignees_selected'] = set()
+        task_edit_state['assignee_error'] = ''
+        task = task_edit_state.get('assignee_task')
+        if isinstance(task, asyncio.Task):
+            task.cancel()
+        task_edit_state['assignee_task'] = None
         if task_edit_state.get('mode') != 'list':
             task_edit_state['mode'] = 'list'
             task_edit_state['input'] = ''
@@ -7418,9 +7562,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 add_line(f"   {marker} {name}", style)
         elif mode == 'edit-assignees':
             add_blank()
-            add_line("👥 Assignees (comma-separated GitHub logins)", 'class:editor.instructions')
-            add_line(f"✏️  {task_edit_state.get('input', '')}", 'class:editor.entry')
-            add_line("Enter=save · Esc=cancel", 'class:editor.instructions')
+            if task_edit_state.get('assignee_loading'):
+                add_line("⏳ Loading project people…", 'class:editor.instructions')
+            else:
+                choices = task_edit_state.get('assignee_choices') or []
+                selected = task_edit_state.get('assignees_selected') or set()
+                if not isinstance(selected, set):
+                    selected = set(selected)
+                idx = max(0, min(len(choices)-1, task_edit_state.get('assignee_index', 0))) if choices else 0
+                assignee_error = task_edit_state.get('assignee_error') or ''
+                if assignee_error:
+                    add_line(f"⚠️ {assignee_error}", 'class:editor.warning')
+                if choices:
+                    add_line("👥 Use j/k to move, Space to toggle, Enter=save, Esc=cancel", 'class:editor.instructions')
+                    for i, entry in enumerate(choices):
+                        login = (entry.get('login') or '').strip()
+                        display = (entry.get('display') or login or '(unknown)')
+                        pointer = '➤' if i == idx else ' '
+                        checkbox = '☑' if login in selected else '☐'
+                        if i == idx and login in selected:
+                            style = 'class:editor.label.cursor.selected'
+                        elif i == idx:
+                            style = 'class:editor.label.cursor'
+                        elif login in selected:
+                            style = 'class:editor.label.selected'
+                        else:
+                            style = 'class:editor.label'
+                        add_line(f" {pointer} {checkbox} {display}", style)
+                else:
+                    add_line("No project assignees found.", 'class:editor.warning')
+                    add_line("Type logins manually (comma-separated).", 'class:editor.instructions')
+                    add_line(f"✏️  {task_edit_state.get('input', '')}", 'class:editor.entry')
+                    add_line("Enter=save · Esc=cancel", 'class:editor.instructions')
+                if choices and selected:
+                    add_blank()
+                    add_line('Selection: ' + ', '.join(sorted(selected)), 'class:editor.meta')
         elif mode == 'edit-labels':
             repo_label = task_edit_state.get('labels_repo') or '(unknown repo)'
             add_blank()
@@ -7969,6 +8145,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if task_edit_float and task_edit_float in floats:
             floats.remove(task_edit_float)
         task_edit_float = None
+        task = task_edit_state.get('assignee_task') if isinstance(task_edit_state, dict) else None
+        if isinstance(task, asyncio.Task):
+            task.cancel()
         task = task_edit_state.get('labels_task') if isinstance(task_edit_state, dict) else None
         if isinstance(task, asyncio.Task):
             task.cancel()
@@ -8009,6 +8188,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'editing': None,
             'priority_loading': False,
             'assignee_loading': False,
+            'assignee_choices': [],
+            'assignee_index': 0,
+            'assignees_selected': set(),
+            'assignee_error': '',
+            'assignee_task': None,
+            'labels_task': None,
         }
         if task_edit_float and task_edit_float in floats:
             floats.remove(task_edit_float)
@@ -8033,6 +8218,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if mode == 'edit-assignees' and idx is not None and idx < len(fields):
             prev_list = editing.get('prev_value', fields[idx].get('value', []))
             fields[idx]['value'] = list(prev_list) if isinstance(prev_list, list) else []
+            task = task_edit_state.get('assignee_task')
+            if isinstance(task, asyncio.Task):
+                task.cancel()
+            task_edit_state['assignee_task'] = None
+            task_edit_state['assignee_choices'] = []
+            task_edit_state['assignee_index'] = 0
+            task_edit_state['assignees_selected'] = set()
+            task_edit_state['assignee_error'] = ''
         if mode == 'edit-labels' and idx is not None and idx < len(fields):
             prev_list = editing.get('prev_value', fields[idx].get('value', []))
             fields[idx]['value'] = list(prev_list) if isinstance(prev_list, list) else []
@@ -8104,7 +8297,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['mode'] = 'edit-assignees'
             task_edit_state['input'] = ', '.join(current)
             task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': list(current)}
-            task_edit_state['message'] = 'Comma-separated GitHub logins (Enter=save, Esc=cancel)'
+            task_edit_state['assignee_choices'] = []
+            task_edit_state['assignee_index'] = 0
+            task_edit_state['assignees_selected'] = set(current)
+            task_edit_state['assignee_error'] = ''
+            task_edit_state['assignee_loading'] = True
+            task_edit_state['message'] = 'Loading project people…'
+            existing_task = task_edit_state.get('assignee_task')
+            if isinstance(existing_task, asyncio.Task):
+                existing_task.cancel()
+            task_edit_state['assignee_task'] = asyncio.create_task(
+                _load_assignee_choices_for_editor(row, set(current))
+            )
         elif ftype == 'labels':
             rows = filtered_rows()
             if not rows:
@@ -8190,10 +8394,27 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_add_date_input = Condition(lambda: add_mode and add_state.get('step') in ('start', 'end', 'focus') and not add_state.get('calendar_active'))
     is_session_input = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is not None)
     is_session_idle = Condition(lambda: edit_sessions_mode and session_state.get('edit_field') is None)
-    is_task_edit_text = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-assignees', 'edit-comment'))
-    is_task_edit_nav = Condition(lambda: edit_task_mode and task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-labels'))
+    def _assignee_text_mode() -> bool:
+        if not edit_task_mode:
+            return False
+        if task_edit_state.get('mode') != 'edit-assignees':
+            return False
+        if task_edit_state.get('assignee_loading'):
+            return False
+        return not bool(task_edit_state.get('assignee_choices'))
+
+    is_task_edit_text = Condition(
+        lambda: edit_task_mode and (task_edit_state.get('mode') == 'edit-comment' or _assignee_text_mode())
+    )
+    is_task_edit_nav = Condition(
+        lambda: edit_task_mode and (
+            task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-labels')
+            or (task_edit_state.get('mode') == 'edit-assignees' and bool(task_edit_state.get('assignee_choices')))
+        )
+    )
     is_task_edit_calendar = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-date-calendar')
     is_task_edit_labels = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-labels')
+    is_task_edit_assignees = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-assignees')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_overrun_prompt = Condition(lambda: overrun_prompt is not None)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
@@ -9017,14 +9238,40 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 asyncio.create_task(_change_priority(option_id=option_id))
             elif mode == 'edit-assignees':
                 field = fields[cursor] if cursor < len(fields) else None
-                value = task_edit_state.get('input', '')
-                logins = [part.strip().lstrip('@') for part in value.replace(';', ',').split(',')]
-                logins = [login for login in logins if login]
+                if task_edit_state.get('assignee_loading'):
+                    task_edit_state['message'] = 'Assignees still loading…'
+                    invalidate(); return
+                choices = task_edit_state.get('assignee_choices') or []
+                if choices:
+                    selected = task_edit_state.get('assignees_selected') or set()
+                    if not isinstance(selected, set):
+                        selected = set(selected)
+                    ordered: List[str] = []
+                    for entry in choices:
+                        login = (entry.get('login') or '').strip()
+                        if login and login in selected:
+                            ordered.append(login)
+                    for login in sorted(selected):
+                        if login not in ordered:
+                            ordered.append(login)
+                    logins = ordered
+                else:
+                    value = task_edit_state.get('input', '')
+                    logins = [part.strip().lstrip('@') for part in value.replace(';', ',').split(',')]
+                    logins = [login for login in logins if login]
                 if field is not None:
                     field['value'] = logins
                 task_edit_state['mode'] = 'list'
                 task_edit_state['input'] = ''
                 task_edit_state['editing'] = None
+                task = task_edit_state.get('assignee_task')
+                if isinstance(task, asyncio.Task):
+                    task.cancel()
+                task_edit_state['assignee_task'] = None
+                task_edit_state['assignee_choices'] = []
+                task_edit_state['assignee_index'] = 0
+                task_edit_state['assignees_selected'] = set()
+                task_edit_state['assignee_error'] = ''
                 task_edit_state['message'] = 'Updating assignees…'
                 asyncio.create_task(_apply_assignees(logins))
             elif mode == 'edit-labels':
@@ -9402,6 +9649,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['label_index'] = idx
             task_edit_state['message'] = choices[idx]
             invalidate()
+        elif mode == 'edit-assignees':
+            if task_edit_state.get('assignee_loading'):
+                return
+            choices = task_edit_state.get('assignee_choices') or []
+            if not choices:
+                return
+            idx = (task_edit_state.get('assignee_index', 0) + 1) % len(choices)
+            task_edit_state['assignee_index'] = idx
+            display = choices[idx].get('display') or choices[idx].get('login') or ''
+            task_edit_state['message'] = display
+            invalidate()
 
     @kb.add('k', filter=is_task_edit_nav)
     @kb.add('up', filter=is_task_edit_nav)
@@ -9430,6 +9688,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             idx = (task_edit_state.get('label_index', 0) - 1) % len(choices)
             task_edit_state['label_index'] = idx
             task_edit_state['message'] = choices[idx]
+            invalidate()
+        elif mode == 'edit-assignees':
+            if task_edit_state.get('assignee_loading'):
+                return
+            choices = task_edit_state.get('assignee_choices') or []
+            if not choices:
+                return
+            idx = (task_edit_state.get('assignee_index', 0) - 1) % len(choices)
+            task_edit_state['assignee_index'] = idx
+            display = choices[idx].get('display') or choices[idx].get('login') or ''
+            task_edit_state['message'] = display
             invalidate()
 
     @kb.add('h', filter=is_task_edit_calendar)
@@ -9609,6 +9878,72 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_float = Float(content=add_window, top=3, left=4)
         floats.append(add_float)
         status_line = 'Select item type'
+        invalidate()
+
+    @kb.add('n', filter=is_normal)
+    def _(event):
+        nonlocal add_mode, add_state, add_float, status_line
+        if detail_mode or in_search:
+            return
+        choices = build_project_choices()
+        project = _find_project_choice(choices, 'StratoAdmin')
+        if not project:
+            status_line = "Quick add failed: project 'StratoAdmin' not found"
+            invalidate()
+            return
+        today_iso = dt.date.today().isoformat()
+        add_mode = True
+        add_state = {
+            'step': 'title',
+            'quick_add': True,
+            'mode': 'task',
+            'mode_index': 1,
+            'project_choices_all': choices,
+            'project_choices': [project],
+            'project_index': 0,
+            'project_meta_cache': {},
+            'repo_choices': [],
+            'repo_index': 0,
+            'repo_manual': '',
+            'repo_cursor': 0,
+            'repo_full_name': '',
+            'title': '',
+            'title_cursor': 0,
+            'start_date': today_iso,
+            'start_cursor': len(today_iso),
+            'end_date': '',
+            'end_cursor': 0,
+            'focus_date': today_iso,
+            'focus_cursor': len(today_iso),
+            'iteration_choices': [],
+            'iteration_index': 0,
+            'label_choices': [],
+            'label_index': 0,
+            'labels_selected': set(),
+            'priority_choices': [],
+            'priority_index': 0,
+            'priority_label': 'P0',
+            'priority_options': (project.get('priority_options') or []),
+            'assignee_choices': [],
+            'assignee_index': 0,
+            'assignees_selected': {'eldraco'},
+            'comment': '',
+            'comment_cursor': 0,
+            'loading_repo_metadata': False,
+            'metadata_error': '',
+            'repo_metadata_source': '',
+            'repo_metadata_task': None,
+            'calendar_active': False,
+            'calendar_field': '',
+            'calendar_date': '',
+            'calendar_prev': '',
+            'quick_assignees': ['eldraco'],
+        }
+        if add_float and add_float in floats:
+            floats.remove(add_float)
+        add_float = Float(content=add_window, top=3, left=4)
+        floats.append(add_float)
+        status_line = "Quick add: StratoAdmin (today, P0, @eldraco). Enter title"
         invalidate()
 
     @kb.add('D', filter=is_normal)
@@ -9952,6 +10287,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if add_state.get('calendar_active'):
             _confirm_add_calendar()
         step = add_state.get('step')
+        if add_state.get('quick_add') and step == 'title':
+            project = _current_add_project()
+            if not project:
+                close_add_mode('Project metadata unavailable')
+                return
+            title_val = (add_state.get('title') or '').strip()
+            if not title_val:
+                status_line = 'Title is required'
+                invalidate()
+                return
+            start_val = (add_state.get('start_date') or '').strip() or dt.date.today().isoformat()
+            focus_val = (add_state.get('focus_date') or '').strip() or start_val
+            end_val = (add_state.get('end_date') or '').strip()
+            priority_label = (add_state.get('priority_label') or '').strip() or 'P0'
+            priority_options = (add_state.get('priority_options') or [])
+            assignees = add_state.get('quick_assignees') or ['eldraco']
+            close_add_mode('Queueing quick task…')
+            asyncio.create_task(create_task_async(
+                project,
+                title_val,
+                start_val,
+                end_val,
+                focus_val,
+                '',
+                'task',
+                None,
+                None,
+                '',
+                [],
+                priority_label,
+                priority_options,
+                assignees,
+                '',
+            ))
+            return
         if step == 'mode':
             idx = add_state.get('mode_index', 0)
             add_state['mode'] = 'issue' if idx == 0 else 'task'
@@ -10327,6 +10697,29 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['message'] = ', '.join(sorted(selected)) or '(none)'
         invalidate()
 
+    @kb.add(' ', filter=is_task_edit_assignees)
+    def _(event):
+        if task_edit_state.get('assignee_loading'):
+            return
+        choices = task_edit_state.get('assignee_choices') or []
+        if not choices:
+            return
+        idx = max(0, min(len(choices)-1, task_edit_state.get('assignee_index', 0)))
+        entry = choices[idx]
+        login = (entry.get('login') or '').strip()
+        if not login:
+            return
+        selected = task_edit_state.get('assignees_selected') or set()
+        if not isinstance(selected, set):
+            selected = set(selected)
+        if login in selected:
+            selected.remove(login)
+        else:
+            selected.add(login)
+        task_edit_state['assignees_selected'] = selected
+        task_edit_state['message'] = ', '.join(sorted(selected)) or '(none)'
+        invalidate()
+
     @kb.add('u', filter=is_normal)
     def _(event):
         if detail_mode or in_search or in_date_filter:
@@ -10624,6 +11017,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "",
                 "🛠 Task Actions",
                 "  A                   Add issue / project task",
+                "  n                   Quick add (StratoAdmin, today, P0, @eldraco)",
                 "  D / I               Set status Done / In Progress",
                 "  ] / [               Priority next / previous",
                 "  T                   Set focus day to today",
