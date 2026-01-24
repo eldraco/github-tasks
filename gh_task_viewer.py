@@ -8,7 +8,7 @@
 #   Y  shift focus day +1 day
 #   y  shift focus day -1 day
 #   a  show all cached tasks
-#   n  quick add task (StratoAdmin, today, P0, @eldraco)
+#   n  quick add issue (AdminTasks, today, P0, @eldraco)
 #   P  clear project filter (show all projects again)
 #   N  toggle hide tasks with no date
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
@@ -838,6 +838,7 @@ TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
 USER_ID_CACHE: Dict[str, str] = {}
 STATUS_OPTION_CACHE: Dict[str, List[Dict[str, object]]] = {}
 PRIORITY_FIELD_CACHE: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
+ITERATION_FIELD_CACHE: Dict[Tuple[str, str], Tuple[str, List[Dict[str, object]], str]] = {}
 PEOPLE_FIELD_CACHE: Dict[str, str] = {}
 _UNSET = object()
 PENDING_URL_PREFIX = "pending://"
@@ -1640,6 +1641,61 @@ class TaskDB:
             )
         self.conn.commit()
 
+    def update_end_date(self, url: str, end_date: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET end_date=? WHERE url=?",
+            (end_date, url),
+        )
+        self.conn.commit()
+
+    def update_iteration_field(self, url: str, field_id: str, field_name: Optional[str] = None) -> None:
+        cur = self.conn.cursor()
+        if field_name is not None and field_name:
+            cur.execute(
+                "UPDATE tasks SET iteration_field_id=?, iteration_field=? WHERE url=?",
+                (field_id or '', field_name, url),
+            )
+        else:
+            cur.execute(
+                "UPDATE tasks SET iteration_field_id=? WHERE url=?",
+                (field_id or '', url),
+            )
+        self.conn.commit()
+
+    def update_iteration_options(self, url: str, options: List[Dict[str, object]]) -> None:
+        try:
+            payload = json.dumps(options or [], ensure_ascii=False)
+        except Exception:
+            payload = "[]"
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET iteration_options=? WHERE url=?",
+            (payload, url),
+        )
+        self.conn.commit()
+
+    def update_iteration(
+        self,
+        url: str,
+        title: str,
+        start_date: str,
+        duration: int,
+        field_id: Optional[str] = None,
+    ) -> None:
+        cur = self.conn.cursor()
+        if field_id is not None and field_id:
+            cur.execute(
+                "UPDATE tasks SET iteration_title=?, iteration_start=?, iteration_duration=?, iteration_field_id=? WHERE url=?",
+                (title, start_date, int(duration), field_id, url),
+            )
+        else:
+            cur.execute(
+                "UPDATE tasks SET iteration_title=?, iteration_start=?, iteration_duration=? WHERE url=?",
+                (title, start_date, int(duration), url),
+            )
+        self.conn.commit()
+
     def update_assignees(self, url: str, user_ids: List[str], logins: List[str]) -> None:
         try:
             user_ids_json = json.dumps(user_ids or [], ensure_ascii=False)
@@ -1876,10 +1932,10 @@ class TaskDB:
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                        start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
-                FROM tasks WHERE focus_date = ?
+                FROM tasks WHERE focus_date = ? OR url LIKE ?
                 ORDER BY project_title, focus_date, repo, title
                 """,
-                (today,),
+                (today, f"{PENDING_URL_PREFIX}%"),
             )
         else:
             cur.execute(
@@ -1895,6 +1951,100 @@ class TaskDB:
                 """
             )
         return [TaskRow(*r) for r in cur.fetchall()]
+
+    def ensure_pending_placeholders(self) -> int:
+        inserted = 0
+        pending = self.list_pending_actions()
+        if not pending:
+            return 0
+        cur = self.conn.cursor()
+        for action in pending:
+            if action.action_type != 'create_task':
+                continue
+            payload = action.payload or {}
+            placeholder_url = (payload.get('placeholder_url') or '').strip()
+            if not placeholder_url:
+                continue
+            cur.execute("SELECT 1 FROM tasks WHERE url=? LIMIT 1", (placeholder_url,))
+            if cur.fetchone():
+                continue
+            row = self._placeholder_from_payload(payload)
+            if row is None:
+                continue
+            self.upsert_task(row)
+            inserted += 1
+        return inserted
+
+    def _placeholder_from_payload(self, payload: Dict[str, object]) -> Optional[TaskRow]:
+        placeholder_url = (payload.get('placeholder_url') or '').strip()
+        if not placeholder_url:
+            return None
+        start_value = (payload.get('start_value') or '').strip()
+        focus_value = (payload.get('focus_value') or '').strip() or start_value
+        end_value = (payload.get('end_value') or '').strip()
+        start_field_name = (payload.get('start_field_name') or 'Start Date').strip() or 'Start Date'
+        focus_field_name = (payload.get('focus_field_name') or 'Focus Day').strip() or 'Focus Day'
+        end_field_name = (payload.get('end_field_name') or 'Due Date').strip() or 'Due Date'
+        labels_list = payload.get('labels') or []
+        if not isinstance(labels_list, list):
+            labels_list = []
+        assignees = payload.get('assignees') or []
+        if not isinstance(assignees, list):
+            assignees = []
+        priority_options = payload.get('priority_options') or []
+        if not isinstance(priority_options, list):
+            priority_options = []
+        status_options = payload.get('status_options') or []
+        if not isinstance(status_options, list):
+            status_options = []
+        now_iso = dt.datetime.utcnow().isoformat()
+        return TaskRow(
+            owner_type=str(payload.get('owner_type') or 'org'),
+            owner=str(payload.get('owner') or ''),
+            project_number=int(payload.get('project_number') or 0),
+            project_title=str(payload.get('project_title') or ''),
+            start_field=start_field_name,
+            start_date=start_value,
+            end_field=end_field_name,
+            end_date=end_value,
+            focus_field=focus_field_name,
+            focus_date=focus_value,
+            focus_field_id=str(payload.get('focus_field_id') or ''),
+            iteration_field='Iteration',
+            iteration_title='',
+            iteration_start='',
+            iteration_duration=0,
+            title=str(payload.get('title') or ''),
+            repo_id=str(payload.get('repo_id') or ''),
+            repo=str(payload.get('repo_source') or payload.get('repo_full') or ''),
+            labels=json.dumps(labels_list, ensure_ascii=False),
+            priority=str(payload.get('priority_label') or ''),
+            priority_field_id=str(payload.get('priority_field_id') or ''),
+            priority_option_id=str(payload.get('priority_option_id') or ''),
+            priority_options=json.dumps(priority_options, ensure_ascii=False),
+            priority_dirty=0,
+            priority_pending_option_id='',
+            url=placeholder_url,
+            updated_at=now_iso,
+            status=str(payload.get('status_label') or ''),
+            is_done=0,
+            assigned_to_me=0,
+            created_by_me=1,
+            item_id='',
+            project_id=str(payload.get('project_id') or ''),
+            status_field_id=str(payload.get('status_field_id') or ''),
+            status_option_id=str(payload.get('status_option_id') or ''),
+            status_options=json.dumps(status_options, ensure_ascii=False),
+            status_dirty=0,
+            status_pending_option_id='',
+            start_field_id=str(payload.get('start_field_id') or ''),
+            iteration_field_id=str(payload.get('iteration_field_id') or ''),
+            iteration_options=json.dumps(payload.get('iteration_options') or [], ensure_ascii=False),
+            assignee_field_id=str(payload.get('assignee_field_id') or ''),
+            assignee_user_ids='[]',
+            assignee_logins=json.dumps(assignees, ensure_ascii=False),
+            content_node_id='',
+        )
 
     def upsert_task(self, row: TaskRow) -> None:
         self.upsert_many([row])
@@ -2170,7 +2320,7 @@ GQL_MUTATION_CREATE_DRAFT = """mutation($projectId:ID!, $title:String!, $body:St
 }
 """
 
-GQL_MUTATION_SET_DATE = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $date:Date!) {
+GQL_MUTATION_SET_DATE = """mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $date:Date) {
   updateProjectV2ItemFieldValue(
     input:{
       projectId:$projectId,
@@ -2194,6 +2344,24 @@ GQL_MUTATION_SET_ITERATION = """mutation($projectId:ID!, $itemId:ID!, $fieldId:I
     }
   ){
     projectV2Item{ id }
+  }
+}
+"""
+
+GQL_MUTATION_UPDATE_ITERATION_FIELD = """mutation($fieldId:ID!, $iterations:[ProjectV2IterationFieldIterationInput!]!) {
+  updateProjectV2IterationField(input:{fieldId:$fieldId, iterations:$iterations}){
+    projectV2IterationField{
+      configuration{ iterations{ id title startDate duration } }
+    }
+  }
+}
+"""
+
+GQL_MUTATION_UPDATE_ITERATION_FIELD_WITH_PROJECT = """mutation($projectId:ID!, $fieldId:ID!, $iterations:[ProjectV2IterationFieldIterationInput!]!) {
+  updateProjectV2IterationField(input:{projectId:$projectId, fieldId:$fieldId, iterations:$iterations}){
+    projectV2IterationField{
+      configuration{ iterations{ id title startDate duration } }
+    }
   }
 }
 """
@@ -2276,7 +2444,17 @@ GQL_PROJECT_FIELDS = """query($id:ID!){
   node(id:$id){
     ... on ProjectV2{
       fields(first:100){
-        nodes{ ... on ProjectV2FieldCommon { id name } }
+        nodes{
+          __typename
+          ... on ProjectV2FieldCommon { id name }
+          ... on ProjectV2IterationField {
+            id
+            name
+            configuration {
+              iterations { id title startDate duration }
+            }
+          }
+        }
       }
     }
   }
@@ -2683,21 +2861,23 @@ def set_project_date(
     project_id: str,
     item_id: str,
     field_id: str,
-    date_val: str,
+    date_val: Optional[str],
     field_name: Optional[str] = None,
 ) -> str:
-    if not (project_id and item_id and date_val):
+    if not (project_id and item_id):
         return field_id or ""
     if not field_id:
         return ""
     session = _session(token)
+    date_clean = (date_val or "").strip()
+    date_payload = date_clean or None
 
     def _attempt(fid: str) -> List[Dict[str, object]]:
         variables = {
             "projectId": project_id,
             "itemId": item_id,
             "fieldId": fid,
-            "date": date_val,
+            "date": date_payload,
         }
         resp = _graphql_with_backoff(session, GQL_MUTATION_SET_DATE, variables)
         return resp.get("errors") or []
@@ -2737,6 +2917,81 @@ def set_project_iteration(token: str, project_id: str, item_id: str, field_id: s
     errs = resp.get("errors") or []
     if errs:
         raise RuntimeError("Setting iteration failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+
+
+def create_project_iteration(
+    token: str,
+    project_id: str,
+    field_id: str,
+    title: str,
+    start_date: str,
+    duration_days: int,
+    existing: Iterable[object],
+) -> List[Dict[str, object]]:
+    if not token:
+        raise RuntimeError("Cannot create iteration without GITHUB_TOKEN")
+    if not field_id:
+        raise RuntimeError("Iteration field ID required to create iterations")
+    if not _looks_like_iso_date(start_date):
+        raise RuntimeError("Iteration start date must be YYYY-MM-DD")
+    try:
+        duration_val = int(duration_days)
+    except (TypeError, ValueError):
+        raise RuntimeError("Iteration duration must be a number of days")
+    if duration_val <= 0:
+        raise RuntimeError("Iteration duration must be at least 1 day")
+    session = _session(token)
+
+    iterations_input: List[Dict[str, object]] = []
+    for opt in existing or []:
+        if not isinstance(opt, dict):
+            continue
+        start = (opt.get('startDate') or '').strip()
+        try:
+            duration_existing = int(opt.get('duration') or 0)
+        except (TypeError, ValueError):
+            duration_existing = 0
+        if not start or duration_existing <= 0:
+            continue
+        entry: Dict[str, object] = {
+            'startDate': start,
+            'duration': duration_existing,
+        }
+        opt_id = (opt.get('id') or '').strip()
+        if opt_id:
+            entry['id'] = opt_id
+        if 'title' in opt:
+            entry['title'] = opt.get('title')
+        iterations_input.append(entry)
+
+    iterations_input.append({
+        'title': title,
+        'startDate': start_date,
+        'duration': duration_val,
+    })
+
+    def _run(query: str, variables: Dict[str, object]) -> List[Dict[str, object]]:
+        resp = _graphql_with_backoff(session, query, variables)
+        errs = resp.get("errors") or []
+        if errs:
+            raise RuntimeError("; ".join(e.get("message", str(e)) for e in errs))
+        payload = (resp.get("data") or {}).get("updateProjectV2IterationField") or {}
+        field = payload.get("projectV2IterationField") or {}
+        config = field.get("configuration") or {}
+        iterations = config.get("iterations") or []
+        return _normalize_iteration_options(iterations)
+
+    if project_id:
+        try:
+            return _run(
+                GQL_MUTATION_UPDATE_ITERATION_FIELD_WITH_PROJECT,
+                {"projectId": project_id, "fieldId": field_id, "iterations": iterations_input},
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "projectId" not in msg:
+                raise
+    return _run(GQL_MUTATION_UPDATE_ITERATION_FIELD, {"fieldId": field_id, "iterations": iterations_input})
 
 
 def set_project_users(token: str, project_id: str, item_id: str, field_id: str, user_ids: List[str]) -> None:
@@ -3095,6 +3350,77 @@ def get_people_field_id(token: str, project_id: str) -> Optional[str]:
     return None
 
 
+def get_iteration_field_metadata(
+    token: str,
+    project_id: str,
+    name_regex: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, object]], str]:
+    if not project_id or not token:
+        return "", [], ""
+    cache_key = (project_id, name_regex or "")
+    cached = ITERATION_FIELD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    session = _session(token)
+    try:
+        resp = _graphql_with_backoff(session, GQL_PROJECT_FIELDS, {"id": project_id})
+    except Exception:
+        ITERATION_FIELD_CACHE[cache_key] = ("", [], "")
+        return "", [], ""
+    errs = resp.get("errors") or []
+    if errs:
+        ITERATION_FIELD_CACHE[cache_key] = ("", [], "")
+        return "", [], ""
+    node = (resp.get("data") or {}).get("node") or {}
+    fields = ((node.get("fields") or {}).get("nodes")) or []
+    regex = None
+    if name_regex:
+        try:
+            regex = re.compile(name_regex, re.IGNORECASE)
+        except Exception:
+            regex = None
+    candidates: List[Tuple[str, List[Dict[str, object]], str]] = []
+    for field_node in fields:
+        if not isinstance(field_node, dict):
+            continue
+        if field_node.get("__typename") != "ProjectV2IterationField":
+            continue
+        field_id = (field_node.get("id") or "").strip()
+        name = (field_node.get("name") or "").strip()
+        if not field_id:
+            continue
+        if regex and name and not regex.search(name):
+            continue
+        config = field_node.get("configuration") or {}
+        iterations = config.get("iterations") or []
+        options: List[Dict[str, object]] = []
+        for it in iterations:
+            if not isinstance(it, dict):
+                continue
+            it_id = (it.get("id") or "").strip()
+            if not it_id:
+                continue
+            options.append({
+                "id": it_id,
+                "title": it.get("title"),
+                "startDate": it.get("startDate"),
+                "duration": it.get("duration"),
+            })
+        candidates.append((field_id, options, name))
+    if not candidates:
+        ITERATION_FIELD_CACHE[cache_key] = ("", [], "")
+        return "", [], ""
+    if regex:
+        selected = candidates[0]
+    else:
+        selected = candidates[0]
+        for field_id, options, name in candidates:
+            if any(hint in (name or "").lower() for hint in ITERATION_FIELD_HINTS):
+                selected = (field_id, options, name)
+                break
+    ITERATION_FIELD_CACHE[cache_key] = selected
+    return selected
+
 # -----------------------------
 # Fetch with progress callback
 # -----------------------------
@@ -3109,9 +3435,100 @@ def _ascii_bar(done:int, total:int, width:int=40)->str:
 STATUS_FIELD_HINTS = ("status", "state", "progress", "stage", "column")
 PRIORITY_FIELD_HINTS = ("priority", "prio")
 PEOPLE_FIELD_HINTS = ("people", "owner", "assignee")
+ITERATION_FIELD_HINTS = ("iteration", "sprint", "cycle")
 END_FIELD_HINTS = ("end date", "due date", "target date", "finish date")
+ITERATION_CREATE_SENTINEL = "__create_iteration__"
+ITERATION_DEFAULT_DURATION_DAYS = 7
 LONG_TASK_THRESHOLD_SECONDS = 4 * 60 * 60  # 4 hours
 LONG_TASK_REPROMPT_INCREMENT = 60 * 60     # re-confirm every extra hour over threshold
+
+
+def _looks_like_iso_date(value: str) -> bool:
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", (value or "").strip()))
+
+
+def _default_iteration_duration(options: Iterable[object]) -> int:
+    for opt in reversed(list(options or [])):
+        if not isinstance(opt, dict):
+            continue
+        try:
+            duration_val = int(opt.get('duration') or 0)
+        except (TypeError, ValueError):
+            duration_val = 0
+        if duration_val > 0:
+            return duration_val
+    return ITERATION_DEFAULT_DURATION_DAYS
+
+
+def _normalize_iteration_options(raw: Iterable[object]) -> List[Dict[str, object]]:
+    cleaned: List[Dict[str, object]] = []
+    for opt in raw or []:
+        if not isinstance(opt, dict):
+            continue
+        ident = (opt.get('id') or '').strip()
+        if not ident:
+            continue
+        title = opt.get('title') or ''
+        start = opt.get('startDate') or ''
+        duration_val = opt.get('duration')
+        try:
+            duration_int = int(duration_val) if duration_val is not None else 0
+        except (TypeError, ValueError):
+            duration_int = 0
+        cleaned.append({
+            'id': ident,
+            'title': title,
+            'startDate': start,
+            'duration': duration_int,
+        })
+    return cleaned
+
+
+def _parse_iteration_create_input(raw: str, default_duration: int) -> Tuple[str, str, int]:
+    parts = [p.strip() for p in re.split(r"[|,]", raw or "") if p.strip()]
+    if not parts:
+        raise ValueError("Enter: title | YYYY-MM-DD | duration")
+    date_part = next((p for p in parts if _looks_like_iso_date(p)), "")
+    duration_part = next((p for p in parts if p.isdigit()), "")
+    title_parts = [p for p in parts if p not in {date_part, duration_part}]
+    title = " ".join(title_parts).strip()
+    if not title:
+        raise ValueError("Iteration title is required")
+    if not date_part:
+        raise ValueError("Start date required (YYYY-MM-DD)")
+    try:
+        dt.date.fromisoformat(date_part)
+    except Exception as exc:
+        raise ValueError("Invalid start date (YYYY-MM-DD)") from exc
+    if duration_part:
+        try:
+            duration_val = int(duration_part)
+        except ValueError as exc:
+            raise ValueError("Duration must be a number of days") from exc
+    else:
+        duration_val = int(default_duration)
+    if duration_val <= 0:
+        raise ValueError("Duration must be at least 1 day")
+    return title, date_part, duration_val
+
+
+def _find_iteration_option_id(options: Iterable[object], title: str, start_date: str) -> str:
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        if (opt.get('title') or '') == title and (opt.get('startDate') or '') == start_date:
+            return (opt.get('id') or '').strip()
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        if (opt.get('startDate') or '') == start_date:
+            return (opt.get('id') or '').strip()
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        if (opt.get('title') or '') == title:
+            return (opt.get('id') or '').strip()
+    return ""
 
 
 def _looks_like_status_field(name: Optional[str]) -> bool:
@@ -4125,6 +4542,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     fh.setLevel(lvl)
     fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logger.addHandler(fh)
+    logger.propagate = False
 
     def _load_state() -> dict:
         try:
@@ -4227,6 +4645,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def load_all():
         return db.load(today_only=show_today_only, today=today_date.isoformat())
 
+    db.ensure_pending_placeholders()
     all_rows = load_all()
 
     def _open_task_url(row: Optional[TaskRow]) -> None:
@@ -4260,9 +4679,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             pass
         return []
 
-    def build_project_choices() -> List[Dict[str, object]]:
+    def build_project_choices(rows: Optional[List[TaskRow]] = None) -> List[Dict[str, object]]:
         meta: Dict[Tuple[str, str, int], Dict[str, object]] = {}
-        for row in all_rows:
+        rows = all_rows if rows is None else rows
+        for row in rows:
             key = (row.owner_type, row.owner, row.project_number)
             entry = meta.setdefault(key, {
                 'owner_type': row.owner_type,
@@ -4360,13 +4780,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         target = (title or '').strip().lower()
         if not target:
             return None
+        def _norm(value: str) -> str:
+            return re.sub(r'[^a-z0-9]+', '', value.lower())
         for entry in choices:
             name = (entry.get('project_title') or '').strip().lower()
             if name == target:
                 return entry
+        target_norm = _norm(target)
         for entry in choices:
             name = (entry.get('project_title') or '').strip().lower()
             if target in name:
+                return entry
+            if target_norm and target_norm in _norm(name):
                 return entry
         return None
 
@@ -4401,8 +4826,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _build_iteration_choices(project: Dict[str, object]) -> List[Dict[str, object]]:
         opts = project.get('iteration_options') or []
         if not opts:
-            return []
-        return [{'id': '', 'title': '(None)'}] + opts
+            base: List[Dict[str, object]] = []
+        else:
+            base = list(opts)
+        choices = [{'id': '', 'title': '(None)'}] + base
+        if token and project.get('project_id'):
+            choices.append({'id': ITERATION_CREATE_SENTINEL, 'title': '➕ New iteration…'})
+        return choices
+
+    def _iteration_select_choices(options: List[Dict[str, object]], allow_create: bool) -> List[Dict[str, object]]:
+        choices = [opt for opt in (options or []) if isinstance(opt, dict)]
+        if allow_create:
+            choices.append({'id': ITERATION_CREATE_SENTINEL, 'title': '➕ New iteration…'})
+        return choices
 
     def _build_repo_choices(project: Optional[Dict[str, object]]) -> List[Dict[str, str]]:
         repo_map = (project or {}).get('repos') or {}
@@ -4691,6 +5127,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'end': '📆 End Date (optional)',
             'focus': '🎯 Focus Day (YYYY-MM-DD)',
             'iteration': '🔁 Select Iteration',
+            'iteration-create': '➕ New Iteration',
             'labels': '🏷️ Select Labels',
             'priority': '⚡ Select Priority',
             'assignee': '👥 Choose Assignees',
@@ -4789,6 +5226,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 prefix = "➤" if idx == add_state.get('iteration_index', 0) else " "
                 label = opt.get('title') or '(None)'
                 body.append(f" {prefix} {label}")
+        elif step == 'iteration-create':
+            body.append("Enter: title | YYYY-MM-DD | duration days (duration optional)")
+            default_days = _default_iteration_duration(add_state.get('iteration_choices') or [])
+            body.append(f"Default duration: {default_days} days")
+            if add_state.get('iteration_creating'):
+                body.append("")
+                body.append(" Creating iteration…")
+            elif add_state.get('iteration_create_error'):
+                body.append(f" ⚠️ {add_state.get('iteration_create_error')}")
+            raw = add_state.get('iteration_create', '')
+            cur = max(0, min(len(raw), add_state.get('iteration_create_cursor', len(raw))))
+            body.append(raw[:cur] + "_" + raw[cur:])
         elif step == 'labels':
             labels = add_state.get('label_choices') or []
             selected = add_state.get('labels_selected') or set()
@@ -5122,7 +5571,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     async def _update_task_date(field_type: str, new_value: str):
         nonlocal all_rows, status_line, current_index
-        label = 'Start Date' if field_type == 'start' else 'Focus Day'
         rows = filtered_rows()
         if not rows:
             status_line = "No task selected"
@@ -5147,13 +5595,38 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if edit_task_mode:
                 task_edit_state['message'] = msg
             invalidate(); return
-        field_id = row.start_field_id if field_type == 'start' else getattr(row, 'focus_field_id', '')
-        field_name = row.start_field if field_type == 'start' else (row.focus_field or 'Focus Day')
+        if field_type == 'start':
+            label = 'Start Date'
+            field_id = row.start_field_id
+            field_name = row.start_field or label
+        elif field_type == 'end':
+            field_id = ''
+            field_name = row.end_field or 'Due Date'
+            label = field_name
+        else:
+            label = 'Focus Day'
+            field_id = getattr(row, 'focus_field_id', '')
+            field_name = row.focus_field or label
         loop = asyncio.get_running_loop()
         if not field_id and token:
             try:
-                lookup_name = (field_name or '').strip() or ('Focus Day' if field_type == 'focus' else 'Start date')
-                field_id = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, lookup_name)) or ''
+                lookup_names: List[str] = []
+                base_name = (field_name or '').strip()
+                if base_name:
+                    lookup_names.append(base_name)
+                if field_type == 'end':
+                    lookup_names.extend(list(END_FIELD_HINTS))
+                elif field_type == 'focus':
+                    lookup_names.append('Focus Day')
+                else:
+                    lookup_names.append('Start date')
+                for lookup_name in lookup_names:
+                    field_id = await loop.run_in_executor(
+                        None,
+                        lambda name=lookup_name: get_project_field_id_by_name(token, project_id, name),
+                    ) or ''
+                    if field_id:
+                        break
             except Exception as exc:
                 field_id = ''
                 try:
@@ -5180,6 +5653,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
         if field_type == 'start':
             db.update_start_date(row.url, new_value, field_id or None)
+        elif field_type == 'end':
+            db.update_end_date(row.url, new_value)
         else:
             db.update_focus_date(row.url, new_value, field_id or None)
         all_rows = load_all()
@@ -5214,6 +5689,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if days:
             current += dt.timedelta(days=days)
         editing['calendar_date'] = current.isoformat()
+        editing['cleared'] = False
         fields[idx]['value'] = current.isoformat()
         task_edit_state['editing'] = editing
         task_edit_state['message'] = current.isoformat()
@@ -5396,6 +5872,194 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         finally:
             task_edit_state['priority_loading'] = False
             _refresh_task_editor_state(preserve_cursor=False)
+            invalidate()
+
+    async def _load_iteration_options_for_editor(row: TaskRow) -> None:
+        nonlocal all_rows, status_line
+        if not edit_task_mode:
+            return
+        if task_edit_state.get('iteration_loading'):
+            return
+        if not token:
+            msg = 'GITHUB_TOKEN required for iteration options'
+            status_line = msg
+            task_edit_state['message'] = msg
+            invalidate(); return
+        if not row or not (row.project_id or '').strip():
+            task_edit_state['message'] = 'Iteration metadata unavailable'
+            invalidate(); return
+        task_edit_state['iteration_loading'] = True
+        task_edit_state['message'] = 'Loading iteration options…'
+        invalidate()
+        loop = asyncio.get_running_loop()
+        try:
+            field_id, options, field_name = await loop.run_in_executor(
+                None,
+                lambda: get_iteration_field_metadata(token, row.project_id, cfg.iteration_field_regex),
+            )
+        except Exception as exc:
+            task_edit_state['message'] = f'Iteration options unavailable: {exc}'
+        else:
+            if field_id:
+                if field_id != (row.iteration_field_id or '').strip():
+                    db.update_iteration_field(row.url, field_id, field_name or None)
+                if options:
+                    db.update_iteration_options(row.url, options)
+                    all_rows = load_all()
+                    task_edit_state['message'] = 'Iteration options loaded'
+                else:
+                    task_edit_state['message'] = 'Iteration options unavailable'
+            else:
+                task_edit_state['message'] = 'Iteration field not configured'
+        finally:
+            task_edit_state['iteration_loading'] = False
+            _refresh_task_editor_state(preserve_cursor=False)
+            invalidate()
+
+    async def _create_iteration_for_add(
+        project: Dict[str, object],
+        title: str,
+        start_date: str,
+        duration_days: int,
+        next_step: str,
+    ) -> None:
+        nonlocal status_line
+        if not add_mode:
+            return
+        if not token:
+            msg = 'GITHUB_TOKEN required to create iterations'
+            status_line = msg
+            add_state['iteration_create_error'] = msg
+            add_state['iteration_creating'] = False
+            add_state['iteration_create_task'] = None
+            invalidate()
+            return
+        project_id = (project.get('project_id') or '').strip()
+        if not project_id:
+            msg = 'Project metadata missing ID'
+            status_line = msg
+            add_state['iteration_create_error'] = msg
+            add_state['iteration_creating'] = False
+            add_state['iteration_create_task'] = None
+            invalidate()
+            return
+        loop = asyncio.get_running_loop()
+        field_id = (project.get('iteration_field_id') or '').strip()
+        options = project.get('iteration_options') or []
+        field_name = (project.get('iteration_field') or '').strip()
+        try:
+            if not field_id or not options:
+                field_id, options, field_name = await loop.run_in_executor(
+                    None,
+                    lambda: get_iteration_field_metadata(token, project_id, cfg.iteration_field_regex),
+                )
+            if not field_id:
+                raise RuntimeError('Iteration field not configured')
+            updated_options = await loop.run_in_executor(
+                None,
+                lambda: create_project_iteration(
+                    token, project_id, field_id, title, start_date, duration_days, options
+                ),
+            )
+            new_id = _find_iteration_option_id(updated_options, title, start_date)
+        except Exception as exc:
+            msg = f"Iteration create failed: {exc}"
+            status_line = msg
+            add_state['iteration_create_error'] = msg
+            add_state['iteration_creating'] = False
+            add_state['iteration_create_task'] = None
+            invalidate()
+            return
+        project['iteration_field_id'] = field_id
+        project['iteration_options'] = updated_options
+        cache_key = (project_id, cfg.iteration_field_regex or "")
+        ITERATION_FIELD_CACHE[cache_key] = (field_id, updated_options, field_name or "")
+        add_state['iteration_choices'] = _build_iteration_choices(project)
+        add_state['iteration_index'] = 0
+        if new_id:
+            for idx, opt in enumerate(add_state.get('iteration_choices') or []):
+                if (opt.get('id') or '') == new_id:
+                    add_state['iteration_index'] = idx
+                    break
+        add_state['iteration_create'] = ''
+        add_state['iteration_create_cursor'] = 0
+        add_state['iteration_creating'] = False
+        add_state['iteration_create_task'] = None
+        add_state['step'] = next_step
+        status_line = f"Iteration created: {title}"
+        invalidate()
+
+    async def _create_iteration_for_editor(title: str, start_date: str, duration_days: int) -> None:
+        nonlocal all_rows, status_line
+        if not edit_task_mode:
+            return
+        if not token:
+            msg = 'GITHUB_TOKEN required to create iterations'
+            status_line = msg
+            task_edit_state['message'] = msg
+            task_edit_state['iteration_create_task'] = None
+            invalidate()
+            return
+        rows = filtered_rows()
+        if not rows:
+            status_line = 'No task selected'
+            task_edit_state['message'] = status_line
+            task_edit_state['iteration_create_task'] = None
+            invalidate()
+            return
+        row = rows[current_index]
+        project_id = (row.project_id or '').strip()
+        if not project_id:
+            msg = 'Task missing project metadata'
+            status_line = msg
+            task_edit_state['message'] = msg
+            task_edit_state['iteration_create_task'] = None
+            invalidate()
+            return
+        loop = asyncio.get_running_loop()
+        field_id = (row.iteration_field_id or '').strip()
+        options = _json_list(row.iteration_options)
+        field_name = (row.iteration_field or '').strip()
+        try:
+            if not field_id or not options:
+                field_id, options, field_name = await loop.run_in_executor(
+                    None,
+                    lambda: get_iteration_field_metadata(token, project_id, cfg.iteration_field_regex),
+                )
+            if not field_id:
+                raise RuntimeError('Iteration field not configured')
+            updated_options = await loop.run_in_executor(
+                None,
+                lambda: create_project_iteration(
+                    token, project_id, field_id, title, start_date, duration_days, options
+                ),
+            )
+            new_id = _find_iteration_option_id(updated_options, title, start_date)
+        except Exception as exc:
+            msg = f"Iteration create failed: {exc}"
+            status_line = msg
+            task_edit_state['message'] = msg
+            task_edit_state['iteration_create_task'] = None
+            invalidate()
+            return
+        if field_id:
+            if field_id != (row.iteration_field_id or '').strip():
+                db.update_iteration_field(row.url, field_id, field_name or None)
+            db.update_iteration_options(row.url, updated_options)
+        cache_key = (project_id, cfg.iteration_field_regex or "")
+        ITERATION_FIELD_CACHE[cache_key] = (field_id, updated_options, field_name or "")
+        all_rows = load_all()
+        _refresh_task_editor_state(preserve_cursor=False)
+        if new_id:
+            option = next((opt for opt in updated_options if (opt.get('id') or '') == new_id), None)
+        else:
+            option = None
+        task_edit_state['iteration_create_task'] = None
+        if option:
+            await _apply_iteration(option)
+        else:
+            status_line = f"Iteration created: {title}"
+            task_edit_state['message'] = status_line
             invalidate()
 
     def _collect_project_assignees(project_id: str) -> List[str]:
@@ -5797,6 +6461,49 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 _refresh_task_editor_state()
             invalidate()
 
+    async def _apply_iteration(option: Dict[str, object]) -> None:
+        nonlocal all_rows, status_line, current_index
+        if not token:
+            status_line = "GITHUB_TOKEN required for iteration updates"
+            invalidate(); return
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate(); return
+        row = rows[current_index]
+        if not (row.project_id and row.item_id and row.iteration_field_id):
+            status_line = "Task missing iteration metadata"
+            invalidate(); return
+        iteration_id = (option.get('id') or '').strip()
+        if not iteration_id:
+            status_line = "Iteration option missing id"
+            invalidate(); return
+        title = (option.get('title') or '').strip()
+        start = (option.get('startDate') or '').strip()
+        try:
+            duration = int(option.get('duration') or 0)
+        except Exception:
+            duration = 0
+        label = title or start or iteration_id
+        status_line = f"Updating iteration to {label}…"
+        invalidate()
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: set_project_iteration(token, row.project_id, row.item_id, row.iteration_field_id, iteration_id),
+            )
+        except Exception as exc:
+            status_line = f"Iteration update failed: {exc}"
+            invalidate(); return
+        db.update_iteration(row.url, title, start, duration, row.iteration_field_id)
+        all_rows = load_all()
+        status_line = f"Iteration set to {label}"
+        if edit_task_mode:
+            task_edit_state['message'] = status_line
+            _refresh_task_editor_state()
+        invalidate()
+
     def _safe_date(s: str) -> Optional[dt.date]:
         try:
             return dt.date.fromisoformat(s)
@@ -5809,21 +6516,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             logger.debug("apply_filters start: hide_done=%s hide_no_date=%s project_cycle=%r in_search=%s search_term=%r search_buffer=%r", hide_done, hide_no_date, project_cycle, in_search, search_term, search_buffer)
         except Exception:
             pass
+        def _is_pending(row: TaskRow) -> bool:
+            return (row.url or '').startswith(PENDING_URL_PREFIX)
         if hide_done:
-            out = [r for r in out if not r.is_done]
+            out = [r for r in out if _is_pending(r) or not r.is_done]
         if hide_no_date:
             if use_iteration:
-                out = [r for r in out if r.iteration_title or r.iteration_start]
+                out = [r for r in out if _is_pending(r) or r.iteration_title or r.iteration_start]
             else:
-                out = [r for r in out if r.focus_date]
+                out = [r for r in out if _is_pending(r) or r.focus_date]
         if not include_created:
-            out = [r for r in out if not (r.created_by_me and not r.assigned_to_me)]
+            out = [r for r in out if _is_pending(r) or not (r.created_by_me and not r.assigned_to_me)]
         if project_cycle:
-            out = [r for r in out if r.project_title == project_cycle]
+            out = [r for r in out if _is_pending(r) or r.project_title == project_cycle]
         active_search = search_buffer if in_search else search_term
         if active_search:
             needle = active_search.lower()
-            out = [r for r in out if needle in (r.title or '').lower() or
+            out = [r for r in out if _is_pending(r) or needle in (r.title or '').lower() or
                                    needle in (r.repo or '').lower() or
                                    needle in (r.priority or '').lower() or
                                    needle in (r.status or '').lower() or
@@ -5833,6 +6542,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if dm:
                 tmp: List[TaskRow] = []
                 for r in out:
+                    if _is_pending(r):
+                        tmp.append(r)
+                        continue
                     if not r.focus_date:
                         continue
                     rsd = _safe_date(r.focus_date)
@@ -6027,6 +6739,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'field_key': 'start',
             'value': row.start_date or '',
         })
+        end_label = row.end_field or 'Due Date'
+        fields.append({
+            'name': end_label,
+            'type': 'date',
+            'field_key': 'end',
+            'value': row.end_date or '',
+        })
         focus_label = row.focus_field or 'Focus Day'
         fields.append({
             'name': focus_label,
@@ -6034,6 +6753,48 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'field_key': 'focus',
             'value': row.focus_date or '',
         })
+        iteration_opts = _json_list(row.iteration_options)
+        iter_field_id = (row.iteration_field_id or '').strip()
+        iter_field_name = (row.iteration_field or '').strip()
+        iter_value = (row.iteration_title or '').strip() or (row.iteration_start or '').strip()
+        if (not iter_field_id or not iteration_opts or not iter_field_name) and token and row.project_id:
+            cache_key = (row.project_id, cfg.iteration_field_regex or "")
+            cached = ITERATION_FIELD_CACHE.get(cache_key)
+            if cached:
+                cached_field_id, cached_opts, cached_name = cached
+                if cached_field_id and not iter_field_id:
+                    iter_field_id = cached_field_id
+                if cached_opts and not iteration_opts:
+                    iteration_opts = cached_opts
+                if cached_name and not iter_field_name:
+                    iter_field_name = cached_name
+        show_iteration = bool(iteration_opts or iter_field_id or iter_value or (token and row.project_id))
+        if show_iteration:
+            current_idx = 0
+            if iteration_opts and (row.iteration_title or row.iteration_start):
+                target_title = (row.iteration_title or '').strip()
+                target_start = (row.iteration_start or '').strip()
+                for idx, opt in enumerate(iteration_opts):
+                    if not isinstance(opt, dict):
+                        continue
+                    opt_title = (opt.get('title') or '').strip()
+                    opt_start = (opt.get('startDate') or '').strip()
+                    if target_title and opt_title == target_title:
+                        current_idx = idx
+                        if not target_start or opt_start == target_start:
+                            break
+                    if target_start and opt_start == target_start:
+                        current_idx = idx
+                        break
+            fields.append({
+                'name': iter_field_name or 'Iteration',
+                'type': 'iteration',
+                'field_key': 'iteration',
+                'options': iteration_opts,
+                'index': current_idx,
+                'value': iter_value,
+                'field_available': bool(iter_field_id or (token and row.project_id)),
+            })
         priority_opts = _priority_options(row)
         priority_field_known = bool((row.priority_field_id or '').strip())
         if priority_opts or priority_field_known:
@@ -6145,6 +6906,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['cursor'] = cursor
         task_edit_state['task_url'] = row.url
         task_edit_state['priority_loading'] = False
+        task_edit_state['iteration_loading'] = False
+        task_edit_state['iteration_choice_index'] = 0
         task_edit_state['assignee_loading'] = False
         task_edit_state['assignee_choices'] = []
         task_edit_state['assignee_index'] = 0
@@ -6987,6 +7750,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             app.layout.focus(table_window)
         return None
 
+    table_kb = KeyBindings()
+
     class _TableFormattedTextControl(FormattedTextControl):
         def __init__(self, *args, click_handler: Optional[Callable[[MouseEvent], object]] = None, **kwargs):
             self._click_handler = click_handler
@@ -7003,6 +7768,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         text=lambda: build_table_fragments(),
         focusable=True,
         click_handler=_handle_table_mouse if _MOUSE_EVENTS_AVAILABLE else None,
+        key_bindings=table_kb,
     )
     table_window = Window(content=table_control, wrap_lines=False, always_hide_cursor=True)
     # Top status bar: shows date, current project, total tasks shown, and active search filter
@@ -7500,6 +8266,24 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                         value = ', '.join(vals) or '-'
                     else:
                         value = str(vals) or '-'
+                elif ftype == 'iteration':
+                    opts = field_info.get('options') or []
+                    index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
+                    if opts:
+                        opt = opts[index]
+                        title = (opt.get('title') or '').strip()
+                        start = (opt.get('startDate') or '').strip()
+                        if title and start:
+                            value = f"{title} ({start})"
+                        else:
+                            value = title or start or '-'
+                    else:
+                        value = field_info.get('value') or ''
+                        if not value:
+                            if field_info.get('field_available'):
+                                value = '(load options)'
+                            else:
+                                value = '(none)'
                 elif ftype == 'priority-text':
                     value = field_info.get('value') or '-'
                 elif ftype == 'comment':
@@ -7531,7 +8315,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 cursor_date = dt.date.today()
             cal = calendar.Calendar(firstweekday=0)
             add_blank()
-            add_line(f"🗓️ Select {fields[cursor].get('name')} (h/l day, j/k week, </> month, t today)", 'class:editor.instructions')
+            add_line(f"🗓️ Select {fields[cursor].get('name')} (h/l day, j/k week, </> month, t today, x clear)", 'class:editor.instructions')
             add_line(cursor_date.strftime("%B %Y"), 'class:editor.calendar')
             day_header = ''.join(f" {calendar.day_abbr[i][:2]} " for i in range(7))
             add_line(day_header, 'class:editor.calendar')
@@ -7560,6 +8344,31 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 name = (opt.get('name') if isinstance(opt, dict) else None) or '(option)'
                 style = 'class:editor.priority.cursor' if i == idx else 'class:editor.priority'
                 add_line(f"   {marker} {name}", style)
+        elif mode == 'iteration-select':
+            field = fields[cursor] if cursor < len(fields) else None
+            opts = (field or {}).get('options') or []
+            allow_create = bool(token and row and row.project_id)
+            choices = _iteration_select_choices(opts, allow_create)
+            idx = task_edit_state.get('iteration_choice_index', (field or {}).get('index', 0))
+            idx = max(0, min(idx, len(choices)-1)) if choices else 0
+            add_blank()
+            add_line("🔁 Select iteration (j/k move, Enter=save, Esc=cancel)", 'class:editor.instructions')
+            for i, opt in enumerate(choices):
+                marker = '➤' if i == idx else ' '
+                title = (opt.get('title') if isinstance(opt, dict) else None) or '(iteration)'
+                start = (opt.get('startDate') or '').strip() if isinstance(opt, dict) else ''
+                label = f"{title} ({start})" if title and start else (title or start or '(iteration)')
+                style = 'class:editor.priority.cursor' if i == idx else 'class:editor.priority'
+                add_line(f"   {marker} {label}", style)
+        elif mode == 'iteration-create':
+            field = fields[cursor] if cursor < len(fields) else None
+            opts = (field or {}).get('options') or []
+            default_days = _default_iteration_duration(opts)
+            add_blank()
+            add_line("➕ New iteration: title | YYYY-MM-DD | duration days (duration optional)", 'class:editor.instructions')
+            add_line(f"Default duration: {default_days} days", 'class:editor.meta')
+            add_line(f"✏️  {task_edit_state.get('input', '')}", 'class:editor.entry')
+            add_line("Enter=create · Esc=cancel", 'class:editor.instructions')
         elif mode == 'edit-assignees':
             add_blank()
             if task_edit_state.get('assignee_loading'):
@@ -8134,6 +8943,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task = add_state.get('repo_metadata_task') if isinstance(add_state, dict) else None
         if isinstance(task, asyncio.Task):
             task.cancel()
+        task = add_state.get('iteration_create_task') if isinstance(add_state, dict) else None
+        if isinstance(task, asyncio.Task):
+            task.cancel()
         add_mode = False
         add_state = {}
         if message is not None:
@@ -8149,6 +8961,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if isinstance(task, asyncio.Task):
             task.cancel()
         task = task_edit_state.get('labels_task') if isinstance(task_edit_state, dict) else None
+        if isinstance(task, asyncio.Task):
+            task.cancel()
+        task = task_edit_state.get('iteration_create_task') if isinstance(task_edit_state, dict) else None
         if isinstance(task, asyncio.Task):
             task.cancel()
         edit_task_mode = False
@@ -8187,6 +9002,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'task_url': row.url,
             'editing': None,
             'priority_loading': False,
+            'iteration_loading': False,
+            'iteration_choice_index': 0,
+            'iteration_create_task': None,
             'assignee_loading': False,
             'assignee_choices': [],
             'assignee_index': 0,
@@ -8215,6 +9033,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if mode == 'priority-select' and idx is not None and idx < len(fields):
             prev_idx = editing.get('prev_index', fields[idx].get('index', 0))
             fields[idx]['index'] = prev_idx
+        if mode == 'iteration-select' and idx is not None and idx < len(fields):
+            prev_idx = editing.get('prev_index', fields[idx].get('index', 0))
+            fields[idx]['index'] = prev_idx
+            prev_choice_idx = editing.get('prev_choice_index', prev_idx)
+            task_edit_state['iteration_choice_index'] = prev_choice_idx
         if mode == 'edit-assignees' and idx is not None and idx < len(fields):
             prev_list = editing.get('prev_value', fields[idx].get('value', []))
             fields[idx]['value'] = list(prev_list) if isinstance(prev_list, list) else []
@@ -8235,10 +9058,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['labels_task'] = None
             task_edit_state['labels_loading'] = False
             task_edit_state['labels_error'] = ''
+        if mode == 'iteration-create':
+            task = task_edit_state.get('iteration_create_task')
+            if isinstance(task, asyncio.Task):
+                task.cancel()
+            task_edit_state['iteration_create_task'] = None
         task_edit_state['mode'] = 'list'
         task_edit_state['input'] = ''
         task_edit_state['editing'] = None
         task_edit_state['priority_loading'] = False
+        task_edit_state['iteration_loading'] = False
         task_edit_state['assignee_loading'] = False
         task_edit_state['message'] = message or 'Edit cancelled'
         invalidate()
@@ -8264,11 +9093,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'field_idx': cursor,
                 'prev_value': field.get('value', ''),
                 'calendar_date': base_date.isoformat(),
+                'cleared': False,
             }
             field['value'] = base_date.isoformat()
             task_edit_state['mode'] = 'edit-date-calendar'
             task_edit_state['editing'] = editing_state
-            task_edit_state['message'] = 'Use h/j/k/l to move, </> month, t=Today, Enter=save, Esc=cancel'
+            task_edit_state['message'] = 'Use h/j/k/l to move, </> month, t=Today, x=clear, Enter=save, Esc=cancel'
         elif ftype == 'priority':
             options = field.get('options') or []
             rows = filtered_rows()
@@ -8282,6 +9112,29 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['mode'] = 'priority-select'
             task_edit_state['editing'] = {'field_idx': cursor, 'prev_index': field.get('index', 0)}
             task_edit_state['message'] = 'Use j/k to choose priority (Enter=save, Esc=cancel)'
+        elif ftype == 'iteration':
+            options = field.get('options') or []
+            rows = filtered_rows()
+            row = rows[current_index] if rows else None
+            if not row:
+                task_edit_state['message'] = 'No task selected'
+                return
+            if not options or not (row.iteration_field_id or '').strip():
+                if task_edit_state.get('iteration_loading'):
+                    task_edit_state['message'] = 'Loading iteration options…'
+                    invalidate()
+                    return
+                asyncio.create_task(_load_iteration_options_for_editor(row))
+                return
+            task_edit_state['mode'] = 'iteration-select'
+            choice_index = max(0, min(field.get('index', 0), len(options)-1)) if options else 0
+            task_edit_state['iteration_choice_index'] = choice_index
+            task_edit_state['editing'] = {
+                'field_idx': cursor,
+                'prev_index': field.get('index', 0),
+                'prev_choice_index': choice_index,
+            }
+            task_edit_state['message'] = 'Use j/k to choose iteration (Enter=save, Esc=cancel)'
         elif ftype == 'assignees':
             rows = filtered_rows()
             if not rows:
@@ -8404,11 +9257,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         return not bool(task_edit_state.get('assignee_choices'))
 
     is_task_edit_text = Condition(
-        lambda: edit_task_mode and (task_edit_state.get('mode') == 'edit-comment' or _assignee_text_mode())
+        lambda: edit_task_mode and (
+            task_edit_state.get('mode') in ('edit-comment', 'iteration-create') or _assignee_text_mode()
+        )
     )
     is_task_edit_nav = Condition(
         lambda: edit_task_mode and (
-            task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'edit-labels')
+            task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'iteration-select', 'edit-labels')
             or (task_edit_state.get('mode') == 'edit-assignees' and bool(task_edit_state.get('assignee_choices')))
         )
     )
@@ -8418,6 +9273,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_overrun_prompt = Condition(lambda: overrun_prompt is not None)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
+    is_quick_add_allowed = Condition(lambda: not (add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -8478,7 +9334,20 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return True
         if not field_id:
             try:
-                lookup = await loop.run_in_executor(None, lambda: get_project_field_id_by_name(token, project_id, field_name))
+                lookup = None
+                lookup_names: List[str] = []
+                base_name = (field_name or '').strip()
+                if base_name:
+                    lookup_names.append(base_name)
+                if field_type == 'end':
+                    lookup_names.extend(list(END_FIELD_HINTS))
+                for name in lookup_names:
+                    lookup = await loop.run_in_executor(
+                        None,
+                        lambda n=name: get_project_field_id_by_name(token, project_id, n),
+                    )
+                    if lookup:
+                        break
             except Exception as exc:
                 status_line = f"{field_name} sync failed: {exc}"
                 try:
@@ -8510,6 +9379,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         db.remove_pending_action(action.id)
         if field_type == 'start':
             db.update_start_date(url, value, field_id)
+        elif field_type == 'end':
+            db.update_end_date(url, value)
         else:
             db.update_focus_date(url, value, field_id)
         all_rows = load_all()
@@ -9133,11 +10004,25 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         status_line = "Task queued locally (press 'u' to sync)"
         invalidate()
 
+    async def _safe_create_task_async(*args, **kwargs) -> None:
+        nonlocal status_line
+        try:
+            await create_task_async(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            status_line = f"Create task failed: {exc}"
+            try:
+                logger.exception("Create task failed")
+            except Exception:
+                pass
+            invalidate()
+
     @kb.add('q')
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
         if edit_task_mode:
-            if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select'):
+            if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create'):
                 _cancel_task_edit('Edit cancelled')
             else:
                 close_task_editor('Field editor closed')
@@ -9216,9 +10101,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     _cancel_task_edit('Field unavailable')
                     return
                 value = editing.get('calendar_date') or field.get('value', '')
-                if not value:
+                cleared = bool(editing.get('cleared'))
+                if not value and not cleared:
                     task_edit_state['message'] = 'Select a date'
                     invalidate(); return
+                if cleared:
+                    value = ''
                 field['value'] = value
                 task_edit_state['mode'] = 'list'
                 task_edit_state['editing'] = None
@@ -9236,6 +10124,51 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['editing'] = None
                 task_edit_state['message'] = f"Updating {field.get('name')}…"
                 asyncio.create_task(_change_priority(option_id=option_id))
+            elif mode == 'iteration-select':
+                field = fields[cursor] if cursor < len(fields) else None
+                options = (field or {}).get('options') or []
+                rows_local = filtered_rows()
+                row = rows_local[current_index] if rows_local else None
+                choices = _iteration_select_choices(options, bool(token and row and row.project_id))
+                if not field or not choices:
+                    _cancel_task_edit('Iteration options unavailable')
+                    return
+                idx = int(task_edit_state.get('iteration_choice_index', field.get('index', 0)) or 0)
+                idx = max(0, min(idx, len(choices)-1))
+                option = choices[idx]
+                if (option.get('id') or '') == ITERATION_CREATE_SENTINEL:
+                    task_edit_state['mode'] = 'iteration-create'
+                    task_edit_state['input'] = ''
+                    task_edit_state['editing'] = {'field_idx': cursor}
+                    task_edit_state['message'] = 'Enter iteration: title | YYYY-MM-DD | duration'
+                    invalidate()
+                    return
+                field['index'] = max(0, min(idx, len(options)-1))
+                task_edit_state['mode'] = 'list'
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = f"Updating {field.get('name')}…"
+                asyncio.create_task(_apply_iteration(option))
+            elif mode == 'iteration-create':
+                field = fields[cursor] if cursor < len(fields) else None
+                options = (field or {}).get('options') or []
+                default_days = _default_iteration_duration(options)
+                raw = (task_edit_state.get('input', '') or '').strip()
+                try:
+                    title_val, start_val, duration_val = _parse_iteration_create_input(raw, default_days)
+                except ValueError as exc:
+                    task_edit_state['message'] = str(exc)
+                    invalidate()
+                    return
+                task_edit_state['mode'] = 'list'
+                task_edit_state['input'] = ''
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = 'Creating iteration…'
+                task = task_edit_state.get('iteration_create_task')
+                if isinstance(task, asyncio.Task):
+                    task.cancel()
+                task_edit_state['iteration_create_task'] = asyncio.create_task(
+                    _create_iteration_for_editor(title_val, start_val, duration_val)
+                )
             elif mode == 'edit-assignees':
                 field = fields[cursor] if cursor < len(fields) else None
                 if task_edit_state.get('assignee_loading'):
@@ -9416,9 +10349,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             invalidate()
 
     # filters
-    @kb.add('d', filter=is_normal)
+    @kb.add('d', filter=is_normal, eager=True)
     def _(event):
         if detail_mode or in_search:
+            return
+        if (getattr(event, 'data', '') or '') == 'D':
+            asyncio.create_task(_apply_status_change('done'))
             return
         nonlocal hide_done, current_index
         hide_done = not hide_done
@@ -9637,6 +10573,26 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             fields[idx]['index'] = (fields[idx].get('index', 0) + 1) % len(options)
             task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
             invalidate()
+        elif mode == 'iteration-select':
+            fields = task_edit_state.get('fields') or []
+            editing = task_edit_state.get('editing') or {}
+            idx = editing.get('field_idx')
+            if idx is None or idx >= len(fields):
+                return
+            options = fields[idx].get('options') or []
+            rows_local = filtered_rows()
+            row = rows_local[current_index] if rows_local else None
+            choices = _iteration_select_choices(options, bool(token and row and row.project_id))
+            if not choices:
+                return
+            choice_idx = int(task_edit_state.get('iteration_choice_index', fields[idx].get('index', 0)) or 0)
+            choice_idx = (choice_idx + 1) % len(choices)
+            task_edit_state['iteration_choice_index'] = choice_idx
+            opt = choices[choice_idx]
+            title = (opt.get('title') or '').strip() if isinstance(opt, dict) else ''
+            start = (opt.get('startDate') or '').strip() if isinstance(opt, dict) else ''
+            task_edit_state['message'] = title or start or '-'
+            invalidate()
         elif mode == 'edit-date-calendar':
             _calendar_adjust(days=7)
         elif mode == 'edit-labels':
@@ -9677,6 +10633,26 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             fields[idx]['index'] = (fields[idx].get('index', 0) - 1) % len(options)
             task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
             invalidate()
+        elif mode == 'iteration-select':
+            fields = task_edit_state.get('fields') or []
+            editing = task_edit_state.get('editing') or {}
+            idx = editing.get('field_idx')
+            if idx is None or idx >= len(fields):
+                return
+            options = fields[idx].get('options') or []
+            rows_local = filtered_rows()
+            row = rows_local[current_index] if rows_local else None
+            choices = _iteration_select_choices(options, bool(token and row and row.project_id))
+            if not choices:
+                return
+            choice_idx = int(task_edit_state.get('iteration_choice_index', fields[idx].get('index', 0)) or 0)
+            choice_idx = (choice_idx - 1) % len(choices)
+            task_edit_state['iteration_choice_index'] = choice_idx
+            opt = choices[choice_idx]
+            title = (opt.get('title') or '').strip() if isinstance(opt, dict) else ''
+            start = (opt.get('startDate') or '').strip() if isinstance(opt, dict) else ''
+            task_edit_state['message'] = title or start or '-'
+            invalidate()
         elif mode == 'edit-date-calendar':
             _calendar_adjust(days=-7)
         elif mode == 'edit-labels':
@@ -9715,6 +10691,24 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return
         _calendar_adjust(days=1)
 
+    @kb.add('x', filter=is_task_edit_calendar)
+    @kb.add('X', filter=is_task_edit_calendar)
+    @kb.add('delete', filter=is_task_edit_calendar)
+    @kb.add('backspace', filter=is_task_edit_calendar)
+    def _(event):
+        if task_edit_state.get('mode') != 'edit-date-calendar':
+            return
+        editing = task_edit_state.get('editing') or {}
+        editing['calendar_date'] = ''
+        editing['cleared'] = True
+        task_edit_state['editing'] = editing
+        fields = task_edit_state.get('fields') or []
+        idx = editing.get('field_idx')
+        if idx is not None and idx < len(fields):
+            fields[idx]['value'] = ''
+        task_edit_state['message'] = 'Date cleared (Enter to save)'
+        invalidate()
+
     @kb.add('t', filter=is_task_edit_calendar)
     def _(event):
         if task_edit_state.get('mode') != 'edit-date-calendar':
@@ -9722,6 +10716,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         today = dt.date.today()
         editing = task_edit_state.get('editing') or {}
         editing['calendar_date'] = today.isoformat()
+        editing['cleared'] = False
         task_edit_state['editing'] = editing
         fields = task_edit_state.get('fields') or []
         idx = editing.get('field_idx')
@@ -9814,12 +10809,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         session_state['input'] = buf + ch  # type: ignore[index]
         invalidate()
 
-    @kb.add('A', filter=is_normal)
-    def _(event):
+    def open_add_dialog() -> None:
         nonlocal add_mode, add_state, add_float, status_line
         if detail_mode or in_search:
             return
         choices = build_project_choices()
+        if not choices:
+            try:
+                fallback_rows = db.load(today_only=False)
+            except Exception:
+                fallback_rows = []
+            if fallback_rows:
+                choices = build_project_choices(fallback_rows)
         if not choices:
             status_line = "No projects available to add task"
             invalidate()
@@ -9851,6 +10852,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'focus_cursor': len(today_iso),
             'iteration_choices': [],
             'iteration_index': 0,
+            'iteration_create': '',
+            'iteration_create_cursor': 0,
+            'iteration_create_error': '',
+            'iteration_creating': False,
+            'iteration_create_task': None,
             'label_choices': [],
             'label_index': 0,
             'labels_selected': set(),
@@ -9880,15 +10886,93 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         status_line = 'Select item type'
         invalidate()
 
-    @kb.add('n', filter=is_normal)
-    def _(event):
+    def _refresh_project_cache() -> bool:
+        if not token:
+            return False
+        cache = _load_target_cache()
+        updated = False
+        session = _session(token)
+        for spec in cfg.projects:
+            cache_key = f"{spec.owner_type}:{spec.owner}"
+            try:
+                discovered = discover_open_projects(session, spec.owner_type, spec.owner)
+            except Exception as exc:
+                try:
+                    logger.warning("Quick add discovery failed for %s: %s", cache_key, exc)
+                except Exception:
+                    pass
+                continue
+            cleaned: List[Dict[str, object]] = []
+            for entry in discovered:
+                try:
+                    num_val = int(entry.get("number"))
+                except Exception:
+                    continue
+                cleaned.append({
+                    "number": num_val,
+                    "title": entry.get("title") or "",
+                    "project_id": entry.get("id") or "",
+                })
+            if cleaned:
+                cache[cache_key] = cleaned
+                updated = True
+        if updated:
+            _save_target_cache(cache)
+        return updated
+
+    QUICK_ADD_PROJECT_ALIASES = (
+        'AdminTasks',
+        'Admin Tasks',
+        'StratoAdmin',
+        'Strato Administration',
+        'StratoAdministration',
+    )
+
+    def _select_quick_add_project(choices: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+        for name in QUICK_ADD_PROJECT_ALIASES:
+            project = _find_project_choice(choices, name)
+            if project:
+                return project
+        admin_matches = [
+            entry for entry in choices
+            if 'admin' in (entry.get('project_title') or '').lower()
+        ]
+        if len(admin_matches) == 1:
+            return admin_matches[0]
+        return None
+
+    def open_quick_add() -> None:
         nonlocal add_mode, add_state, add_float, status_line
-        if detail_mode or in_search:
+        nonlocal detail_mode, show_report, in_search, in_date_filter, search_buffer, date_buffer
+        if add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt:
             return
+        if show_report or detail_mode:
+            show_report = False
+            detail_mode = False
+            floats.clear()
+        if in_search:
+            in_search = False
+            search_buffer = ""
+        if in_date_filter:
+            in_date_filter = False
+            date_buffer = ""
         choices = build_project_choices()
-        project = _find_project_choice(choices, 'StratoAdmin')
+        project = _select_quick_add_project(choices)
         if not project:
-            status_line = "Quick add failed: project 'StratoAdmin' not found"
+            try:
+                fallback_rows = db.load(today_only=False)
+            except Exception:
+                fallback_rows = []
+            if fallback_rows:
+                choices = build_project_choices(fallback_rows)
+                project = _select_quick_add_project(choices)
+        if not project:
+            refreshed = _refresh_project_cache()
+            if refreshed:
+                choices = build_project_choices()
+                project = _select_quick_add_project(choices)
+        if not project:
+            status_line = "Quick add failed: project not found"
             invalidate()
             return
         today_iso = dt.date.today().isoformat()
@@ -9896,8 +10980,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_state = {
             'step': 'title',
             'quick_add': True,
-            'mode': 'task',
-            'mode_index': 1,
+            'mode': 'issue',
+            'mode_index': 0,
             'project_choices_all': choices,
             'project_choices': [project],
             'project_index': 0,
@@ -9917,6 +11001,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'focus_cursor': len(today_iso),
             'iteration_choices': [],
             'iteration_index': 0,
+            'iteration_create': '',
+            'iteration_create_cursor': 0,
+            'iteration_create_error': '',
+            'iteration_creating': False,
+            'iteration_create_task': None,
             'label_choices': [],
             'label_index': 0,
             'labels_selected': set(),
@@ -9943,10 +11032,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             floats.remove(add_float)
         add_float = Float(content=add_window, top=3, left=4)
         floats.append(add_float)
-        status_line = "Quick add: StratoAdmin (today, P0, @eldraco). Enter title"
+        status_line = "Quick add: AdminTasks issue (today, P0, @eldraco). Enter title"
         invalidate()
 
-    @kb.add('D', filter=is_normal)
+    @kb.add('A', filter=is_normal)
+    def _(event):
+        open_add_dialog()
+
+    @kb.add('n', filter=is_quick_add_allowed, eager=True)
+    def _(event):
+        open_quick_add()
+
+    @table_kb.add('n', filter=is_quick_add_allowed, eager=True)
+    def _(event):
+        open_quick_add()
+
+    @table_kb.add('D', filter=is_normal, eager=True)
+    def _(event):
+        if detail_mode or in_search:
+            return
+        asyncio.create_task(_apply_status_change('done'))
+
+    @kb.add('D', filter=is_normal, eager=True)
     def _(event):
         if detail_mode or in_search:
             return
@@ -9971,12 +11078,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     def _add_delete_one():
         step = add_state.get('step')
+        if step == 'iteration-create' and add_state.get('iteration_creating'):
+            return
         field_map = {
             'title': ('title', 'title_cursor'),
             'start': ('start_date', 'start_cursor'),
             'end': ('end_date', 'end_cursor'),
             'focus': ('focus_date', 'focus_cursor'),
             'comment': ('comment', 'comment_cursor'),
+            'iteration-create': ('iteration_create', 'iteration_create_cursor'),
         }
         if step in field_map:
             field_key, cursor_key = field_map[step]
@@ -10002,12 +11112,15 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         # Forward delete at cursor
         step = add_state.get('step')
         changed = False
+        if step == 'iteration-create' and add_state.get('iteration_creating'):
+            return
         field_map = {
             'title': ('title', 'title_cursor'),
             'start': ('start_date', 'start_cursor'),
             'end': ('end_date', 'end_cursor'),
             'focus': ('focus_date', 'focus_cursor'),
             'comment': ('comment', 'comment_cursor'),
+            'iteration-create': ('iteration_create', 'iteration_create_cursor'),
         }
         if step in field_map:
             field_key, cursor_key = field_map[step]
@@ -10038,6 +11151,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _move_cursor('focus_date', -1)
         elif step == 'comment':
             _move_cursor('comment', -1)
+        elif step == 'iteration-create':
+            _move_cursor('iteration_create', -1, 'iteration_create_cursor')
         elif step == 'repo' and not add_state.get('repo_choices'):
             _move_cursor('repo_manual', -1, 'repo_cursor')
         invalidate()
@@ -10055,6 +11170,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _move_cursor('focus_date', 1)
         elif step == 'comment':
             _move_cursor('comment', 1)
+        elif step == 'iteration-create':
+            _move_cursor('iteration_create', 1, 'iteration_create_cursor')
         elif step == 'repo' and not add_state.get('repo_choices'):
             _move_cursor('repo_manual', 1, 'repo_cursor')
         invalidate()
@@ -10127,7 +11244,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         _cycle_add(-1)
         invalidate()
 
-    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') in ('title','comment')))
+    @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') in ('title','comment','iteration-create')))
     def _(event):
         ch = event.data or ""
         if not ch or ch in ('\n', '\r'):
@@ -10136,8 +11253,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         field_map = {
             'title': ('title', 'title_cursor'),
             'comment': ('comment', 'comment_cursor'),
+            'iteration-create': ('iteration_create', 'iteration_create_cursor'),
         }
         field_key, cursor_key = field_map.get(step, ('title', 'title_cursor'))
+        if step == 'iteration-create' and add_state.get('iteration_creating'):
+            return
         text = add_state.get(field_key, '')
         cur = max(0, min(len(text), add_state.get(cursor_key, len(text))))
         add_state[field_key] = text[:cur] + ch + text[cur:]
@@ -10292,6 +11412,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             if not project:
                 close_add_mode('Project metadata unavailable')
                 return
+            repo_choices = _build_repo_choices(project)
+            if not repo_choices:
+                status_line = "Quick add requires a repository to create an issue"
+                invalidate()
+                return
+            repo_choice = repo_choices[0]
+            repo_full = (repo_choice.get('repo') or '').strip()
+            if not repo_full:
+                status_line = "Quick add repository metadata missing owner/name"
+                invalidate()
+                return
             title_val = (add_state.get('title') or '').strip()
             if not title_val:
                 status_line = 'Title is required'
@@ -10303,18 +11434,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             priority_label = (add_state.get('priority_label') or '').strip() or 'P0'
             priority_options = (add_state.get('priority_options') or [])
             assignees = add_state.get('quick_assignees') or ['eldraco']
-            close_add_mode('Queueing quick task…')
-            asyncio.create_task(create_task_async(
+            close_add_mode('Queueing quick issue…')
+            asyncio.create_task(_safe_create_task_async(
                 project,
                 title_val,
                 start_val,
                 end_val,
                 focus_val,
                 '',
-                'task',
+                'issue',
+                repo_choice,
                 None,
-                None,
-                '',
+                repo_full,
                 [],
                 priority_label,
                 priority_options,
@@ -10432,12 +11563,56 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_state['title_cursor'] = len(add_state.get('title', ''))
             status_line = 'Enter title'
         elif step == 'iteration':
+            choices = add_state.get('iteration_choices') or []
+            if choices:
+                idx = add_state.get('iteration_index', 0)
+                opt = choices[max(0, min(idx, len(choices)-1))]
+                if (opt.get('id') or '') == ITERATION_CREATE_SENTINEL:
+                    add_state['iteration_create'] = ''
+                    add_state['iteration_create_cursor'] = 0
+                    add_state['iteration_create_error'] = ''
+                    add_state['step'] = 'iteration-create'
+                    status_line = 'Enter iteration details'
+                    invalidate()
+                    return
             if add_state.get('mode', 'issue') == 'issue':
                 add_state['step'] = 'labels'
                 status_line = 'Select labels (space to toggle)'
             else:
                 add_state['step'] = 'confirm'
                 status_line = 'Review and confirm'
+        elif step == 'iteration-create':
+            if add_state.get('iteration_creating'):
+                status_line = 'Iteration creation in progress…'
+                invalidate()
+                return
+            project = _current_add_project()
+            if not project:
+                status_line = 'Project metadata unavailable'
+                invalidate()
+                return
+            raw = (add_state.get('iteration_create') or '').strip()
+            default_days = _default_iteration_duration(add_state.get('iteration_choices') or [])
+            try:
+                title_val, start_val, duration_val = _parse_iteration_create_input(raw, default_days)
+            except ValueError as exc:
+                msg = str(exc)
+                add_state['iteration_create_error'] = msg
+                status_line = msg
+                invalidate()
+                return
+            next_step = 'labels' if add_state.get('mode', 'issue') == 'issue' else 'confirm'
+            add_state['iteration_creating'] = True
+            add_state['iteration_create_error'] = ''
+            status_line = 'Creating iteration…'
+            task = add_state.get('iteration_create_task')
+            if isinstance(task, asyncio.Task):
+                task.cancel()
+            add_state['iteration_create_task'] = asyncio.create_task(
+                _create_iteration_for_add(project, title_val, start_val, duration_val, next_step)
+            )
+            invalidate()
+            return
         elif step == 'labels':
             if add_state.get('loading_repo_metadata'):
                 status_line = 'Labels still loading…'
@@ -10511,6 +11686,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 idx = add_state.get('iteration_index', 0)
                 opt = iteration_choices[max(0, min(idx, len(iteration_choices)-1))]
                 iteration_id = opt.get('id') or ''
+                if iteration_id == ITERATION_CREATE_SENTINEL:
+                    iteration_id = ''
             repo_choice = None
             repo_manual = None
             repo_full = (add_state.get('repo_full_name') or '').strip()
@@ -10545,7 +11722,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             mode_val = add_state.get('mode', 'issue')
             priority_options = (add_state.get('priority_options') or [])
             close_add_mode('Queueing item…')
-            asyncio.create_task(create_task_async(
+            asyncio.create_task(_safe_create_task_async(
                 project,
                 title_val,
                 start_val,
@@ -10600,7 +11777,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _cancel_add_calendar('Calendar cancelled')
             return
         if edit_task_mode:
-            if task_edit_state.get('mode') in ('edit-date', 'priority-select'):
+            if task_edit_state.get('mode') in ('edit-date', 'edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create'):
                 _cancel_task_edit('Edit cancelled')
             else:
                 close_task_editor('Field editor closed')
@@ -10641,7 +11818,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add('backspace', filter=is_task_edit_text)
     def _(event):
         mode = task_edit_state.get('mode')
-        if mode in ('edit-assignees', 'edit-comment'):
+        if mode in ('edit-assignees', 'edit-comment', 'iteration-create'):
             buf = task_edit_state.get('input', '')
             if buf:
                 task_edit_state['input'] = buf[:-1]
@@ -10668,7 +11845,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add(Keys.Any, filter=is_task_edit_text)
     def _(event):
         mode = task_edit_state.get('mode')
-        if mode not in ('edit-assignees', 'edit-comment'):
+        if mode not in ('edit-assignees', 'edit-comment', 'iteration-create'):
             return
         ch = event.data or ''
         if not ch or ch in ('\r', '\n'):
@@ -11017,7 +12194,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 "",
                 "🛠 Task Actions",
                 "  A                   Add issue / project task",
-                "  n                   Quick add (StratoAdmin, today, P0, @eldraco)",
+                "  n                   Quick add (AdminTasks issue, today, P0, @eldraco)",
                 "  D / I               Set status Done / In Progress",
                 "  ] / [               Priority next / previous",
                 "  T                   Set focus day to today",
