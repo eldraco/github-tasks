@@ -836,6 +836,7 @@ def _load_theme_presets(theme_dir: Path) -> List[ThemePreset]:
 
 TARGET_CACHE_PATH = os.path.expanduser("~/.gh_tasks.targets.json")
 USER_ID_CACHE: Dict[str, str] = {}
+VIEWER_LOGIN_CACHE: Optional[str] = None
 STATUS_OPTION_CACHE: Dict[str, List[Dict[str, object]]] = {}
 PRIORITY_FIELD_CACHE: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
 ITERATION_FIELD_CACHE: Dict[Tuple[str, str], Tuple[str, List[Dict[str, object]], str]] = {}
@@ -890,6 +891,7 @@ class TaskRow:
     iteration_start: str = ""
     iteration_duration: int = 0
     title: str = ""
+    description: str = ""
     repo_id: str = ""
     repo: Optional[str] = None
     labels: str = "[]"
@@ -934,7 +936,7 @@ class TaskDB:
         "start_field","start_date","end_field","end_date",
         "focus_field","focus_date","focus_field_id",
         "iteration_field","iteration_title","iteration_start","iteration_duration",
-        "title","repo_id","repo","labels","priority","priority_field_id","priority_option_id","priority_options","priority_dirty","priority_pending_option_id","url","updated_at","status","is_done","assigned_to_me","created_by_me",
+        "title","description","repo_id","repo","labels","priority","priority_field_id","priority_option_id","priority_options","priority_dirty","priority_pending_option_id","url","updated_at","status","is_done","assigned_to_me","created_by_me",
         "item_id","project_id","status_field_id","status_option_id","status_options","status_dirty","status_pending_option_id",
         "start_field_id","iteration_field_id","iteration_options","assignee_field_id","assignee_user_ids","assignee_logins","content_node_id"
     ]
@@ -956,6 +958,7 @@ class TaskDB:
         iteration_start TEXT,
         iteration_duration INTEGER DEFAULT 0,
         title TEXT NOT NULL,
+        description TEXT,
         repo_id TEXT,
         repo TEXT,
         labels TEXT,
@@ -1031,7 +1034,7 @@ class TaskDB:
             "start_field":"''","start_date":"''","end_field":"''","end_date":"''",
             "focus_field":"''","focus_date":"''","focus_field_id":"''",
             "iteration_field":"''","iteration_title":"''","iteration_start":"''","iteration_duration":"0",
-            "title":"''","repo_id":"''","repo":"NULL","labels":"'[]'","priority":"NULL","priority_field_id":"''","priority_option_id":"''","priority_options":"'[]'","priority_dirty":"0","priority_pending_option_id":"''","url":"''",
+            "title":"''","description":"''","repo_id":"''","repo":"NULL","labels":"'[]'","priority":"NULL","priority_field_id":"''","priority_option_id":"''","priority_options":"'[]'","priority_dirty":"0","priority_pending_option_id":"''","url":"''",
             "updated_at":"datetime('now')","status":"NULL","is_done":"0",
             "assigned_to_me":"0","created_by_me":"0",
             "item_id":"''","project_id":"''","status_field_id":"''","status_option_id":"''",
@@ -1649,6 +1652,14 @@ class TaskDB:
         )
         self.conn.commit()
 
+    def update_title(self, url: str, title: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET title=? WHERE url=?",
+            (title, url),
+        )
+        self.conn.commit()
+
     def update_iteration_field(self, url: str, field_id: str, field_name: Optional[str] = None) -> None:
         cur = self.conn.cursor()
         if field_name is not None and field_name:
@@ -1800,19 +1811,20 @@ class TaskDB:
               start_field, start_date, end_field, end_date,
               focus_field, focus_date, focus_field_id,
               iteration_field, iteration_title, iteration_start, iteration_duration,
-              title, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
+              title, description, repo_id, repo, labels, priority, priority_field_id, priority_option_id, priority_options, priority_dirty, priority_pending_option_id,
               url, updated_at, status, is_done, assigned_to_me, created_by_me,
               item_id, project_id, status_field_id, status_option_id, status_options, status_dirty, status_pending_option_id,
               start_field_id, iteration_field_id, iteration_options, assignee_field_id, assignee_user_ids, assignee_logins, content_node_id
             ) VALUES (
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(owner_type, owner, project_number, title, url, start_field, start_date)
             DO UPDATE SET project_title=excluded.project_title,
                           repo=excluded.repo,
+                          description=excluded.description,
                           updated_at=excluded.updated_at,
                           end_field=excluded.end_field,
                           end_date=excluded.end_date,
@@ -1865,6 +1877,7 @@ class TaskDB:
                     r.iteration_start,
                     r.iteration_duration,
                     r.title,
+                    getattr(r, 'description', ''),
                     r.repo_id,
                     r.repo,
                     r.labels,
@@ -1928,7 +1941,7 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,end_field,end_date,focus_field,focus_date,focus_field_id,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
+                       title,description,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                        start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
@@ -1942,7 +1955,7 @@ class TaskDB:
                 """                SELECT owner_type,owner,project_number,project_title,start_field,
                        start_date,end_field,end_date,focus_field,focus_date,focus_field_id,
                        iteration_field,iteration_title,iteration_start,iteration_duration,
-                       title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
+                       title,description,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                        url,updated_at,status,is_done,assigned_to_me,created_by_me,
                        item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                        start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
@@ -2060,7 +2073,7 @@ class TaskDB:
             """            SELECT owner_type,owner,project_number,project_title,start_field,
                    start_date,end_field,end_date,focus_field,focus_date,focus_field_id,
                    iteration_field,iteration_title,iteration_start,iteration_duration,
-                   title,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
+                   title,description,repo_id,repo,labels,priority,priority_field_id,priority_option_id,priority_options,priority_dirty,priority_pending_option_id,
                    url,updated_at,status,is_done,assigned_to_me,created_by_me,
                    item_id,project_id,status_field_id,status_option_id,status_options,status_dirty,status_pending_option_id,
                    start_field_id,iteration_field_id,iteration_options,assignee_field_id,assignee_user_ids,assignee_logins,content_node_id
@@ -2166,15 +2179,18 @@ GQL_SCAN_ORG = """query($org:String!, $number:Int!, $after:String) {
             ... on DraftIssue {
               title
               creator { login }
+              bodyText
             }
             ... on Issue {
               title url repository{ id nameWithOwner }
+              bodyText
               assignees(first:50){ nodes{ id login } }
               author { login }
               labels(first:50){ nodes{ name color } }
             }
             ... on PullRequest {
               title url repository{ id nameWithOwner }
+              bodyText
               assignees(first:50){ nodes{ id login } }
               author { login }
               labels(first:50){ nodes{ name color } }
@@ -2238,15 +2254,18 @@ GQL_SCAN_USER = """query($login:String!, $number:Int!, $after:String) {
             ... on DraftIssue {
               title
               creator { login }
+              bodyText
             }
             ... on Issue {
               title url repository{ id nameWithOwner }
+              bodyText
               assignees(first:50){ nodes{ id login } }
               author { login }
               labels(first:50){ nodes{ name color } }
             }
             ... on PullRequest {
               title url repository{ id nameWithOwner }
+              bodyText
               assignees(first:50){ nodes{ id login } }
               author { login }
               labels(first:50){ nodes{ name color } }
@@ -2423,6 +2442,7 @@ GQL_MUTATION_SET_USERS_TEMPLATE = """mutation($projectId:ID!, $itemId:ID!, $fiel
 """
 
 GQL_QUERY_USER_ID = """query($login:String!){ user(login:$login){ id login } }"""
+GQL_QUERY_VIEWER = """query{ viewer{ login } }"""
 
 GQL_MUTATION_CREATE_ISSUE = """mutation($repositoryId:ID!, $title:String!, $body:String, $assigneeIds:[ID!]) {
   createIssue(input:{repositoryId:$repositoryId, title:$title, body:$body, assigneeIds:$assigneeIds}){
@@ -2471,10 +2491,27 @@ GQL_FIELD_OPTIONS = """query($id:ID!){
 }
 """
 
-def _session(token: str) -> requests.Session:
+GITHUB_ACCEPT_HEADER = "application/vnd.github+json"
+PROJECTS_V2_PREVIEW_ACCEPT = ",".join([
+    "application/vnd.github.starfox-preview+json",
+    "application/vnd.github.inertia-preview+json",
+])
+
+
+def _build_accept_header(extra_accept: Optional[str] = None) -> str:
+    accepts = [GITHUB_ACCEPT_HEADER]
+    if extra_accept:
+        for entry in extra_accept.split(","):
+            entry = entry.strip()
+            if entry and entry not in accepts:
+                accepts.append(entry)
+    return ", ".join(accepts)
+
+
+def _session(token: str, extra_accept: Optional[str] = None) -> requests.Session:
     s = requests.Session()
     s.headers["Authorization"] = f"Bearer {token}"
-    s.headers["Accept"] = "application/vnd.github+json"
+    s.headers["Accept"] = _build_accept_header(extra_accept)
     return s
 
 
@@ -2919,6 +2956,14 @@ def set_project_iteration(token: str, project_id: str, item_id: str, field_id: s
         raise RuntimeError("Setting iteration failed: " + "; ".join(e.get("message", str(e)) for e in errs))
 
 
+def _needs_iteration_preview(msg: str) -> bool:
+    low = (msg or "").lower()
+    if "updateprojectv2iterationfield" in low or "projectv2iterationfielditerationinput" in low:
+        if "doesn't exist" in low or "does not exist" in low or "isn't a defined input type" in low or "not defined" in low:
+            return True
+    return False
+
+
 def create_project_iteration(
     token: str,
     project_id: str,
@@ -2970,10 +3015,14 @@ def create_project_iteration(
         'duration': duration_val,
     })
 
-    def _run(query: str, variables: Dict[str, object]) -> List[Dict[str, object]]:
+    def _run(session: requests.Session, query: str, variables: Dict[str, object]) -> List[Dict[str, object]]:
         resp = _graphql_with_backoff(session, query, variables)
         errs = resp.get("errors") or []
         if errs:
+            try:
+                logging.getLogger('gh_task_viewer').error("create_project_iteration error: %s", errs)
+            except Exception:
+                pass
             raise RuntimeError("; ".join(e.get("message", str(e)) for e in errs))
         payload = (resp.get("data") or {}).get("updateProjectV2IterationField") or {}
         field = payload.get("projectV2IterationField") or {}
@@ -2981,17 +3030,38 @@ def create_project_iteration(
         iterations = config.get("iterations") or []
         return _normalize_iteration_options(iterations)
 
-    if project_id:
-        try:
-            return _run(
-                GQL_MUTATION_UPDATE_ITERATION_FIELD_WITH_PROJECT,
-                {"projectId": project_id, "fieldId": field_id, "iterations": iterations_input},
-            )
-        except RuntimeError as exc:
-            msg = str(exc)
-            if "projectId" not in msg:
+    def _run_with_session(session: requests.Session) -> List[Dict[str, object]]:
+        if project_id:
+            try:
+                return _run(
+                    session,
+                    GQL_MUTATION_UPDATE_ITERATION_FIELD_WITH_PROJECT,
+                    {"projectId": project_id, "fieldId": field_id, "iterations": iterations_input},
+                )
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "projectid" not in msg.lower():
+                    raise
+        return _run(session, GQL_MUTATION_UPDATE_ITERATION_FIELD, {"fieldId": field_id, "iterations": iterations_input})
+
+    session = _session(token)
+    try:
+        return _run_with_session(session)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if _needs_iteration_preview(msg):
+            preview_session = _session(token, PROJECTS_V2_PREVIEW_ACCEPT)
+            try:
+                return _run_with_session(preview_session)
+            except RuntimeError as exc2:
+                msg2 = str(exc2)
+                if _needs_iteration_preview(msg2):
+                    raise RuntimeError(
+                        "Iteration creation not supported by this GitHub API (missing updateProjectV2IterationField). "
+                        "Create the iteration in GitHub UI or upgrade the server."
+                    ) from exc2
                 raise
-    return _run(GQL_MUTATION_UPDATE_ITERATION_FIELD, {"fieldId": field_id, "iterations": iterations_input})
+        raise
 
 
 def set_project_users(token: str, project_id: str, item_id: str, field_id: str, user_ids: List[str]) -> None:
@@ -3054,6 +3124,26 @@ def set_issue_labels(token: str, issue_url: str, labels: List[str]) -> None:
     )
     if r.status_code >= 300:
         raise RuntimeError(f"Label update failed ({r.status_code}): {r.text}")
+
+
+def set_issue_title(token: str, issue_url: str, title: str) -> None:
+    parts = _parse_issue_url(issue_url)
+    if not parts or token is None:
+        raise RuntimeError("Issue URL required for title update")
+    owner, repo, number = parts
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+    }
+    import requests as _rq
+    r = _rq.patch(
+        f'https://api.github.com/repos/{owner}/{repo}/issues/{number}',
+        headers=headers,
+        json={'title': title},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Title update failed ({r.status_code}): {r.text}")
 
 
 def set_issue_assignees(token: str, issue_url: str, assignees: List[str]) -> None:
@@ -3159,6 +3249,23 @@ def get_user_node_id(token: str, login: str) -> str:
         user_id = ""
     USER_ID_CACHE[login_key] = user_id
     return user_id
+
+
+def get_viewer_login(token: str) -> str:
+    global VIEWER_LOGIN_CACHE
+    if VIEWER_LOGIN_CACHE:
+        return VIEWER_LOGIN_CACHE
+    session = _session(token)
+    resp = _graphql_with_backoff(session, GQL_QUERY_VIEWER, {})
+    errs = resp.get("errors") or []
+    if errs:
+        raise RuntimeError("Viewer lookup failed: " + "; ".join(e.get("message", str(e)) for e in errs))
+    try:
+        login = ((resp.get("data") or {}).get("viewer") or {}).get("login") or ""
+    except Exception:
+        login = ""
+    VIEWER_LOGIN_CACHE = login
+    return login
 
 
 def create_issue(token: str, repository_id: str, title: str, body: str, assignee_ids: List[str]) -> Dict[str, str]:
@@ -3630,7 +3737,17 @@ def fetch_tasks_github(
     regex = re.compile(cfg.date_field_regex, re.IGNORECASE)
     iter_regex = re.compile(cfg.iteration_field_regex, re.IGNORECASE) if cfg.iteration_field_regex else None
     me = cfg.user
-    me_login = me.strip().lower()
+    me_logins: Set[str] = set()
+    if me:
+        me_logins.add(me.strip().lower())
+    viewer_login = ""
+    if token:
+        try:
+            viewer_login = get_viewer_login(token)
+        except Exception:
+            viewer_login = ""
+    if viewer_login:
+        me_logins.add(viewer_login.strip().lower())
     def _norm_login(login: Optional[str]) -> Optional[str]:
         if isinstance(login, str):
             return login.strip().lower()
@@ -3641,6 +3758,7 @@ def fetch_tasks_github(
     target_cache = _load_target_cache()
     cache_updated = False
     targets: List[Tuple[str,str,int,str]] = []
+    target_set: Set[Tuple[str, str, int]] = set()
     for spec in cfg.projects:
         cache_key = f"{spec.owner_type}:{spec.owner}"
         if spec.numbers is None:
@@ -3662,31 +3780,46 @@ def fetch_tasks_github(
                     continue
                 title = n.get("title") or ""
                 project_id_val = n.get("id") or ""
-                targets.append((spec.owner_type, spec.owner, num_int, title))
+                key = (spec.owner_type, spec.owner, num_int)
+                if key not in target_set:
+                    targets.append((spec.owner_type, spec.owner, num_int, title))
+                    target_set.add(key)
                 discovered.append({"number": num_int, "title": title, "project_id": project_id_val})
             if discovered:
                 target_cache[cache_key] = discovered
                 cache_updated = True
-            elif cache_key in target_cache:
-                cached_entries = target_cache.get(cache_key) or []
-                if cached_entries:
+            cached_entries = target_cache.get(cache_key) or []
+            if cached_entries:
+                try:
+                    logging.getLogger('gh_task_viewer').info(
+                        "Using cached projects for %s: %d entries", cache_key, len(cached_entries)
+                    )
+                except Exception:
+                    pass
+                for entry in cached_entries:
                     try:
-                        logging.getLogger('gh_task_viewer').warning(
-                            "Project discovery empty for %s; using cached project list", cache_key)
+                        num_int = int(entry.get("number"))
                     except Exception:
-                        pass
-                    for entry in cached_entries:
-                        try:
-                            num_int = int(entry.get("number"))
-                        except Exception:
-                            continue
-                        targets.append((spec.owner_type, spec.owner, num_int, entry.get("title") or ""))
-                else:
-                    target_cache.pop(cache_key, None)
-                    cache_updated = True
+                        continue
+                    key = (spec.owner_type, spec.owner, num_int)
+                    if key in target_set:
+                        continue
+                    targets.append((spec.owner_type, spec.owner, num_int, entry.get("title") or ""))
+                    target_set.add(key)
+            elif cache_key in target_cache:
+                target_cache.pop(cache_key, None)
+                cache_updated = True
         else:
             for num in spec.numbers:
-                targets.append((spec.owner_type, spec.owner, int(num), ""))
+                try:
+                    num_int = int(num)
+                except (TypeError, ValueError):
+                    continue
+                key = (spec.owner_type, spec.owner, num_int)
+                if key in target_set:
+                    continue
+                targets.append((spec.owner_type, spec.owner, num_int, ""))
+                target_set.add(key)
 
     if cache_updated:
         _save_target_cache(target_cache)
@@ -3780,6 +3913,11 @@ def fetch_tasks_github(
                     repo_id = rep.get("id") or ""
 
                 label_names: List[str] = []
+                desc_candidate = content.get("bodyText") or content.get("body") or ""
+                if isinstance(desc_candidate, str):
+                    desc_text = desc_candidate.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+                else:
+                    desc_text = ""
                 if ctype in ("Issue", "PullRequest"):
                     for node in (content.get("labels") or {}).get("nodes") or []:
                         nm = (node or {}).get("name")
@@ -3920,8 +4058,8 @@ def fetch_tasks_github(
                     author_login_norm = _norm_login(((content.get("creator") or {})).get("login"))
                 elif ctype in ("Issue", "PullRequest"):
                     author_login_norm = _norm_login(((content.get("author") or {})).get("login"))
-                assigned_to_me = (me_login in assignees_norm) or (me_login in people_logins)
-                created_by_me = author_login_norm == me_login if author_login_norm else False
+                assigned_to_me = bool(me_logins and ((set(assignees_norm) & me_logins) or (set(people_logins) & me_logins)))
+                created_by_me = bool(author_login_norm and author_login_norm in me_logins)
                 if (not assigned_to_me) and (not created_by_me) and (not include_unassigned):
                     continue
 
@@ -4024,6 +4162,7 @@ def fetch_tasks_github(
                                 iteration_start=iteration_start,
                                 iteration_duration=iteration_duration,
                                 title=title, repo=repo,
+                                description=desc_text,
                                 labels=json.dumps(label_names, ensure_ascii=False),
                                 priority=priority_text,
                                 priority_field_id=priority_field_id,
@@ -4072,6 +4211,7 @@ def fetch_tasks_github(
                             iteration_duration=iteration_duration,
                             title=title + (" (unassigned)" if not assigned_to_me else ""),
                             repo=repo,
+                            description=desc_text,
                             labels=json.dumps(label_names, ensure_ascii=False),
                             priority=priority_text,
                             priority_field_id=priority_field_id,
@@ -5288,10 +5428,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 marker = '✔' if entry.get('login') in selected else ' '
                 body.append(f" {prefix} [{marker}] {entry.get('display') or entry.get('login')}")
         elif step == 'comment':
-            body.append("Type an optional comment, Enter to continue, Esc cancel")
+            body.append("Type an optional comment (Ctrl+J=newline), Enter to continue, Esc cancel")
             comment = add_state.get('comment', '')
             cur = max(0, min(len(comment), add_state.get('comment_cursor', len(comment))))
-            body.append(comment[:cur] + "_" + comment[cur:])
+            display = comment[:cur] + "_" + comment[cur:]
+            for line in display.splitlines():
+                body.append(line)
         elif step == 'confirm':
             title_val = add_state.get('title', '').strip()
             start_val = (add_state.get('start_date') or '').strip() or '(auto)'
@@ -5320,7 +5462,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if login in assignees_selected:
                     assignee_display.append(entry.get('display') or login)
             assignee_display.extend(sorted({login for login in assignees_selected if login not in {e.get('login') for e in assignee_entries}}))
-            comment_val = add_state.get('comment', '').strip() or '(none)'
+            comment_val = add_state.get('comment', '')
 
             body.append("Review and press Enter to create, Esc cancel")
             body.append("")
@@ -5337,7 +5479,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 body.append(f"🏷️ Labels   : {', '.join(label_list) if label_list else '(none)'}")
                 body.append(f"⚡ Priority : {priority_label}")
                 body.append(f"👥 Assignees: {', '.join(assignee_display) if assignee_display else '(none)'}")
-                body.append(f"💬 Comment  : {comment_val}")
+                if comment_val.strip():
+                    lines = comment_val.splitlines() or ['']
+                    body.append(f"💬 Comment  : {lines[0]}")
+                    for line in lines[1:]:
+                        body.append(f"             {line}")
+                else:
+                    body.append("💬 Comment  : (none)")
 
         def boxed(title: str, lines: List[str], width: int = 92) -> str:
             inner = width - 2
@@ -5400,11 +5548,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         low = (name or "").lower()
         return int(any(kw in low for kw in status_keywords['done']))
 
+    def _pending_create_action_for_url(url: str) -> Optional[PendingAction]:
+        if not (url or '').startswith(PENDING_URL_PREFIX):
+            return None
+        try:
+            pending_actions = db.list_pending_actions()
+        except Exception:
+            return None
+        for action in pending_actions:
+            if action.action_type != 'create_task':
+                continue
+            payload = action.payload or {}
+            if (payload.get('placeholder_url') or '').strip() == url:
+                return action
+        return None
+
     async def _apply_status_change(target: str):
         nonlocal all_rows, status_line, current_index
-        if not token:
-            status_line = "GITHUB_TOKEN required for status updates"
-            invalidate(); return
         rows = filtered_rows()
         if not rows:
             status_line = "No task selected"
@@ -5412,162 +5572,84 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         current_index = max(0, min(len(rows)-1, current_index))
         row = rows[current_index]
         selected_url = row.url
-        pending_create_action: Optional[PendingAction] = None
-        if (row.item_id or "").strip() == "" and selected_url.startswith(PENDING_URL_PREFIX):
-            try:
-                pending_actions = db.list_pending_actions()
-            except Exception:
-                pending_actions = []
-            else:
-                for action in pending_actions:
-                    if action.action_type != 'create_task':
-                        continue
-                    payload = action.payload or {}
-                    if (payload.get('placeholder_url') or '').strip() == selected_url:
-                        pending_create_action = action
-                        if not row.status_field_id:
-                            row.status_field_id = (payload.get('status_field_id') or '').strip()
-                        break
-        if row.url in pending_status_urls:
-            status_line = "Status update already in progress"
-            invalidate(); return
-        status_options_cached = _normalize_status_options(_json_list(row.status_options))
-        if not status_options_cached and pending_create_action:
-            status_options_cached = _normalize_status_options(pending_create_action.payload.get('status_options') or [])
-        if (row.project_id and not row.status_field_id) or not status_options_cached:
-            fetched_field_id, fetched_options = await _ensure_status_field_metadata(row.project_id or '', row.status_field_id or '', status_options_cached)
-            if fetched_field_id and fetched_field_id != (row.status_field_id or ''):
-                row.status_field_id = fetched_field_id
-                try:
-                    db.update_status_field(row.url, fetched_field_id)
-                except Exception:
-                    pass
-            if fetched_options:
-                status_options_cached = fetched_options
-                try:
-                    db.update_status_options(row.url, fetched_options)
-                except Exception:
-                    pass
-                row.status_options = json.dumps(fetched_options, ensure_ascii=False)
-        if not (row.project_id and row.item_id and row.status_field_id):
-            if pending_create_action and row.project_id and row.status_field_id:
+        pending_create_action = _pending_create_action_for_url(selected_url)
+        if pending_create_action and not row.status_field_id:
+            row.status_field_id = (pending_create_action.payload or {}).get('status_field_id', '') or ''
+        if pending_create_action:
+            status_options_cached = _normalize_status_options(_json_list(row.status_options))
+            if not status_options_cached:
+                status_options_cached = _normalize_status_options(pending_create_action.payload.get('status_options') or [])
+            option_id, display_name = ("", "")
+            if status_options_cached:
                 option_id, display_name = _match_status_option(row, target)
-                if not option_id and status_options_cached:
+                if not option_id:
                     preferred_name = target.replace('_', ' ').strip().title() or target
                     option_id, display_name = _select_status_option(status_options_cached, preferred_name)
-                if not option_id:
-                    status_line = f"No status option matches '{target}'"
-                    invalidate(); return
-                new_is_done = _is_done_name(display_name)
-                try:
-                    db.reset_status(row.url, display_name, option_id, new_is_done)
-                except Exception as exc:
-                    status_line = f"Failed to cache status: {exc}"
-                    invalidate(); return
-                payload_update = dict(pending_create_action.payload or {})
-                payload_update['status_label'] = display_name
-                payload_update['status_option_id'] = option_id
-                if row.status_field_id:
-                    payload_update['status_field_id'] = row.status_field_id
-                if status_options_cached:
-                    payload_update['status_options'] = status_options_cached
-                try:
-                    db.update_pending_action(pending_create_action.id, payload_update)
-                except Exception as exc:
-                    status_line = f"Failed to update queued create: {exc}"
-                    invalidate(); return
-                all_rows = load_all()
-                status_line = f"Status set to {display_name} (queued create)"
-                invalidate()
-                return
-            if not row.project_id or not row.item_id:
-                status_line = "Task missing project metadata"
-                invalidate(); return
-            fallback_id = row.status_field_id or payload_field_id or ''
-            if fallback_id:
-                status_options_cached = _normalize_status_options(_json_list(row.status_options)) or [{'id': 'todo', 'name': 'Todo'}]
-                option_id, display_name = _select_status_option(status_options_cached, target)
-                if not option_id:
-                    option_id = fallback_id
-                    display_name = target.title()
-            else:
-                status_line = "Task missing status metadata"
-                invalidate(); return
-        option_id, display_name = _match_status_option(row, target)
-        if not option_id and token and row.status_field_id:
+            if not display_name:
+                display_name = target.replace('_', ' ').strip().title() or target
+            new_is_done = _is_done_name(display_name)
             try:
-                fetched_opts = get_project_field_options(token, row.status_field_id)
+                db.reset_status(row.url, display_name, option_id, new_is_done)
             except Exception as exc:
-                fetched_opts = []
-                try:
-                    logger.warning("Unable to fetch status options for %s: %s", row.status_field_id, exc)
-                except Exception:
-                    pass
-            if fetched_opts:
-                try:
-                    db.update_status_options_by_field(row.status_field_id, fetched_opts)
-                except Exception:
-                    try:
-                        db.update_status_options(selected_url, fetched_opts)
-                    except Exception:
-                        pass
-                all_rows = load_all()
-                rows = filtered_rows()
-                if rows:
-                    for idx, candidate in enumerate(rows):
-                        if candidate.url == selected_url:
-                            current_index = idx
-                            row = candidate
-                            break
-                    else:
-                        current_index = max(0, min(len(rows)-1, current_index))
-                        row = rows[current_index]
-                option_id, display_name = _match_status_option(row, target)
+                status_line = f"Failed to cache status: {exc}"
+                invalidate(); return
+            payload_update = dict(pending_create_action.payload or {})
+            payload_update['status_label'] = display_name
+            payload_update['status_option_id'] = option_id
+            if row.status_field_id:
+                payload_update['status_field_id'] = row.status_field_id
+            if status_options_cached:
+                payload_update['status_options'] = status_options_cached
+            try:
+                db.update_pending_action(pending_create_action.id, payload_update)
+            except Exception as exc:
+                status_line = f"Failed to update queued create: {exc}"
+                invalidate(); return
+            all_rows = load_all()
+            status_line = f"Status set to {display_name} (queued create)"
+            invalidate()
+            return
+        if selected_url.startswith(PENDING_URL_PREFIX):
+            status_options_cached = _normalize_status_options(_json_list(row.status_options))
+            option_id, display_name = _match_status_option(row, target)
+            if not option_id and status_options_cached:
+                preferred_name = target.replace('_', ' ').strip().title() or target
+                option_id, display_name = _select_status_option(status_options_cached, preferred_name)
+            if not display_name:
+                display_name = target.replace('_', ' ').strip().title() or target
+            new_is_done = _is_done_name(display_name)
+            try:
+                db.reset_status(row.url, display_name, option_id, new_is_done)
+            except Exception as exc:
+                status_line = f"Failed to cache status: {exc}"
+                invalidate(); return
+            all_rows = load_all()
+            status_line = f"Status set to {display_name} (local)"
+            invalidate()
+            return
+        status_options_cached = _normalize_status_options(_json_list(row.status_options))
+        option_id, display_name = _match_status_option(row, target)
         if not option_id:
-            status_line = f"No status option matches '{target}'"
-            invalidate(); return
-        if (row.status_option_id == option_id) and not row.status_dirty:
+            if status_options_cached:
+                preferred_name = target.replace('_', ' ').strip().title() or target
+                option_id, display_name = _select_status_option(status_options_cached, preferred_name)
+        if not display_name:
+            display_name = target.replace('_', ' ').strip().title() or target
+        if option_id and (row.status_option_id == option_id) and not row.status_dirty:
             status_line = f"Already {display_name}"
             invalidate(); return
         new_is_done = _is_done_name(display_name)
-        original_status = row.status or ""
-        original_option = row.status_option_id or ""
-        original_is_done = row.is_done
         try:
             db.mark_status_pending(row.url, display_name, option_id, new_is_done)
         except Exception as exc:
             status_line = f"Failed to mark pending: {exc}"
             invalidate(); return
-        pending_status_urls.add(row.url)
         all_rows = load_all()
-        status_line = f"Updating status to {display_name}…"
+        rows_after = filtered_rows()
+        if current_index >= len(rows_after):
+            current_index = max(0, len(rows_after) - 1)
+        status_line = f"Status set to {display_name} (queued)"
         invalidate()
-
-        loop = asyncio.get_running_loop()
-
-        def _do_update():
-            set_project_status(token, row.project_id, row.item_id, row.status_field_id, option_id)
-
-        try:
-            await loop.run_in_executor(None, _do_update)
-        except Exception as exc:
-            db.reset_status(row.url, original_status, original_option, original_is_done)
-            status_line = f"Status update failed: {exc}"
-        else:
-            db.mark_status_synced(row.url)
-            if new_is_done and row.url in db.active_task_urls():
-                labels = fetch_labels_for_url(token, row.url) if token else []
-                labels_json = json.dumps(labels) if labels else None
-                _handle_timer_stop(row, labels_json, allow_prompt=True)
-                try:
-                    logger.info("Auto-stopped timer for %s after marking done", row.url)
-                except Exception:
-                    pass
-            status_line = f"Status set to {display_name}"
-        finally:
-            pending_status_urls.discard(row.url)
-            all_rows = load_all()
-            invalidate()
 
     async def _update_task_date(field_type: str, new_value: str):
         nonlocal all_rows, status_line, current_index
@@ -5578,6 +5660,65 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = status_line
             invalidate(); return
         row = rows[current_index]
+        pending_create_action = _pending_create_action_for_url(row.url)
+        if pending_create_action or (row.url or '').startswith(PENDING_URL_PREFIX):
+            try:
+                if new_value:
+                    dt.date.fromisoformat(new_value)
+            except Exception:
+                msg = f"Bad date '{new_value}' (use YYYY-MM-DD)"
+                status_line = msg
+                if edit_task_mode:
+                    task_edit_state['message'] = msg
+                invalidate(); return
+            if field_type == 'start':
+                label = 'Start Date'
+                field_name = row.start_field or label
+                if pending_create_action:
+                    payload_update = dict(pending_create_action.payload or {})
+                    payload_update['start_value'] = new_value
+                    if row.start_field_id:
+                        payload_update['start_field_id'] = row.start_field_id
+                    try:
+                        db.update_pending_action(pending_create_action.id, payload_update)
+                    except Exception as exc:
+                        status_line = f"Failed to update queued create: {exc}"
+                        invalidate(); return
+                db.update_start_date(row.url, new_value, row.start_field_id or None)
+            elif field_type == 'end':
+                label = row.end_field or 'Due Date'
+                field_name = label
+                if pending_create_action:
+                    payload_update = dict(pending_create_action.payload or {})
+                    payload_update['end_value'] = new_value
+                    try:
+                        db.update_pending_action(pending_create_action.id, payload_update)
+                    except Exception as exc:
+                        status_line = f"Failed to update queued create: {exc}"
+                        invalidate(); return
+                db.update_end_date(row.url, new_value)
+            else:
+                label = 'Focus Day'
+                field_name = row.focus_field or label
+                if pending_create_action:
+                    payload_update = dict(pending_create_action.payload or {})
+                    payload_update['focus_value'] = new_value
+                    if row.focus_field_id:
+                        payload_update['focus_field_id'] = row.focus_field_id
+                    try:
+                        db.update_pending_action(pending_create_action.id, payload_update)
+                    except Exception as exc:
+                        status_line = f"Failed to update queued create: {exc}"
+                        invalidate(); return
+                db.update_focus_date(row.url, new_value, row.focus_field_id or None)
+            all_rows = load_all()
+            suffix = " (queued create)" if pending_create_action else " (local)"
+            status_line = f"{field_name} updated{suffix}"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+                _refresh_task_editor_state()
+            invalidate()
+            return
         project_id = row.project_id or ''
         item_id = row.item_id or ''
         if not (project_id and item_id):
@@ -5667,6 +5808,75 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _refresh_task_editor_state()
         invalidate()
 
+    async def _update_task_title(new_title: str) -> None:
+        nonlocal all_rows, status_line
+        rows = filtered_rows()
+        if not rows:
+            msg = "No task selected"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        row = rows[current_index]
+        pending_create_action = _pending_create_action_for_url(row.url)
+        if pending_create_action or (row.url or '').startswith(PENDING_URL_PREFIX):
+            if pending_create_action:
+                payload_update = dict(pending_create_action.payload or {})
+                payload_update['title'] = new_title
+                try:
+                    db.update_pending_action(pending_create_action.id, payload_update)
+                except Exception as exc:
+                    status_line = f"Failed to update queued create: {exc}"
+                    if edit_task_mode:
+                        task_edit_state['message'] = status_line
+                    invalidate(); return
+            try:
+                db.update_title(row.url, new_title)
+            except Exception as exc:
+                status_line = f"Failed to update title: {exc}"
+                if edit_task_mode:
+                    task_edit_state['message'] = status_line
+                invalidate(); return
+            all_rows = load_all()
+            suffix = " (queued create)" if pending_create_action else " (local)"
+            status_line = f"Title updated{suffix}"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+                _refresh_task_editor_state()
+            invalidate()
+            return
+        if not token:
+            msg = "GITHUB_TOKEN required for title updates"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        if not _parse_issue_url(row.url):
+            msg = "Title updates supported only for issues/PRs"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, lambda: set_issue_title(token, row.url, new_title))
+        except Exception as exc:
+            msg = f"Title update failed: {exc}"
+            status_line = msg
+            if edit_task_mode:
+                task_edit_state['message'] = msg
+            invalidate(); return
+        try:
+            db.update_title(row.url, new_title)
+        except Exception:
+            pass
+        all_rows = load_all()
+        status_line = "Title updated"
+        if edit_task_mode:
+            task_edit_state['message'] = status_line
+            _refresh_task_editor_state()
+        invalidate()
+
     def _calendar_adjust(days: int = 0, months: int = 0) -> None:
         if not edit_task_mode or task_edit_state.get('mode') != 'edit-date-calendar':
             return
@@ -5705,6 +5915,48 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = msg
             invalidate(); return
         row = rows[current_index]
+        pending_create_action = _pending_create_action_for_url(row.url)
+        if pending_create_action or (row.url or '').startswith(PENDING_URL_PREFIX):
+            clean_logins = []
+            seen = set()
+            for login in logins:
+                norm = login.strip().lstrip('@')
+                if not norm:
+                    continue
+                key = norm.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                clean_logins.append(norm)
+            try:
+                db.update_assignees(row.url, [], clean_logins)
+            except Exception as exc:
+                msg = f"Failed to cache assignees: {exc}"
+                status_line = msg
+                if edit_task_mode:
+                    task_edit_state['message'] = msg
+                invalidate(); return
+            if pending_create_action:
+                payload_update = dict(pending_create_action.payload or {})
+                payload_update['assignees'] = clean_logins
+                if row.assignee_field_id:
+                    payload_update['assignee_field_id'] = row.assignee_field_id
+                try:
+                    db.update_pending_action(pending_create_action.id, payload_update)
+                except Exception as exc:
+                    msg = f"Failed to update queued create: {exc}"
+                    status_line = msg
+                    if edit_task_mode:
+                        task_edit_state['message'] = msg
+                    invalidate(); return
+            all_rows = load_all()
+            suffix = " (queued create)" if pending_create_action else " (local)"
+            status_line = f"Assignees updated{suffix}"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+                _refresh_task_editor_state()
+            invalidate()
+            return
         if not token:
             msg = "GITHUB_TOKEN required for assignee updates"
             status_line = msg
@@ -5779,6 +6031,46 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = msg
             invalidate(); return
         row = rows[current_index]
+        pending_create_action = _pending_create_action_for_url(row.url)
+        if pending_create_action or (row.url or '').startswith(PENDING_URL_PREFIX):
+            clean_labels = []
+            seen = set()
+            for lab in labels_new:
+                nm = lab.strip()
+                if not nm:
+                    continue
+                key = nm.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                clean_labels.append(nm)
+            try:
+                db.update_labels(row.url, clean_labels)
+            except Exception as exc:
+                msg = f"Failed to cache labels: {exc}"
+                status_line = msg
+                if edit_task_mode:
+                    task_edit_state['message'] = msg
+                invalidate(); return
+            if pending_create_action:
+                payload_update = dict(pending_create_action.payload or {})
+                payload_update['labels'] = clean_labels
+                try:
+                    db.update_pending_action(pending_create_action.id, payload_update)
+                except Exception as exc:
+                    msg = f"Failed to update queued create: {exc}"
+                    status_line = msg
+                    if edit_task_mode:
+                        task_edit_state['message'] = msg
+                    invalidate(); return
+            all_rows = load_all()
+            suffix = " (queued create)" if pending_create_action else " (local)"
+            status_line = f"Labels updated{suffix}"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+                _refresh_task_editor_state()
+            invalidate()
+            return
         if not token:
             msg = "GITHUB_TOKEN required for label updates"
             status_line = msg
@@ -5964,6 +6256,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             new_id = _find_iteration_option_id(updated_options, title, start_date)
         except Exception as exc:
             msg = f"Iteration create failed: {exc}"
+            try:
+                logging.getLogger('gh_task_viewer').exception("create iteration failed (add)")
+            except Exception:
+                pass
             status_line = msg
             add_state['iteration_create_error'] = msg
             add_state['iteration_creating'] = False
@@ -6037,6 +6333,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             new_id = _find_iteration_option_id(updated_options, title, start_date)
         except Exception as exc:
             msg = f"Iteration create failed: {exc}"
+            try:
+                logging.getLogger('gh_task_viewer').exception("create iteration failed (edit)")
+            except Exception:
+                pass
             status_line = msg
             task_edit_state['message'] = msg
             task_edit_state['iteration_create_task'] = None
@@ -6285,6 +6585,32 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = msg
             invalidate(); return
         row = rows[current_index]
+        pending_create_action = _pending_create_action_for_url(row.url)
+        if pending_create_action or (row.url or '').startswith(PENDING_URL_PREFIX):
+            body = (comment or '').strip()
+            if not body:
+                msg = "Comment cannot be empty"
+                status_line = msg
+                if edit_task_mode:
+                    task_edit_state['message'] = msg
+                invalidate(); return
+            if pending_create_action:
+                payload_update = dict(pending_create_action.payload or {})
+                payload_update['comment'] = body
+                try:
+                    db.update_pending_action(pending_create_action.id, payload_update)
+                except Exception as exc:
+                    msg = f"Failed to update queued create: {exc}"
+                    status_line = msg
+                    if edit_task_mode:
+                        task_edit_state['message'] = msg
+                    invalidate(); return
+            suffix = " (queued create)" if pending_create_action else " (local)"
+            status_line = f"Comment stored{suffix}"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+            invalidate()
+            return
         if not token:
             msg = "GITHUB_TOKEN required for comments"
             status_line = msg
@@ -6349,9 +6675,6 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     async def _change_priority(delta: Optional[int] = None, option_id: Optional[str] = None):
         nonlocal all_rows, status_line, current_index
-        if not token:
-            status_line = "GITHUB_TOKEN required for priority updates"
-            invalidate(); return
         rows = filtered_rows()
         if not rows:
             status_line = "No task selected"
@@ -6360,6 +6683,63 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         selected_url = row.url
         if not selected_url:
             status_line = "Selected task missing URL"
+            invalidate(); return
+        pending_create_action = _pending_create_action_for_url(selected_url)
+        if pending_create_action or selected_url.startswith(PENDING_URL_PREFIX):
+            options = _priority_options(row)
+            if not options and pending_create_action:
+                options = pending_create_action.payload.get('priority_options') or []
+            option_map = [opt for opt in options if isinstance(opt, dict) and opt.get('id')]
+            if not option_map:
+                status_line = "No priority options available"
+                invalidate(); return
+            try:
+                current_idx = next((idx for idx, opt in enumerate(option_map) if (opt.get('id') or '') == (row.priority_option_id or '')), 0)
+            except Exception:
+                current_idx = 0
+            if option_id is not None:
+                new_opt = next((opt for opt in option_map if (opt.get('id') or '').strip() == option_id.strip()), None)
+                if not new_opt:
+                    status_line = "Priority option not found"
+                    invalidate(); return
+                new_idx = option_map.index(new_opt)
+            else:
+                if delta is None:
+                    status_line = "No priority change provided"
+                    invalidate(); return
+                new_idx = (current_idx + delta) % len(option_map)
+                new_opt = option_map[new_idx]
+            new_option_id = (new_opt.get('id') or '').strip()
+            display_name = (new_opt.get('name') or '').strip() or '(unset)'
+            if not new_option_id:
+                status_line = "Selected priority option missing id"
+                invalidate(); return
+            try:
+                db.reset_priority(selected_url, display_name, new_option_id)
+            except Exception as exc:
+                status_line = f"Failed to cache priority: {exc}"
+                invalidate(); return
+            if pending_create_action:
+                payload_update = dict(pending_create_action.payload or {})
+                payload_update['priority_label'] = display_name
+                payload_update['priority_options'] = option_map
+                if row.priority_field_id:
+                    payload_update['priority_field_id'] = row.priority_field_id
+                try:
+                    db.update_pending_action(pending_create_action.id, payload_update)
+                except Exception as exc:
+                    status_line = f"Failed to update queued create: {exc}"
+                    invalidate(); return
+            all_rows = load_all()
+            suffix = " (queued create)" if pending_create_action else " (local)"
+            status_line = f"Priority set to {display_name}{suffix}"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+                _refresh_task_editor_state()
+            invalidate()
+            return
+        if not token:
+            status_line = "GITHUB_TOKEN required for priority updates"
             invalidate(); return
         if selected_url in pending_priority_urls:
             status_line = "Priority update already in progress"
@@ -6463,14 +6843,46 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     async def _apply_iteration(option: Dict[str, object]) -> None:
         nonlocal all_rows, status_line, current_index
-        if not token:
-            status_line = "GITHUB_TOKEN required for iteration updates"
-            invalidate(); return
         rows = filtered_rows()
         if not rows:
             status_line = "No task selected"
             invalidate(); return
         row = rows[current_index]
+        pending_create_action = _pending_create_action_for_url(row.url)
+        if pending_create_action or (row.url or '').startswith(PENDING_URL_PREFIX):
+            iteration_id = (option.get('id') or '').strip()
+            if not iteration_id:
+                status_line = "Iteration option missing id"
+                invalidate(); return
+            title = (option.get('title') or '').strip()
+            start = (option.get('startDate') or '').strip()
+            try:
+                duration = int(option.get('duration') or 0)
+            except Exception:
+                duration = 0
+            label = title or start or iteration_id
+            db.update_iteration(row.url, title, start, duration, row.iteration_field_id)
+            if pending_create_action:
+                payload_update = dict(pending_create_action.payload or {})
+                payload_update['iteration_id'] = iteration_id
+                if row.iteration_field_id:
+                    payload_update['iteration_field_id'] = row.iteration_field_id
+                try:
+                    db.update_pending_action(pending_create_action.id, payload_update)
+                except Exception as exc:
+                    status_line = f"Failed to update queued create: {exc}"
+                    invalidate(); return
+            all_rows = load_all()
+            suffix = " (queued create)" if pending_create_action else " (local)"
+            status_line = f"Iteration set to {label}{suffix}"
+            if edit_task_mode:
+                task_edit_state['message'] = status_line
+                _refresh_task_editor_state()
+            invalidate()
+            return
+        if not token:
+            status_line = "GITHUB_TOKEN required for iteration updates"
+            invalidate(); return
         if not (row.project_id and row.item_id and row.iteration_field_id):
             status_line = "Task missing iteration metadata"
             invalidate(); return
@@ -6519,7 +6931,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         def _is_pending(row: TaskRow) -> bool:
             return (row.url or '').startswith(PENDING_URL_PREFIX)
         if hide_done:
-            out = [r for r in out if _is_pending(r) or not r.is_done]
+            out = [r for r in out if not r.is_done]
         if hide_no_date:
             if use_iteration:
                 out = [r for r in out if _is_pending(r) or r.iteration_title or r.iteration_start]
@@ -6734,6 +7146,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _build_task_edit_fields_from_row(row: TaskRow) -> List[Dict[str, object]]:
         fields: List[Dict[str, object]] = []
         fields.append({
+            'name': 'Title',
+            'type': 'title',
+            'field_key': 'title',
+            'value': row.title or '',
+        })
+        fields.append({
             'name': row.start_field or 'Start Date',
             'type': 'date',
             'field_key': 'start',
@@ -6905,6 +7323,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['fields'] = fields
         task_edit_state['cursor'] = cursor
         task_edit_state['task_url'] = row.url
+        task_edit_state['local_only'] = (row.url or '').startswith(PENDING_URL_PREFIX)
         task_edit_state['priority_loading'] = False
         task_edit_state['iteration_loading'] = False
         task_edit_state['iteration_choice_index'] = 0
@@ -8228,6 +8647,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if row:
             add_line(f"🏷️ Project: {row.project_title or '-'}", 'class:editor.meta')
             add_line(f"🔗 URL: {row.url}", 'class:editor.meta')
+            if task_edit_state.get('local_only'):
+                add_line("⚠️ Local-only (pending sync)", 'class:editor.meta')
 
         if not fields:
             add_blank()
@@ -8333,6 +8754,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 add_line("".join(row_cells), 'class:editor.calendar')
             add_blank()
             add_line("Enter=save · Esc=cancel", 'class:editor.instructions')
+        elif mode == 'edit-title':
+            add_blank()
+            add_line("📝 Edit title (Enter=save, Esc=cancel)", 'class:editor.instructions')
+            add_line(f"✏️  {task_edit_state.get('input', '')}", 'class:editor.entry')
         elif mode == 'priority-select':
             field = fields[cursor] if cursor < len(fields) else None
             opts = (field or {}).get('options') or []
@@ -8442,8 +8867,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                     add_line('Selection: ' + ', '.join(sorted(selected)), 'class:editor.meta')
         elif mode == 'edit-comment':
             add_blank()
-            add_line("💬 New comment", 'class:editor.instructions')
-            add_line(f"✏️  {task_edit_state.get('input', '')}", 'class:editor.entry')
+            add_line("💬 New comment (Ctrl+J=newline)", 'class:editor.instructions')
+            text = task_edit_state.get('input', '')
+            display = f"{text}_"
+            lines = display.splitlines() or ['_']
+            add_line(f"✏️  {lines[0]}", 'class:editor.entry')
+            for line in lines[1:]:
+                add_line(f"    {line}", 'class:editor.entry')
             add_line("Enter=post · Esc=cancel", 'class:editor.instructions')
         else:
             add_blank()
@@ -8683,6 +9113,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         add_line("📂", "Project", project_display)
         task_title = (t.title or '').strip() or '(untitled task)'
         add_line("📝", "Title", task_title)
+        desc_raw = (t.description or "")
+        if desc_raw and desc_raw.strip():
+            desc_lines = desc_raw.replace('\r\n', '\n').split('\n')
+            segments.append((label_style, "🧾 Description:"))
+            segments.append(('', '\n'))
+            max_lines = 20
+            for idx, line in enumerate(desc_lines):
+                if idx >= max_lines:
+                    segments.append((value_style, "  …\n"))
+                    break
+                segments.append((value_style, f"  {line}\n"))
+            segments.append(('', '\n'))
         add_line("📦", "Repository", t.repo or '—')
         add_line("🏷️", "Labels", labels_display)
         add_line("🔗", "URL", t.url or '—', url_style)
@@ -8979,7 +9421,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = "No task selected"
             invalidate(); return
         row = rows[current_index]
-        if not (row.project_id and row.item_id):
+        is_pending = (row.url or '').startswith(PENDING_URL_PREFIX)
+        if not is_pending and not (row.project_id and row.item_id):
             status_line = "Task missing project metadata"
             invalidate(); return
         if edit_sessions_mode:
@@ -9000,6 +9443,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             'input': '',
             'message': 'Use j/k to select, Enter to edit, Esc to close',
             'task_url': row.url,
+            'local_only': is_pending,
             'editing': None,
             'priority_loading': False,
             'iteration_loading': False,
@@ -9028,6 +9472,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         fields = task_edit_state.get('fields') or []
         idx = editing.get('field_idx')
         if mode == 'edit-date-calendar' and idx is not None and idx < len(fields):
+            prev_val = editing.get('prev_value', fields[idx].get('value', ''))
+            fields[idx]['value'] = prev_val
+        if mode == 'edit-title' and idx is not None and idx < len(fields):
             prev_val = editing.get('prev_value', fields[idx].get('value', ''))
             fields[idx]['value'] = prev_val
         if mode == 'priority-select' and idx is not None and idx < len(fields):
@@ -9083,7 +9530,13 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         cursor = max(0, min(cursor, len(fields)-1))
         field = fields[cursor]
         ftype = field.get('type')
-        if ftype == 'date':
+        if ftype == 'title':
+            current = field.get('value') or ''
+            task_edit_state['mode'] = 'edit-title'
+            task_edit_state['input'] = current
+            task_edit_state['editing'] = {'field_idx': cursor, 'prev_value': current}
+            task_edit_state['message'] = 'Edit title (Enter=save, Esc=cancel)'
+        elif ftype == 'date':
             raw = field.get('value') or ''
             try:
                 base_date = dt.date.fromisoformat(raw)
@@ -9200,7 +9653,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['mode'] = 'edit-comment'
             task_edit_state['input'] = ''
             task_edit_state['editing'] = {'field_idx': cursor}
-            task_edit_state['message'] = 'Type comment text (Enter=post, Esc=cancel)'
+            task_edit_state['message'] = 'Type comment text (Ctrl+J=newline, Enter=post, Esc=cancel)'
         else:
             task_edit_state['message'] = 'Field not editable'
         invalidate()
@@ -9258,7 +9711,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     is_task_edit_text = Condition(
         lambda: edit_task_mode and (
-            task_edit_state.get('mode') in ('edit-comment', 'iteration-create') or _assignee_text_mode()
+            task_edit_state.get('mode') in ('edit-comment', 'iteration-create', 'edit-title') or _assignee_text_mode()
         )
     )
     is_task_edit_nav = Condition(
@@ -9395,6 +9848,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         payload = action.payload or {}
         project_id = (payload.get('project_id') or '').strip()
         title = (payload.get('title') or '').strip() or 'Untitled'
+        if payload.get('synced'):
+            return True
         if not project_id:
             db.remove_pending_action(action.id)
             status_line = f"Skipped queued task '{title}' (missing project)"
@@ -9442,7 +9897,11 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 item_id = await loop.run_in_executor(None, lambda: create_project_draft(token, project_id, title))
                 if not item_id:
                     raise RuntimeError('GitHub did not return item id')
-            start_value = payload.get('start_value') or dt.date.today().isoformat()
+            start_value_raw = payload.get('start_value')
+            if start_value_raw is None:
+                start_value = dt.date.today().isoformat()
+            else:
+                start_value = str(start_value_raw).strip()
             start_field_id = (payload.get('start_field_id') or '').strip()
             if start_field_id:
                 await loop.run_in_executor(
@@ -9619,23 +10078,99 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 pass
             invalidate()
             return False
-        placeholder_url = (payload.get('placeholder_url') or '').strip()
-        if placeholder_url:
-            try:
-                db.delete_task(placeholder_url)
-            except Exception:
-                pass
-        db.remove_pending_action(action.id)
-        status_line = f"Queued task synced: {title}"
+        payload_update = dict(payload)
+        payload_update['synced'] = True
+        payload_update['synced_at'] = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+        if issue_url:
+            payload_update['issue_url'] = issue_url
+        if item_id:
+            payload_update['item_id'] = item_id
+        try:
+            db.update_pending_action(action.id, payload_update)
+        except Exception:
+            pass
+        status_line = f"Queued task synced: {title} (awaiting refresh)"
         invalidate()
+        return True
+
+    async def _sync_dirty_status_updates(loop: asyncio.AbstractEventLoop) -> bool:
+        nonlocal status_line, all_rows
+        try:
+            dirty_rows = [
+                row for row in db.load(today_only=False)
+                if getattr(row, 'status_dirty', 0)
+                and not (row.url or '').startswith(PENDING_URL_PREFIX)
+            ]
+        except Exception:
+            dirty_rows = []
+        if not dirty_rows:
+            return True
+        if not token:
+            status_line = "Queued status updates pending; set GITHUB_TOKEN then press 'u'"
+            invalidate()
+            return False
+        status_line = f"Syncing {len(dirty_rows)} status update{'s' if len(dirty_rows) != 1 else ''}…"
+        invalidate()
+        for idx, row in enumerate(dirty_rows, start=1):
+            if not (row.project_id and row.item_id):
+                status_line = f"Status sync blocked (missing metadata): {row.title or row.url}"
+                invalidate()
+                return False
+            status_field_id = (row.status_field_id or '').strip()
+            options = _normalize_status_options(_json_list(row.status_options))
+            if row.project_id and (not status_field_id or not options):
+                fetched_field_id, fetched_options = await _ensure_status_field_metadata(row.project_id or '', status_field_id, options)
+                if fetched_field_id and fetched_field_id != status_field_id:
+                    status_field_id = fetched_field_id
+                    try:
+                        db.update_status_field(row.url, fetched_field_id)
+                    except Exception:
+                        pass
+                if fetched_options:
+                    options = fetched_options
+                    try:
+                        db.update_status_options(row.url, fetched_options)
+                    except Exception:
+                        pass
+            option_id = (row.status_pending_option_id or row.status_option_id or '').strip()
+            display_name = (row.status or '').strip()
+            if not display_name:
+                display_name = "Done" if row.is_done else "In Progress"
+            if not option_id and options:
+                option_id, display_name = _select_status_option(options, display_name)
+            if not option_id:
+                fallback_target = 'done' if row.is_done else 'in_progress'
+                option_id, display_name = _match_status_option(row, fallback_target)
+            if not status_field_id:
+                status_line = f"Status sync blocked (missing field): {row.title or row.url}"
+                invalidate()
+                return False
+            if not option_id:
+                status_line = f"Status sync blocked (missing option): {row.title or row.url}"
+                invalidate()
+                return False
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda r=row, fid=status_field_id, oid=option_id: set_project_status(token, r.project_id, r.item_id, fid, oid),
+                )
+            except Exception as exc:
+                status_line = f"Status sync failed: {exc}"
+                invalidate()
+                return False
+            try:
+                db.reset_status(row.url, display_name, option_id, row.is_done)
+            except Exception:
+                db.mark_status_synced(row.url)
+            status_line = f"Synced status {idx}/{len(dirty_rows)}"
+            invalidate()
+        all_rows = load_all()
         return True
 
     async def _process_pending_actions(loop: asyncio.AbstractEventLoop) -> bool:
         nonlocal status_line, all_rows
         pending = db.list_pending_actions()
-        if not pending:
-            return True
-        if not token:
+        if pending and not token:
             status_line = "Queued updates pending; set GITHUB_TOKEN then press 'u'"
             invalidate()
             return False
@@ -9649,6 +10184,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 ok = True
             if not ok:
                 return False
+        status_ok = await _sync_dirty_status_updates(loop)
+        if not status_ok:
+            return False
         if token:
             try:
                 missing_status_rows = [
@@ -9690,6 +10228,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 db.reset_status(row.url, label, option_id, _is_done_name(label))
         all_rows = load_all()
         return True
+
+    def _reconcile_synced_pending_creates(rows: List[TaskRow]) -> int:
+        try:
+            pending = db.list_pending_actions()
+        except Exception:
+            return 0
+        if not pending:
+            return 0
+        url_set = {r.url for r in rows if r.url}
+        item_id_set = {r.item_id for r in rows if r.item_id}
+        removed = 0
+        for action in pending:
+            if action.action_type != 'create_task':
+                continue
+            payload = action.payload or {}
+            if not payload.get('synced'):
+                continue
+            issue_url = (payload.get('issue_url') or '').strip()
+            item_id = (payload.get('item_id') or '').strip()
+            placeholder_url = (payload.get('placeholder_url') or '').strip()
+            matched = False
+            if issue_url and issue_url in url_set:
+                matched = True
+            if item_id and item_id in item_id_set:
+                matched = True
+            if not matched:
+                continue
+            if placeholder_url:
+                try:
+                    db.delete_task(placeholder_url)
+                except Exception:
+                    pass
+            db.remove_pending_action(action.id)
+            removed += 1
+        return removed
     async def update_worker(status_msg: Optional[str] = None):
         nonlocal status_line, all_rows, current_index, today_date, update_in_progress, task_duration_cache
         if update_in_progress:
@@ -9746,6 +10319,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 except Exception:
                     pass
                 db.replace_all(rows)
+                _reconcile_synced_pending_creates(rows)
                 replaced_cache = True
             try:
                 today_date = dt.date.today()
@@ -9983,6 +10557,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             assignee_user_ids=assignee_user_ids_json,
             assignee_logins=assignee_logins_json,
             content_node_id='',
+            description=comment,
         )
         try:
             db.upsert_task(placeholder_row)
@@ -10022,7 +10597,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
         if edit_task_mode:
-            if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create'):
+            if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create', 'edit-title'):
                 _cancel_task_edit('Edit cancelled')
             else:
                 close_task_editor('Field editor closed')
@@ -10100,18 +10675,33 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 if not field or editing.get('calendar_date') is None:
                     _cancel_task_edit('Field unavailable')
                     return
-                value = editing.get('calendar_date') or field.get('value', '')
                 cleared = bool(editing.get('cleared'))
-                if not value and not cleared:
-                    task_edit_state['message'] = 'Select a date'
-                    invalidate(); return
                 if cleared:
                     value = ''
+                else:
+                    raw_value = editing.get('calendar_date')
+                    value = raw_value if raw_value is not None else field.get('value', '')
+                    if not value:
+                        task_edit_state['message'] = 'Select a date'
+                        invalidate(); return
                 field['value'] = value
                 task_edit_state['mode'] = 'list'
                 task_edit_state['editing'] = None
                 task_edit_state['message'] = f"Updating {field.get('name')}…"
                 asyncio.create_task(_update_task_date(field.get('field_key', 'start'), value))
+            elif mode == 'edit-title':
+                field = fields[cursor] if cursor < len(fields) else None
+                new_title = (task_edit_state.get('input', '') or '').strip()
+                if not new_title:
+                    task_edit_state['message'] = 'Title cannot be empty'
+                    invalidate(); return
+                if field is not None:
+                    field['value'] = new_title
+                task_edit_state['mode'] = 'list'
+                task_edit_state['input'] = ''
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = 'Updating title…'
+                asyncio.create_task(_update_task_title(new_title))
             elif mode == 'priority-select':
                 field = fields[cursor] if cursor < len(fields) else None
                 options = (field or {}).get('options') or []
@@ -11244,6 +11834,14 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         _cycle_add(-1)
         invalidate()
 
+    @kb.add('c-j', filter=Condition(lambda: add_mode and add_state.get('step') == 'comment'))
+    def _(event):
+        comment = add_state.get('comment', '')
+        cur = max(0, min(len(comment), add_state.get('comment_cursor', len(comment))))
+        add_state['comment'] = comment[:cur] + "\n" + comment[cur:]
+        add_state['comment_cursor'] = cur + 1
+        invalidate()
+
     @kb.add(Keys.Any, filter=Condition(lambda: add_mode and add_state.get('step') in ('title','comment','iteration-create')))
     def _(event):
         ch = event.data or ""
@@ -11777,7 +12375,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _cancel_add_calendar('Calendar cancelled')
             return
         if edit_task_mode:
-            if task_edit_state.get('mode') in ('edit-date', 'edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create'):
+            if task_edit_state.get('mode') in ('edit-date', 'edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create', 'edit-title'):
                 _cancel_task_edit('Edit cancelled')
             else:
                 close_task_editor('Field editor closed')
@@ -11815,10 +12413,28 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             status_line = f"Date<= {date_buffer}"
             invalidate()
 
+    @kb.add('delete', filter=Condition(lambda: (not add_mode) and (in_search or in_date_filter)))
+    def _(event):
+        nonlocal search_buffer, date_buffer, status_line
+        if in_search and search_buffer:
+            search_buffer = search_buffer[:-1]
+            status_line = f"Search: {search_buffer}"
+            invalidate()
+        elif in_date_filter and date_buffer:
+            date_buffer = date_buffer[:-1]
+            status_line = f"Date<= {date_buffer}"
+            invalidate()
+
+    @kb.add('c-j', filter=Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-comment'))
+    def _(event):
+        buf = task_edit_state.get('input', '')
+        task_edit_state['input'] = buf + "\n"
+        invalidate()
+
     @kb.add('backspace', filter=is_task_edit_text)
     def _(event):
         mode = task_edit_state.get('mode')
-        if mode in ('edit-assignees', 'edit-comment', 'iteration-create'):
+        if mode in ('edit-assignees', 'edit-comment', 'iteration-create', 'edit-title'):
             buf = task_edit_state.get('input', '')
             if buf:
                 task_edit_state['input'] = buf[:-1]
@@ -11829,8 +12445,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         nonlocal search_buffer, status_line, date_buffer
         ch = event.data or ""
-        if not ch:
-            return
+        if not ch or not ch.isprintable():
+            return NotImplemented
         if in_search:
             # Accept any printable char; special keys (enter/esc/backspace) have empty event.data
             search_buffer += ch
@@ -11845,7 +12461,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     @kb.add(Keys.Any, filter=is_task_edit_text)
     def _(event):
         mode = task_edit_state.get('mode')
-        if mode not in ('edit-assignees', 'edit-comment', 'iteration-create'):
+        if mode not in ('edit-assignees', 'edit-comment', 'iteration-create', 'edit-title'):
             return
         ch = event.data or ''
         if not ch or ch in ('\r', '\n'):
@@ -12379,6 +12995,7 @@ def generate_mock_tasks(cfg: Config) -> List[TaskRow]:
                 assignee_field_id=assignee_field_id,
                 assignee_user_ids=assignee_user_ids,
                 assignee_logins=json.dumps([cfg.user, "teammate"], ensure_ascii=False),
+                description=f"Mock description for {proj} {d_off}",
             ))
     return rows
 
