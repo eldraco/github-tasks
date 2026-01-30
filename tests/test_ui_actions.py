@@ -341,6 +341,9 @@ def test_update_task_date_with_validation_and_success(monkeypatch, temp_db_path,
     task_state = task_edit_state_cell.cell_contents
     assert task_state["mode"] == "list"
     assert task_state["fields"], "task editor should populate fields"
+    fields = task_state["fields"]
+    start_idx = next(i for i, field in enumerate(fields) if field.get("field_key") == "start")
+    task_state["cursor"] = start_idx
 
     enter_handler(SimpleNamespace())  # begin editing first field (Start date)
     task_state = task_edit_state_cell.cell_contents
@@ -427,9 +430,12 @@ def test_update_task_date_missing_metadata_triggers_lookup(monkeypatch, temp_db_
     open_handler(SimpleNamespace())
     task_state = task_edit_state_cell.cell_contents
     assert task_state["mode"] == "list"
+    fields = task_state["fields"]
+    start_idx = next(i for i, field in enumerate(fields) if field.get("field_key") == "start")
+    focus_idx = next(i for i, field in enumerate(fields) if field.get("field_key") == "focus")
 
     # Attempt to update Start date with missing field metadata (lookup fails)
-    task_state["cursor"] = 0
+    task_state["cursor"] = start_idx
     enter_handler(SimpleNamespace())
     task_state = task_edit_state_cell.cell_contents
     editing = task_state.get("editing") or {}
@@ -448,7 +454,7 @@ def test_update_task_date_missing_metadata_triggers_lookup(monkeypatch, temp_db_
     assert not date_calls, "start update should not proceed without field id"
 
     # Update Focus date where lookup succeeds and new field id is used
-    task_state["cursor"] = 1
+    task_state["cursor"] = focus_idx
     task_state["mode"] = "list"
     enter_handler(SimpleNamespace())
     task_state = task_edit_state_cell.cell_contents
