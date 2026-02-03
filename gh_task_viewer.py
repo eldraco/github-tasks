@@ -15,7 +15,7 @@
 #   W  toggle work timer for the selected task (multiple tasks can run)
 #   E  edit work sessions for the selected task
 #   ]/[ cycle priority forward/backward for selected task
-#   O  open task field editor (start/focus date, priority)
+#   O  open task field editor (start/focus date, priority, status)
 #   s/S cycle sort presets forward/backward
 #   R  open timer report (daily/weekly/monthly aggregates)
 #   X  export a JSON report (quick export)
@@ -5651,6 +5651,66 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         status_line = f"Status set to {display_name} (queued)"
         invalidate()
 
+    async def _apply_status_option(option_id: str, display_name: str):
+        nonlocal all_rows, status_line, current_index
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate(); return
+        current_index = max(0, min(len(rows)-1, current_index))
+        row = rows[current_index]
+        selected_url = row.url
+        pending_create_action = _pending_create_action_for_url(selected_url)
+        if pending_create_action and not row.status_field_id:
+            row.status_field_id = (pending_create_action.payload or {}).get('status_field_id', '') or ''
+        if not display_name:
+            display_name = option_id or 'Status'
+        new_is_done = _is_done_name(display_name)
+        if pending_create_action:
+            try:
+                db.reset_status(row.url, display_name, option_id, new_is_done)
+            except Exception as exc:
+                status_line = f"Failed to cache status: {exc}"
+                invalidate(); return
+            payload_update = dict(pending_create_action.payload or {})
+            payload_update['status_label'] = display_name
+            payload_update['status_option_id'] = option_id
+            if row.status_field_id:
+                payload_update['status_field_id'] = row.status_field_id
+            try:
+                db.update_pending_action(pending_create_action.id, payload_update)
+            except Exception as exc:
+                status_line = f"Failed to update queued create: {exc}"
+                invalidate(); return
+            all_rows = load_all()
+            status_line = f"Status set to {display_name} (queued create)"
+            invalidate()
+            return
+        if selected_url.startswith(PENDING_URL_PREFIX):
+            try:
+                db.reset_status(row.url, display_name, option_id, new_is_done)
+            except Exception as exc:
+                status_line = f"Failed to cache status: {exc}"
+                invalidate(); return
+            all_rows = load_all()
+            status_line = f"Status set to {display_name} (local)"
+            invalidate()
+            return
+        if option_id and (row.status_option_id == option_id) and not row.status_dirty:
+            status_line = f"Already {display_name}"
+            invalidate(); return
+        try:
+            db.mark_status_pending(row.url, display_name, option_id, new_is_done)
+        except Exception as exc:
+            status_line = f"Failed to mark pending: {exc}"
+            invalidate(); return
+        all_rows = load_all()
+        rows_after = filtered_rows()
+        if current_index >= len(rows_after):
+            current_index = max(0, len(rows_after) - 1)
+        status_line = f"Status set to {display_name} (queued)"
+        invalidate()
+
     async def _update_task_date(field_type: str, new_value: str):
         nonlocal all_rows, status_line, current_index
         rows = filtered_rows()
@@ -6163,6 +6223,50 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['message'] = 'Priority field not configured'
         finally:
             task_edit_state['priority_loading'] = False
+            _refresh_task_editor_state(preserve_cursor=False)
+            invalidate()
+
+    async def _load_status_options_for_editor(row: TaskRow) -> None:
+        nonlocal all_rows, status_line
+        if not edit_task_mode:
+            return
+        if task_edit_state.get('status_loading'):
+            return
+        if not token:
+            msg = 'GITHUB_TOKEN required for status options'
+            status_line = msg
+            task_edit_state['message'] = msg
+            invalidate(); return
+        if not row or not (row.project_id or '').strip():
+            task_edit_state['message'] = 'Status field metadata unavailable'
+            invalidate(); return
+        task_edit_state['status_loading'] = True
+        task_edit_state['message'] = 'Loading status options…'
+        invalidate()
+        try:
+            field_id, options = await _ensure_status_field_metadata(
+                row.project_id,
+                row.status_field_id,
+                _json_list(row.status_options),
+            )
+        except Exception as exc:
+            task_edit_state['message'] = f'Status options unavailable: {exc}'
+        else:
+            if field_id:
+                if field_id != (row.status_field_id or '').strip():
+                    db.update_status_field(row.url, field_id)
+                clean_options = _normalize_status_options(options)
+                if clean_options:
+                    db.update_status_options_by_field(field_id, clean_options)
+                    db.update_status_options(row.url, clean_options)
+                    all_rows = load_all()
+                    task_edit_state['message'] = 'Status options loaded'
+                else:
+                    task_edit_state['message'] = 'Status options unavailable'
+            else:
+                task_edit_state['message'] = 'Status field not configured'
+        finally:
+            task_edit_state['status_loading'] = False
             _refresh_task_editor_state(preserve_cursor=False)
             invalidate()
 
@@ -7235,6 +7339,24 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 'field_key': 'priority',
                 'value': row.priority.strip(),
             })
+        status_opts = _normalize_status_options(_json_list(row.status_options))
+        status_field_known = bool((row.status_field_id or '').strip())
+        status_value = (row.status or '').strip()
+        can_fetch_status = bool(token and row.project_id)
+        if status_opts or status_field_known or status_value or can_fetch_status:
+            try:
+                current_idx = next((idx for idx, opt in enumerate(status_opts) if (opt.get('id') or '').strip() == (row.status_option_id or '').strip()), 0)
+            except Exception:
+                current_idx = 0
+            fields.append({
+                'name': 'Status',
+                'type': 'status',
+                'field_key': 'status',
+                'options': status_opts,
+                'index': current_idx,
+                'value': status_value,
+                'field_available': status_field_known or can_fetch_status,
+            })
         try:
             assignees = json.loads(row.assignee_logins or "[]")
             if not isinstance(assignees, list):
@@ -7325,6 +7447,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['task_url'] = row.url
         task_edit_state['local_only'] = (row.url or '').startswith(PENDING_URL_PREFIX)
         task_edit_state['priority_loading'] = False
+        task_edit_state['status_loading'] = False
         task_edit_state['iteration_loading'] = False
         task_edit_state['iteration_choice_index'] = 0
         task_edit_state['assignee_loading'] = False
@@ -8675,6 +8798,22 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                                 value = '(load options)'
                             else:
                                 value = '(none)'
+                elif ftype == 'status':
+                    opts = field_info.get('options') or []
+                    index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
+                    if opts:
+                        value = opts[index].get('name') if opts else '(no options)'
+                        if row and getattr(row, 'status_dirty', 0):
+                            value = (value or '-') + '*'
+                    else:
+                        fallback = (row.status or '').strip() if row else ''
+                        if fallback:
+                            value = fallback
+                        else:
+                            if field_info.get('field_available'):
+                                value = '(load options)'
+                            else:
+                                value = '(none)'
                 elif ftype == 'assignees':
                     vals = field_info.get('value') or []
                     if isinstance(vals, list):
@@ -8706,6 +8845,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                             else:
                                 value = '(none)'
                 elif ftype == 'priority-text':
+                    value = field_info.get('value') or '-'
+                elif ftype == 'status-text':
                     value = field_info.get('value') or '-'
                 elif ftype == 'comment':
                     value = '(add comment)'
@@ -8764,6 +8905,17 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             idx = (field or {}).get('index', 0)
             add_blank()
             add_line("⚡ Select priority (j/k move, Enter=save, Esc=cancel)", 'class:editor.instructions')
+            for i, opt in enumerate(opts):
+                marker = '➤' if i == idx else ' '
+                name = (opt.get('name') if isinstance(opt, dict) else None) or '(option)'
+                style = 'class:editor.priority.cursor' if i == idx else 'class:editor.priority'
+                add_line(f"   {marker} {name}", style)
+        elif mode == 'status-select':
+            field = fields[cursor] if cursor < len(fields) else None
+            opts = (field or {}).get('options') or []
+            idx = (field or {}).get('index', 0)
+            add_blank()
+            add_line("✅ Select status (j/k move, Enter=save, Esc=cancel)", 'class:editor.instructions')
             for i, opt in enumerate(opts):
                 marker = '➤' if i == idx else ' '
                 name = (opt.get('name') if isinstance(opt, dict) else None) or '(option)'
@@ -9480,6 +9632,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if mode == 'priority-select' and idx is not None and idx < len(fields):
             prev_idx = editing.get('prev_index', fields[idx].get('index', 0))
             fields[idx]['index'] = prev_idx
+        if mode == 'status-select' and idx is not None and idx < len(fields):
+            prev_idx = editing.get('prev_index', fields[idx].get('index', 0))
+            fields[idx]['index'] = prev_idx
         if mode == 'iteration-select' and idx is not None and idx < len(fields):
             prev_idx = editing.get('prev_index', fields[idx].get('index', 0))
             fields[idx]['index'] = prev_idx
@@ -9514,6 +9669,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         task_edit_state['input'] = ''
         task_edit_state['editing'] = None
         task_edit_state['priority_loading'] = False
+        task_edit_state['status_loading'] = False
         task_edit_state['iteration_loading'] = False
         task_edit_state['assignee_loading'] = False
         task_edit_state['message'] = message or 'Edit cancelled'
@@ -9565,6 +9721,19 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             task_edit_state['mode'] = 'priority-select'
             task_edit_state['editing'] = {'field_idx': cursor, 'prev_index': field.get('index', 0)}
             task_edit_state['message'] = 'Use j/k to choose priority (Enter=save, Esc=cancel)'
+        elif ftype == 'status':
+            options = field.get('options') or []
+            rows = filtered_rows()
+            row = rows[current_index] if rows else None
+            if not options:
+                if not row:
+                    task_edit_state['message'] = 'No task selected'
+                    return
+                asyncio.create_task(_load_status_options_for_editor(row))
+                return
+            task_edit_state['mode'] = 'status-select'
+            task_edit_state['editing'] = {'field_idx': cursor, 'prev_index': field.get('index', 0)}
+            task_edit_state['message'] = 'Use j/k to choose status (Enter=save, Esc=cancel)'
         elif ftype == 'iteration':
             options = field.get('options') or []
             rows = filtered_rows()
@@ -9716,7 +9885,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     )
     is_task_edit_nav = Condition(
         lambda: edit_task_mode and (
-            task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'iteration-select', 'edit-labels')
+            task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'status-select', 'iteration-select', 'edit-labels')
             or (task_edit_state.get('mode') == 'edit-assignees' and bool(task_edit_state.get('assignee_choices')))
         )
     )
@@ -10597,7 +10766,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         nonlocal detail_mode, in_search, search_buffer, show_report
         if edit_task_mode:
-            if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create', 'edit-title'):
+            if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'status-select', 'iteration-select', 'iteration-create', 'edit-title'):
                 _cancel_task_edit('Edit cancelled')
             else:
                 close_task_editor('Field editor closed')
@@ -10714,6 +10883,23 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 task_edit_state['editing'] = None
                 task_edit_state['message'] = f"Updating {field.get('name')}…"
                 asyncio.create_task(_change_priority(option_id=option_id))
+            elif mode == 'status-select':
+                field = fields[cursor] if cursor < len(fields) else None
+                options = (field or {}).get('options') or []
+                if not field or not options:
+                    _cancel_task_edit('Status options unavailable')
+                    return
+                idx = max(0, min(field.get('index', 0), len(options)-1))
+                option = options[idx] if idx < len(options) else {}
+                option_id = (option.get('id') or '').strip() if isinstance(option, dict) else ''
+                display_name = (option.get('name') or '').strip() if isinstance(option, dict) else ''
+                if not option_id:
+                    _cancel_task_edit('Status option unavailable')
+                    return
+                task_edit_state['mode'] = 'list'
+                task_edit_state['editing'] = None
+                task_edit_state['message'] = f"Updating {field.get('name')}…"
+                asyncio.create_task(_apply_status_option(option_id, display_name))
             elif mode == 'iteration-select':
                 field = fields[cursor] if cursor < len(fields) else None
                 options = (field or {}).get('options') or []
@@ -11163,6 +11349,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             fields[idx]['index'] = (fields[idx].get('index', 0) + 1) % len(options)
             task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
             invalidate()
+        elif mode == 'status-select':
+            fields = task_edit_state.get('fields') or []
+            editing = task_edit_state.get('editing') or {}
+            idx = editing.get('field_idx')
+            if idx is None or idx >= len(fields):
+                return
+            options = fields[idx].get('options') or []
+            if not options:
+                return
+            fields[idx]['index'] = (fields[idx].get('index', 0) + 1) % len(options)
+            task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
+            invalidate()
         elif mode == 'iteration-select':
             fields = task_edit_state.get('fields') or []
             editing = task_edit_state.get('editing') or {}
@@ -11212,6 +11410,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     def _(event):
         mode = task_edit_state.get('mode')
         if mode == 'priority-select':
+            fields = task_edit_state.get('fields') or []
+            editing = task_edit_state.get('editing') or {}
+            idx = editing.get('field_idx')
+            if idx is None or idx >= len(fields):
+                return
+            options = fields[idx].get('options') or []
+            if not options:
+                return
+            fields[idx]['index'] = (fields[idx].get('index', 0) - 1) % len(options)
+            task_edit_state['message'] = options[fields[idx]['index']].get('name') or '-'
+            invalidate()
+        elif mode == 'status-select':
             fields = task_edit_state.get('fields') or []
             editing = task_edit_state.get('editing') or {}
             idx = editing.get('field_idx')
@@ -12375,7 +12585,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             _cancel_add_calendar('Calendar cancelled')
             return
         if edit_task_mode:
-            if task_edit_state.get('mode') in ('edit-date', 'edit-date-calendar', 'priority-select', 'iteration-select', 'iteration-create', 'edit-title'):
+            if task_edit_state.get('mode') in ('edit-date', 'edit-date-calendar', 'priority-select', 'status-select', 'iteration-select', 'iteration-create', 'edit-title'):
                 _cancel_task_edit('Edit cancelled')
             else:
                 close_task_editor('Field editor closed')
