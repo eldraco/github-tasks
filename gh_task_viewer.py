@@ -14,6 +14,7 @@
 #   F  set/clear a max date filter (Date <= YYYY-MM-DD); empty to clear
 #   W  toggle work timer for the selected task (multiple tasks can run)
 #   E  edit work sessions for the selected task
+#   x/Delete  remove the selected task from local cache
 #   ]/[ cycle priority forward/backward for selected task
 #   O  open task field editor (start/focus date, priority, status)
 #   s/S cycle sort presets forward/backward
@@ -2067,6 +2068,36 @@ class TaskDB:
         cur.execute("DELETE FROM tasks WHERE url=?", (url,))
         self.conn.commit()
 
+    def discard_pending_task(self, url: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE url=?", (url,))
+        removed_task = (cur.rowcount or 0) > 0
+        cur.execute("SELECT id, payload FROM pending_actions")
+        action_ids: List[int] = []
+        for action_id, payload_raw in cur.fetchall():
+            try:
+                payload = json.loads(payload_raw or "{}")
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                continue
+            refs = [
+                payload.get('placeholder_url'),
+                payload.get('url'),
+                payload.get('issue_url'),
+                payload.get('task_url'),
+            ]
+            if any((str(ref or '').strip() == (url or '').strip()) for ref in refs):
+                action_ids.append(int(action_id))
+        if action_ids:
+            placeholders = ",".join(["?"] * len(action_ids))
+            cur.execute(
+                f"DELETE FROM pending_actions WHERE id IN ({placeholders})",
+                action_ids,
+            )
+        self.conn.commit()
+        return removed_task or bool(action_ids)
+
     def pending_placeholder_rows(self) -> List[TaskRow]:
         cur = self.conn.cursor()
         cur.execute(
@@ -3544,6 +3575,8 @@ PRIORITY_FIELD_HINTS = ("priority", "prio")
 PEOPLE_FIELD_HINTS = ("people", "owner", "assignee")
 ITERATION_FIELD_HINTS = ("iteration", "sprint", "cycle")
 END_FIELD_HINTS = ("end date", "due date", "target date", "finish date")
+START_FIELD_HINTS = ("start date", "start", "begin date", "begin")
+FOCUS_FIELD_HINTS = ("focus day", "focus date", "focus")
 ITERATION_CREATE_SENTINEL = "__create_iteration__"
 ITERATION_DEFAULT_DURATION_DAYS = 7
 LONG_TASK_THRESHOLD_SECONDS = 4 * 60 * 60  # 4 hours
@@ -3552,6 +3585,33 @@ LONG_TASK_REPROMPT_INCREMENT = 60 * 60     # re-confirm every extra hour over th
 
 def _looks_like_iso_date(value: str) -> bool:
     return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", (value or "").strip()))
+
+
+def _date_field_lookup_names(field_type: str, field_name: str) -> List[str]:
+    names: List[str] = []
+    base_name = (field_name or "").strip()
+    if base_name:
+        names.append(base_name)
+    if field_type == "end":
+        names.extend(list(END_FIELD_HINTS))
+    elif field_type == "focus":
+        names.extend(list(FOCUS_FIELD_HINTS))
+    elif field_type == "start":
+        names.extend(list(START_FIELD_HINTS))
+    else:
+        # Legacy queued payloads may miss field_type; try all common date field aliases.
+        names.extend(list(FOCUS_FIELD_HINTS))
+        names.extend(list(START_FIELD_HINTS))
+        names.extend(list(END_FIELD_HINTS))
+    deduped: List[str] = []
+    seen = set()
+    for name in names:
+        key = name.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(name)
+    return deduped
 
 
 def _default_iteration_duration(options: Iterable[object]) -> int:
@@ -5563,6 +5623,41 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 return action
         return None
 
+    def _delete_selected_task() -> None:
+        nonlocal all_rows, current_index, status_line
+        rows = filtered_rows()
+        if not rows:
+            status_line = "No task selected"
+            invalidate()
+            return
+        current_index = max(0, min(len(rows) - 1, current_index))
+        row = rows[current_index]
+        selected_url = (row.url or '').strip()
+        if not selected_url:
+            status_line = "Selected task has no URL"
+            invalidate()
+            return
+        is_pending = selected_url.startswith(PENDING_URL_PREFIX)
+        try:
+            removed = db.discard_pending_task(selected_url)
+        except Exception as exc:
+            status_line = f"Delete failed: {exc}"
+            invalidate()
+            return
+        if not removed:
+            status_line = "Task was already removed from local cache"
+            invalidate()
+            return
+        all_rows = load_all()
+        rows_after = filtered_rows()
+        if current_index >= len(rows_after):
+            current_index = max(0, len(rows_after) - 1)
+        if is_pending:
+            status_line = "Queued local task deleted"
+        else:
+            status_line = "Task removed from local cache (press 'u' to re-sync)"
+        invalidate()
+
     async def _apply_status_change(target: str):
         nonlocal all_rows, status_line, current_index
         rows = filtered_rows()
@@ -5811,16 +5906,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         loop = asyncio.get_running_loop()
         if not field_id and token:
             try:
-                lookup_names: List[str] = []
-                base_name = (field_name or '').strip()
-                if base_name:
-                    lookup_names.append(base_name)
-                if field_type == 'end':
-                    lookup_names.extend(list(END_FIELD_HINTS))
-                elif field_type == 'focus':
-                    lookup_names.append('Focus Day')
-                else:
-                    lookup_names.append('Start date')
+                lookup_names = _date_field_lookup_names(field_type, field_name)
                 for lookup_name in lookup_names:
                     field_id = await loop.run_in_executor(
                         None,
@@ -7044,7 +7130,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not include_created:
             out = [r for r in out if _is_pending(r) or not (r.created_by_me and not r.assigned_to_me)]
         if project_cycle:
-            out = [r for r in out if _is_pending(r) or r.project_title == project_cycle]
+            out = [r for r in out if r.project_title == project_cycle]
         active_search = search_buffer if in_search else search_term
         if active_search:
             needle = active_search.lower()
@@ -8755,11 +8841,35 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         mode = task_edit_state.get('mode', 'list')
 
         segments: List[Tuple[str, str]] = []
+        line_count = 0
+
+        def _task_edit_body_height() -> int:
+            # Best-effort: prefer last render height, then fall back to terminal height.
+            try:
+                info = getattr(task_edit_body, "render_info", None)
+            except Exception:
+                info = None
+            if info is not None:
+                for attr in ("window_height", "content_height"):
+                    val = getattr(info, attr, None)
+                    if isinstance(val, int) and val > 0:
+                        return val
+            try:
+                from prompt_toolkit.application.current import get_app
+                total_rows = get_app().output.get_size().rows
+            except Exception:
+                total_rows = 40
+            # task_edit_body has preferred height ~32; account for frame/status chrome.
+            return max(8, min(32, total_rows - 8))
 
         def add_line(text: str, style: str = 'class:editor.text') -> None:
+            nonlocal line_count
+            line_count += 1
             segments.append((style, text + '\n'))
 
         def add_blank() -> None:
+            nonlocal line_count
+            line_count += 1
             segments.append(('', '\n'))
 
         if row:
@@ -8955,13 +9065,25 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 selected = task_edit_state.get('assignees_selected') or set()
                 if not isinstance(selected, set):
                     selected = set(selected)
-                idx = max(0, min(len(choices)-1, task_edit_state.get('assignee_index', 0))) if choices else 0
+                idx = max(0, min(len(choices)-1, int(task_edit_state.get('assignee_index', 0) or 0))) if choices else 0
                 assignee_error = task_edit_state.get('assignee_error') or ''
                 if assignee_error:
                     add_line(f"⚠️ {assignee_error}", 'class:editor.warning')
                 if choices:
                     add_line("👥 Use j/k to move, Space to toggle, Enter=save, Esc=cancel", 'class:editor.instructions')
-                    for i, entry in enumerate(choices):
+                    visible = max(1, _task_edit_body_height() - line_count)
+                    offset = int(task_edit_state.get('assignee_v_offset', 0) or 0)
+                    offset = max(0, min(offset, max(0, len(choices) - 1)))
+                    if idx < offset:
+                        offset = idx
+                    elif idx >= offset + visible:
+                        offset = idx - visible + 1
+                    max_offset = max(0, len(choices) - visible)
+                    offset = max(0, min(offset, max_offset))
+                    task_edit_state['assignee_v_offset'] = offset
+                    end = min(len(choices), offset + visible)
+                    for i in range(offset, end):
+                        entry = choices[i]
                         login = (entry.get('login') or '').strip()
                         display = (entry.get('display') or login or '(unknown)')
                         pointer = '➤' if i == idx else ' '
@@ -8994,12 +9116,24 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 selected = task_edit_state.get('labels_selected') or set()
                 if not isinstance(selected, set):
                     selected = set(selected)
-                idx = max(0, min(len(choices)-1, task_edit_state.get('label_index', 0))) if choices else 0
+                idx = max(0, min(len(choices)-1, int(task_edit_state.get('label_index', 0) or 0))) if choices else 0
                 if labels_error:
                     add_line(f"⚠️ {labels_error}", 'class:editor.warning')
                 if choices:
                     add_line("🏷️ Use j/k to move, Space to toggle, Enter=save, Esc=cancel", 'class:editor.instructions')
-                    for i, name in enumerate(choices):
+                    visible = max(1, _task_edit_body_height() - line_count)
+                    offset = int(task_edit_state.get('label_v_offset', 0) or 0)
+                    offset = max(0, min(offset, max(0, len(choices) - 1)))
+                    if idx < offset:
+                        offset = idx
+                    elif idx >= offset + visible:
+                        offset = idx - visible + 1
+                    max_offset = max(0, len(choices) - visible)
+                    offset = max(0, min(offset, max_offset))
+                    task_edit_state['label_v_offset'] = offset
+                    end = min(len(choices), offset + visible)
+                    for i in range(offset, end):
+                        name = choices[i]
                         pointer = '➤' if i == idx else ' '
                         checkbox = '☑' if name in selected else '☐'
                         if i == idx and name in selected:
@@ -9338,6 +9472,83 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     status_window = Window(height=1, content=status_control)
 
     show_help = False
+
+    def build_help_text() -> List[Tuple[str, str]]:
+        rows = filtered_rows()
+        current_theme = theme_presets[current_theme_index].name if theme_presets else 'Default'
+        current_project = project_cycle or 'All projects'
+        sections: List[Tuple[str, List[Tuple[str, str]]]] = [
+            (
+                "Navigate",
+                [
+                    ("j / k, arrows", "Move selection"),
+                    ("gg / G", "Jump to top / bottom"),
+                    ("h / l, arrows", "Scroll horizontally"),
+                    ("Enter", "Open task snapshot"),
+                ],
+            ),
+            (
+                "Search & Filters",
+                [
+                    ("/", "Search tasks"),
+                    ("s / S", "Cycle sort forward / backward"),
+                    ("p / P", "Cycle / clear project filter"),
+                    ("d / N", "Hide done / hide no-date tasks"),
+                    ("F", "Filter by max date"),
+                    ("t / a", "Today only / show all"),
+                    (", / . / '", "Toggle Start / End / Assignees columns"),
+                    ("C / z / V", "Created-only / Zen / iteration view"),
+                ],
+            ),
+            (
+                "Task Actions",
+                [
+                    ("A / n", "Add task / quick add"),
+                    ("D / I", "Set status Done / In Progress"),
+                    ("] / [", "Priority next / previous"),
+                    ("T / Y / y", "Focus today / +1 day / -1 day"),
+                    ("O / E", "Edit fields / edit work sessions"),
+                    ("x / Delete", "Remove task from local cache"),
+                    ("W", "Toggle work timer"),
+                ],
+            ),
+            (
+                "Reports & Theme",
+                [
+                    ("u", "Refresh from GitHub"),
+                    ("R", "Open timer report"),
+                    ("d / w / m", "Report day / week / month"),
+                    ("X / Z", "Export JSON / PDF"),
+                    ("Shift+1..0", "Switch theme preset"),
+                ],
+            ),
+        ]
+
+        segments: List[Tuple[str, str]] = []
+
+        def add(text: str, style: str = 'class:editor.text') -> None:
+            segments.append((style, text))
+
+        add("Keyboard Guide\n", 'class:editor.header')
+        add("Keep moving without leaving the table view.\n", 'class:editor.meta')
+        add(f"Shown: {len(rows)} tasks   Project: {current_project}   Theme: {current_theme}\n", 'class:editor.message')
+        add("\n")
+
+        key_width = 18
+        for title, items in sections:
+            add(f"{title}\n", 'class:editor.instructions')
+            for keys, description in items:
+                add(f"  {keys:<{key_width}}", 'class:editor.field.cursor')
+                add(f" {description}\n", 'class:editor.text')
+            add("\n")
+
+        add("Tips\n", 'class:editor.instructions')
+        add("  Pending items created locally can be discarded before sync.\n", 'class:editor.meta')
+        add("  Cyan rows with a timer icon have an active work timer.\n", 'class:editor.meta')
+        add("\n")
+        add("? / Esc / q", 'class:editor.field.cursor')
+        add(" close this guide", 'class:editor.text')
+        return segments
 
     def _fmt_hms(total_seconds: int) -> str:
         s = int(max(0, total_seconds))
@@ -9894,8 +10105,9 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_task_edit_assignees = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-assignees')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_overrun_prompt = Condition(lambda: overrun_prompt is not None)
-    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
-    is_quick_add_allowed = Condition(lambda: not (add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
+    is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or show_help or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
+    is_help_toggle = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
+    is_quick_add_allowed = Condition(lambda: not (show_help or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
@@ -9957,12 +10169,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         if not field_id:
             try:
                 lookup = None
-                lookup_names: List[str] = []
-                base_name = (field_name or '').strip()
-                if base_name:
-                    lookup_names.append(base_name)
-                if field_type == 'end':
-                    lookup_names.extend(list(END_FIELD_HINTS))
+                lookup_names = _date_field_lookup_names(field_type, field_name)
                 for name in lookup_names:
                     lookup = await loop.run_in_executor(
                         None,
@@ -9980,9 +10187,21 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 return False
             field_id = lookup or ''
             if not field_id:
-                status_line = f"{field_name} sync failed: field id unavailable"
+                db.remove_pending_action(action.id)
+                status_line = f"{field_name} sync skipped: field unavailable in project"
+                try:
+                    logger.error(
+                        "Queued date update dropped: field id unavailable (project_id=%s item_id=%s field_name=%s field_type=%s url=%s)",
+                        project_id,
+                        item_id,
+                        field_name,
+                        field_type,
+                        url,
+                    )
+                except Exception:
+                    pass
                 invalidate()
-                return False
+                return True
         try:
             updated_field_id = await loop.run_in_executor(
                 None,
@@ -10764,7 +10983,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('q')
     def _(event):
-        nonlocal detail_mode, in_search, search_buffer, show_report
+        nonlocal detail_mode, in_search, search_buffer, show_help, show_report
         if edit_task_mode:
             if task_edit_state.get('mode') in ('edit-date-calendar', 'priority-select', 'status-select', 'iteration-select', 'iteration-create', 'edit-title'):
                 _cancel_task_edit('Edit cancelled')
@@ -10782,6 +11001,12 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return
         if detail_mode:
             detail_mode = False
+            if floats:
+                floats.clear()
+            invalidate()
+            return
+        if show_help:
+            show_help = False
             if floats:
                 floats.clear()
             invalidate()
@@ -11859,6 +12084,16 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             return
         asyncio.create_task(_apply_status_change('done'))
 
+    @table_kb.add('x', filter=is_normal, eager=True)
+    @table_kb.add('delete', filter=is_normal, eager=True)
+    def _(event):
+        _delete_selected_task()
+
+    @kb.add('x', filter=is_normal, eager=True)
+    @kb.add('delete', filter=is_normal, eager=True)
+    def _(event):
+        _delete_selected_task()
+
     @kb.add('I', filter=is_normal)
     def _(event):
         if detail_mode or in_search:
@@ -12577,7 +12812,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
 
     @kb.add('escape')
     def _(event):
-        nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_report
+        nonlocal in_search, detail_mode, search_buffer, in_date_filter, date_buffer, status_line, show_help, show_report
         if overrun_prompt:
             close_overrun_prompt(None)
             return
@@ -12608,6 +12843,8 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             in_date_filter = False; date_buffer = ""; invalidate(); return
         if detail_mode:
             detail_mode = False; floats.clear(); invalidate(); return
+        if show_help:
+            show_help = False; floats.clear(); invalidate(); return
         if show_report:
             show_report = False; floats.clear(); invalidate(); return
 
@@ -12983,7 +13220,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         elif not detail_mode and not status_line:
             status_line = ''
 
-    @kb.add('?', filter=is_normal)
+    @kb.add('?', filter=is_help_toggle)
     def _(event):
         nonlocal show_help, detail_mode, in_search, show_report
         if in_search:
@@ -12996,63 +13233,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         show_help = not show_help
         floats.clear()
         if show_help:
-            help_lines = [
-                "🧭 Navigation",
-                "  j/k • arrows        Move selection",
-                "  gg / G              Top / Bottom",
-                "  h/l • arrows        Horizontal scroll",
-                "  Enter               Toggle detail",
-                "",
-                "🔎 Search & Sort",
-                "  /                   Start search (Enter apply, Esc cancel)",
-                "  s / S               Cycle sort forward / backward",
-                "",
-                "🎛️ Filters",
-                "  p / P               Cycle / Clear project",
-                "  d                   Hide done",
-                "  N                   Hide no-date",
-                "  F                   Date ≤ YYYY-MM-DD",
-                "  t / a               Today / All",
-                "  , / . / '           Toggle Start / End / Assignees columns",
-                "  C                   Show created (no assignee)",
-                "  z                   Toggle Zen mode",
-                "  V                   Toggle iteration/date view",
-                "",
-                "🛠 Task Actions",
-                "  A                   Add issue / project task",
-                "  n                   Quick add (AdminTasks issue, today, P0, @eldraco)",
-                "  D / I               Set status Done / In Progress",
-                "  ] / [               Priority next / previous",
-                "  T                   Set focus day to today",
-                "  Y / y               Focus +1 day / -1 day",
-                "  O                   Edit task fields",
-                "  E                   Edit work sessions",
-                "",
-                "⏱ Timers & Reports",
-                "  W                   Toggle work timer",
-                "  R                   Open timer report",
-                "  d / w / m (report)  Day / Week / Month view",
-                "  X                   Export JSON report",
-                "  Z                   Export PDF report",
-                "",
-                "🌐 Fetch",
-                "  u                   Update (fetch GitHub)",
-                "",
-                "🎨 Themes",
-                "  Shift+1..0         Switch theme preset",
-                "  Add YAML under themes/ to create presets",
-                f"  Current: {theme_presets[current_theme_index].name}",
-                "",
-                "❓ General",
-                "  ?                   Toggle help",
-                "  q / Esc             Quit / Close",
-                "",
-                f"Current tasks shown: {len(filtered_rows())}",
-                "Visual: ⏱ + cyan row = task timer running",
-                "Press ? to close help."
-            ]
-            txt = "\n".join(help_lines)
-            hl_control = FormattedTextControl(text=txt)
+            hl_control = FormattedTextControl(text=lambda: build_help_text())
             # Compute size based on terminal
             try:
                 from prompt_toolkit.application.current import get_app
@@ -13061,11 +13242,18 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
                 rows = size.rows
             except Exception:
                 cols, rows = 120, 40
-            w = max(60, min(100, cols - 6))
-            h = max(12, min(rows - 4, 32))
-            body = Window(width=Dimension.exact(w-2), height=Dimension.exact(h-2), content=hl_control, wrap_lines=False, always_hide_cursor=True)
-            frame = Frame(body=body, title="Help")
-            floats.append(Float(content=frame, top=1, left=2))
+            w = max(68, min(96, cols - 8))
+            h = max(18, min(rows - 4, 30))
+            body = Window(
+                width=Dimension.exact(w - 2),
+                height=Dimension.exact(h - 2),
+                content=hl_control,
+                wrap_lines=True,
+                always_hide_cursor=True,
+                style="class:editor.body",
+            )
+            frame = Frame(body=body, title="❓ Keyboard Guide", style="class:editor.frame")
+            floats.append(Float(content=frame, top=max(1, (rows - h) // 2), left=max(2, (cols - w) // 2)))
             invalidate()
 
     # Report bindings
