@@ -140,6 +140,7 @@ Cache & fetch
 
 Timers & reports
 - `W`: toggle work timer for the selected task (multiple can run)
+- `x` or `Delete`: remove the selected task from the local cache
 - `R`: open the Timer Report (daily/weekly/monthly aggregates)
 - `X`: export a JSON report (quick)
 - `Z`: export a one-page PDF report (quick; requires `reportlab`)
