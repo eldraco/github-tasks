@@ -1139,6 +1139,97 @@ def test_update_worker_handles_fetch_error(monkeypatch, temp_db_path, tmp_path, 
     db.conn.close()
 
 
+def test_sync_pending_focus_date_resolves_fallback_field_name(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row(focus_field="Focus", focus_field_id="")
+    db.upsert_many([row])
+    db.add_pending_action(
+        "set_project_date",
+        {
+            "url": row.url,
+            "project_id": row.project_id,
+            "item_id": row.item_id,
+            "field_id": "",
+            "field_name": "Focus",
+            "field_type": "focus",
+            "value": "2024-02-10",
+        },
+    )
+
+    looked_up = []
+
+    def fake_get_project_field_id_by_name(token, project_id, name):
+        looked_up.append(name)
+        return "focus-field-resolved" if name.strip().lower() == "focus day" else None
+
+    date_calls = []
+
+    def fake_set_project_date(token, project_id, item_id, field_id, value, field_name=None):
+        date_calls.append((token, project_id, item_id, field_id, value, field_name))
+        return None
+
+    monkeypatch.setattr(ght, "get_project_field_id_by_name", fake_get_project_field_id_by_name)
+    monkeypatch.setattr(ght, "set_project_date", fake_set_project_date)
+    monkeypatch.setattr(
+        ght,
+        "fetch_tasks_github",
+        lambda *args, **kwargs: ght.FetchTasksResult(rows=[], partial=True, message="partial test"),
+    )
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+    update_handler = _find_binding(harness.kb, "u")
+    update_handler(SimpleNamespace())
+    assert scheduled_tasks, "expected update_worker to be scheduled"
+    asyncio.run(scheduled_tasks.pop())
+
+    assert "Focus Day" in looked_up or "focus day" in [name.lower() for name in looked_up]
+    assert date_calls == [
+        ("token", "proj-123", "item-123", "focus-field-resolved", "2024-02-10", "Focus")
+    ]
+    assert db.list_pending_actions() == []
+    stored = db.load()[0]
+    assert stored.focus_date == "2024-02-10"
+    assert stored.focus_field_id == "focus-field-resolved"
+
+    db.conn.close()
+
+
+def test_sync_pending_date_drops_action_when_field_unavailable(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
+    db = ght.TaskDB(str(temp_db_path))
+    row = _make_task_row(focus_field="Focus Day", focus_field_id="")
+    db.upsert_many([row])
+    pending_id = db.add_pending_action(
+        "set_project_date",
+        {
+            "url": row.url,
+            "project_id": row.project_id,
+            "item_id": row.item_id,
+            "field_id": "",
+            "field_name": "Focus Day",
+            "field_type": "focus",
+            "value": "2024-02-11",
+        },
+    )
+
+    monkeypatch.setattr(ght, "get_project_field_id_by_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        ght,
+        "fetch_tasks_github",
+        lambda *args, **kwargs: ght.FetchTasksResult(rows=[], partial=True, message="partial test"),
+    )
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+    update_handler = _find_binding(harness.kb, "u")
+    update_handler(SimpleNamespace())
+    assert scheduled_tasks, "expected update_worker to be scheduled"
+    asyncio.run(scheduled_tasks.pop())
+
+    remaining_ids = {action.id for action in db.list_pending_actions()}
+    assert pending_id not in remaining_ids
+
+    db.conn.close()
+
+
 def test_add_comment_validation_and_error(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row()
