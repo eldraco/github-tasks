@@ -1,9 +1,10 @@
 import inspect
+from types import SimpleNamespace
 
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.dimension import Dimension as _Dimension
 
-from .helpers import closure_map, closure_value, dummy_event, ticker_update
+from .helpers import closure_map, closure_value, dummy_event, make_task, ticker_update
 
 
 if not hasattr(_Dimension, 'exact'):
@@ -140,3 +141,115 @@ def test_filter_toggle_keybindings(ui_context):
     toggle_created(dummy_event())
     assert closure_value(toggle_created, 'include_created') is True
     assert closure_value(toggle_created, 'status_line') == 'Including created tasks'
+
+
+def test_project_filter_excludes_pending_tasks_from_other_projects(ui_context):
+    show_all = get_binding(ui_context, 'a', requires={'show_today_only'})
+    project_cycle = get_binding(ui_context, 'p', requires={'project_cycle'})
+    open_editor = get_binding(ui_context, 'O')
+
+    open_task_editor = closure_value(open_editor, 'open_task_editor')
+    filtered_rows = closure_value(open_task_editor, 'filtered_rows')
+
+    ui_context.db.upsert_many([
+        make_task(
+            project_title='Project Beta',
+            title='Pending Beta Task',
+            url='pending://project-beta-task',
+        )
+    ])
+
+    show_all(dummy_event())
+    before = filtered_rows()
+    assert {row.project_title for row in before} == {'Project Alpha', 'Project Beta'}
+
+    project_cycle(dummy_event())
+    assert closure_value(project_cycle, 'project_cycle') == 'Project Alpha'
+
+    after = filtered_rows()
+    assert after
+    assert {row.project_title for row in after} == {'Project Alpha'}
+
+
+def test_help_overlay_closes_with_escape_and_q(ui_context):
+    toggle_help = get_binding(ui_context, '?', requires={'show_help', 'build_help_text'})
+    escape = get_binding(ui_context, 'escape', requires={'show_help'})
+    quit_key = get_binding(ui_context, 'q', requires={'show_help'})
+
+    toggle_help(dummy_event())
+    assert closure_value(toggle_help, 'show_help') is True
+    assert closure_value(toggle_help, 'floats')
+
+    escape(dummy_event())
+    assert closure_value(toggle_help, 'show_help') is False
+    assert closure_value(toggle_help, 'floats') == []
+
+    toggle_help(dummy_event())
+    exit_calls = []
+    quit_key(dummy_event(app=SimpleNamespace(exit=lambda: exit_calls.append(True))))
+    assert closure_value(toggle_help, 'show_help') is False
+    assert closure_value(toggle_help, 'floats') == []
+    assert exit_calls == []
+
+
+def test_delete_hotkey_discards_selected_pending_task(ui_context):
+    delete_binding = get_binding(ui_context, 'x', requires={'_delete_selected_task'})
+    delete_helper = closure_value(delete_binding, '_delete_selected_task')
+    all_rows_cell = closure_map(delete_helper)['all_rows']
+    current_index_cell = closure_map(delete_helper)['current_index']
+
+    pending_url = 'pending://task-to-delete'
+    ui_context.db.add_pending_action('create_task', {
+        'placeholder_url': pending_url,
+        'title': 'Draft Task',
+    })
+    ui_context.db.upsert_many([
+        make_task(
+            title='Draft Task',
+            url=pending_url,
+            project_title='A Project',
+            focus_date='2024-01-10',
+            item_id='',
+            project_id='',
+        )
+    ])
+
+    all_rows_cell.cell_contents = ui_context.db.load(today_only=False)
+    filtered_rows = closure_value(delete_helper, 'filtered_rows')
+    rows = filtered_rows()
+    current_index_cell.cell_contents = next(i for i, row in enumerate(rows) if row.url == pending_url)
+
+    delete_binding(dummy_event())
+
+    assert pending_url not in {row.url for row in ui_context.db.load(today_only=False)}
+    assert ui_context.db.list_pending_actions() == []
+    assert closure_value(delete_helper, 'status_line') == 'Queued local task deleted'
+
+
+def test_delete_hotkey_removes_synced_task_from_cache(ui_context):
+    delete_binding = get_binding(ui_context, 'x', requires={'_delete_selected_task'})
+    delete_helper = closure_value(delete_binding, '_delete_selected_task')
+    task_url = make_task().url
+
+    ui_context.db.add_pending_action('set_project_date', {
+        'url': task_url,
+        'field_name': 'Focus Day',
+        'value': '2024-01-11',
+    })
+
+    delete_binding(dummy_event())
+
+    assert task_url not in {row.url for row in ui_context.db.load(today_only=False)}
+    assert ui_context.db.list_pending_actions() == []
+    assert closure_value(delete_helper, 'status_line') == "Task removed from local cache (press 'u' to re-sync)"
+
+
+def test_delete_hotkey_is_eager(ui_context):
+    for keys, kwargs, func in ui_context.kb.bindings:
+        if 'x' not in keys:
+            continue
+        if '_delete_selected_task' not in closure_map(func):
+            continue
+        assert kwargs.get('eager') is True
+        return
+    raise AssertionError("Eager binding for 'x' delete hotkey not found")
