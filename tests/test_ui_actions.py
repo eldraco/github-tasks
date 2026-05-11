@@ -479,6 +479,65 @@ def test_update_task_date_missing_metadata_triggers_lookup(monkeypatch, temp_db_
 
     db.conn.close()
 
+
+def test_date_calendar_mode_uses_focused_editor_layout(monkeypatch, temp_db_path, tmp_path, ui_config):
+    db = ght.TaskDB(str(temp_db_path))
+    db.upsert_many([_make_task_row()])
+
+    class FrameSpy:
+        def __init__(self, body=None, title=None, style=None):
+            self.body = body
+            self.title = title
+            self.style = style
+
+    monkeypatch.setattr(ght, "Frame", FrameSpy)
+
+    harness = _build_ui(db, ui_config, token="token", state_path=str(tmp_path / "state.json"))
+
+    open_handler = _find_binding(harness.kb, "O")
+    enter_handler = _find_binding(
+        harness.kb,
+        "enter",
+        predicate=lambda func: "task_edit_state" in func.__code__.co_freevars,
+    )
+
+    task_edit_state_cell = _closure_cells(enter_handler)["task_edit_state"]
+
+    open_handler(SimpleNamespace())
+    task_state = task_edit_state_cell.cell_contents
+    task_state["fields"].append(
+        {
+            "name": "Recent comments",
+            "type": "comment-history",
+            "value": [f"comment {i}" for i in range(12)],
+        }
+    )
+    start_idx = next(i for i, field in enumerate(task_state["fields"]) if field.get("field_key") == "start")
+    task_state["cursor"] = start_idx
+
+    enter_handler(SimpleNamespace())
+
+    task_state = task_edit_state_cell.cell_contents
+    assert task_state["mode"] == "edit-date-calendar"
+
+    float_container = harness.app.layout.container
+    task_float = float_container.floats[-1]
+    frame = task_float.content
+    body = frame.body
+    control = body.kwargs["content"]
+    rendered = "".join(text for _style, text in control.text())
+
+    assert "Select Start Date" in rendered
+    assert "Editing field" in rendered
+    assert "Recent comments" not in rendered
+    assert "comment 11" not in rendered
+    assert body.kwargs["height"].kwargs == {"preferred": 38, "max": 60}
+    assert task_float.kwargs["top"] == 1
+    assert task_float.kwargs["left"] == 2
+
+    db.conn.close()
+
+
 def test_change_priority_handles_fetch_and_editor(monkeypatch, temp_db_path, tmp_path, ui_config, scheduled_tasks):
     db = ght.TaskDB(str(temp_db_path))
     row = _make_task_row(priority_options="[]")

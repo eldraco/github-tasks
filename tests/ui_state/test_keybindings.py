@@ -1,6 +1,7 @@
 import inspect
 from types import SimpleNamespace
 
+import prompt_toolkit
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.dimension import Dimension as _Dimension
 
@@ -83,6 +84,24 @@ def test_search_and_sort_keybindings(ui_context):
     assert closure_value(slash, 'in_search') is False
     assert closure_value(slash, 'search_buffer') == ''
     assert closure_value(slash, 'status_line') == ''
+
+
+def test_search_mode_disables_quick_add_hotkey(ui_context):
+    slash = get_binding(ui_context, '/', requires={'in_search'})
+
+    quick_add_filters = []
+    for kb in prompt_toolkit.key_binding.KeyBindings.instances:
+        for keys, kwargs, _func in kb.bindings:
+            if 'n' in keys and 'filter' in kwargs:
+                quick_add_filters.append(kwargs['filter'])
+
+    assert quick_add_filters, "Quick add hotkey bindings not found"
+    assert all(filter_fn() for filter_fn in quick_add_filters)
+
+    slash(dummy_event())
+
+    assert closure_value(slash, 'in_search') is True
+    assert all(not filter_fn() for filter_fn in quick_add_filters)
 
 
 def test_date_filter_flow(ui_context):

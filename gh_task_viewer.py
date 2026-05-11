@@ -8872,6 +8872,90 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             line_count += 1
             segments.append(('', '\n'))
 
+        def _describe_task_edit_field(field_info: Dict[str, Any]) -> Tuple[str, List[str]]:
+            ftype = field_info.get('type')
+            extra_lines: List[str] = []
+            if ftype == 'priority':
+                opts = field_info.get('options') or []
+                index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
+                if opts:
+                    value = opts[index].get('name') if opts else '(no options)'
+                    if row and getattr(row, 'priority_dirty', 0):
+                        value = (value or '-') + '*'
+                else:
+                    fallback = (row.priority or '').strip() if row else ''
+                    if fallback:
+                        value = fallback
+                    else:
+                        if field_info.get('field_available'):
+                            value = '(load options)'
+                        else:
+                            value = '(none)'
+            elif ftype == 'status':
+                opts = field_info.get('options') or []
+                index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
+                if opts:
+                    value = opts[index].get('name') if opts else '(no options)'
+                    if row and getattr(row, 'status_dirty', 0):
+                        value = (value or '-') + '*'
+                else:
+                    fallback = (row.status or '').strip() if row else ''
+                    if fallback:
+                        value = fallback
+                    else:
+                        if field_info.get('field_available'):
+                            value = '(load options)'
+                        else:
+                            value = '(none)'
+            elif ftype == 'assignees':
+                vals = field_info.get('value') or []
+                if isinstance(vals, list):
+                    value = ', '.join(vals) or '-'
+                else:
+                    value = str(vals) or '-'
+            elif ftype == 'labels':
+                vals = field_info.get('value') or []
+                if isinstance(vals, list):
+                    value = ', '.join(vals) or '-'
+                else:
+                    value = str(vals) or '-'
+            elif ftype == 'iteration':
+                opts = field_info.get('options') or []
+                index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
+                if opts:
+                    opt = opts[index]
+                    title = (opt.get('title') or '').strip()
+                    start = (opt.get('startDate') or '').strip()
+                    if title and start:
+                        value = f"{title} ({start})"
+                    else:
+                        value = title or start or '-'
+                else:
+                    value = field_info.get('value') or ''
+                    if not value:
+                        if field_info.get('field_available'):
+                            value = '(load options)'
+                        else:
+                            value = '(none)'
+            elif ftype == 'priority-text':
+                value = field_info.get('value') or '-'
+            elif ftype == 'status-text':
+                value = field_info.get('value') or '-'
+            elif ftype == 'comment':
+                value = '(add comment)'
+            elif ftype == 'comment-history':
+                values = field_info.get('value') or []
+                if isinstance(values, list) and values:
+                    value = values[0]
+                    extra_lines = values[1:]
+                elif isinstance(values, list):
+                    value = '(no comments)'
+                else:
+                    value = str(values) or '(no comments)'
+            else:
+                value = field_info.get('value', '')
+            return value or '-', extra_lines
+
         if row:
             header = f"📋 {row.title or row.url}"
         else:
@@ -8888,95 +8972,27 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
             add_line("No editable fields", 'class:editor.warning')
         else:
             add_blank()
-            for idx, field_info in enumerate(fields):
-                marker = '➤' if idx == cursor else ' '
-                ftype = field_info.get('type')
-                extra_lines: List[str] = []
-                if ftype == 'priority':
-                    opts = field_info.get('options') or []
-                    index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
-                    if opts:
-                        value = opts[index].get('name') if opts else '(no options)'
-                        if row and getattr(row, 'priority_dirty', 0):
-                            value = (value or '-') + '*'
-                    else:
-                        fallback = (row.priority or '').strip() if row else ''
-                        if fallback:
-                            value = fallback
-                        else:
-                            if field_info.get('field_available'):
-                                value = '(load options)'
-                            else:
-                                value = '(none)'
-                elif ftype == 'status':
-                    opts = field_info.get('options') or []
-                    index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
-                    if opts:
-                        value = opts[index].get('name') if opts else '(no options)'
-                        if row and getattr(row, 'status_dirty', 0):
-                            value = (value or '-') + '*'
-                    else:
-                        fallback = (row.status or '').strip() if row else ''
-                        if fallback:
-                            value = fallback
-                        else:
-                            if field_info.get('field_available'):
-                                value = '(load options)'
-                            else:
-                                value = '(none)'
-                elif ftype == 'assignees':
-                    vals = field_info.get('value') or []
-                    if isinstance(vals, list):
-                        value = ', '.join(vals) or '-'
-                    else:
-                        value = str(vals) or '-'
-                elif ftype == 'labels':
-                    vals = field_info.get('value') or []
-                    if isinstance(vals, list):
-                        value = ', '.join(vals) or '-'
-                    else:
-                        value = str(vals) or '-'
-                elif ftype == 'iteration':
-                    opts = field_info.get('options') or []
-                    index = max(0, min(field_info.get('index', 0), len(opts)-1)) if opts else 0
-                    if opts:
-                        opt = opts[index]
-                        title = (opt.get('title') or '').strip()
-                        start = (opt.get('startDate') or '').strip()
-                        if title and start:
-                            value = f"{title} ({start})"
-                        else:
-                            value = title or start or '-'
-                    else:
-                        value = field_info.get('value') or ''
-                        if not value:
-                            if field_info.get('field_available'):
-                                value = '(load options)'
-                            else:
-                                value = '(none)'
-                elif ftype == 'priority-text':
-                    value = field_info.get('value') or '-'
-                elif ftype == 'status-text':
-                    value = field_info.get('value') or '-'
-                elif ftype == 'comment':
-                    value = '(add comment)'
-                elif ftype == 'comment-history':
-                    values = field_info.get('value') or []
-                    if isinstance(values, list) and values:
-                        value = values[0]
-                        extra_lines = values[1:]
-                    elif isinstance(values, list):
-                        value = '(no comments)'
-                    else:
-                        value = str(values) or '(no comments)'
-                else:
-                    value = field_info.get('value', '')
-                value = value or '-'
-                style = 'class:editor.field.cursor' if idx == cursor else 'class:editor.field'
-                add_line(f" {marker} {field_info.get('name')} : {value}", style)
+            if mode == 'edit-date-calendar':
+                field_info = fields[cursor]
+                value, extra_lines = _describe_task_edit_field(field_info)
+                add_line(f" Editing field {cursor + 1}/{len(fields)}", 'class:editor.meta')
+                add_line(f" ➤ {field_info.get('name')} : {value}", 'class:editor.field.cursor')
                 if extra_lines:
-                    for extra in extra_lines:
+                    shown = extra_lines[:2]
+                    for extra in shown:
                         add_line(f"   {extra}", 'class:editor.meta')
+                    hidden = len(extra_lines) - len(shown)
+                    if hidden > 0:
+                        add_line(f"   … {hidden} more line(s) hidden while calendar is open", 'class:editor.meta')
+            else:
+                for idx, field_info in enumerate(fields):
+                    marker = '➤' if idx == cursor else ' '
+                    value, extra_lines = _describe_task_edit_field(field_info)
+                    style = 'class:editor.field.cursor' if idx == cursor else 'class:editor.field'
+                    add_line(f" {marker} {field_info.get('name')} : {value}", style)
+                    if extra_lines:
+                        for extra in extra_lines:
+                            add_line(f"   {extra}", 'class:editor.meta')
 
         if mode == 'edit-date-calendar' and fields:
             editing = task_edit_state.get('editing') or {}
@@ -9182,7 +9198,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     task_edit_control = FormattedTextControl(text=lambda: build_task_edit_text())
     task_edit_body = Window(
         width=Dimension(preferred=100, max=120),
-        height=Dimension(preferred=32, max=50),
+        height=Dimension(preferred=38, max=60),
         content=task_edit_control,
         wrap_lines=True,
         always_hide_cursor=True,
@@ -9822,7 +9838,7 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
         }
         if task_edit_float and task_edit_float in floats:
             floats.remove(task_edit_float)
-        task_edit_float = Float(content=task_edit_window, top=3, left=4)
+        task_edit_float = Float(content=task_edit_window, top=1, left=2)
         floats.append(task_edit_float)
         status_line = 'Field editor open'
         invalidate()
@@ -10105,9 +10121,10 @@ def run_ui(db: TaskDB, cfg: Config, token: Optional[str], state_path: Optional[s
     is_task_edit_assignees = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'edit-assignees')
     is_task_edit_idle = Condition(lambda: edit_task_mode and task_edit_state.get('mode') == 'list')
     is_overrun_prompt = Condition(lambda: overrun_prompt is not None)
+    is_inline_input = Condition(lambda: in_search or in_date_filter)
     is_normal = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or show_help or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
     is_help_toggle = Condition(lambda: not (in_search or in_date_filter or detail_mode or show_report or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
-    is_quick_add_allowed = Condition(lambda: not (show_help or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
+    is_quick_add_allowed = Condition(lambda: not (is_inline_input() or show_help or add_mode or edit_sessions_mode or edit_task_mode or overrun_prompt))
 
     def invalidate():
         table_control.text = lambda: build_table_fragments()  # ensure recalculated
