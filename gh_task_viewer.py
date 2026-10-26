@@ -55,6 +55,7 @@ import string
 import json
 import uuid
 import threading
+import tempfile
 import unicodedata
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2182,6 +2183,15 @@ class TaskDB:
 # -----------------------------
 # GitHub GraphQL
 # -----------------------------
+GQL_LIST_ORGANIZATIONS = """query($after:String) {
+  viewer {
+    organizations(first:100, after:$after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { login name }
+    }
+  }
+}
+"""
 GQL_LIST_ORG_PROJECTS = """query($login:String!) {
   organization(login:$login){
     projectsV2(first:50, orderBy:{field:UPDATED_AT,direction:DESC}) {
@@ -3352,6 +3362,117 @@ def get_repo_id(token: str, full_name: str) -> Dict[str, str]:
     if not repo_id:
         raise RuntimeError('Repository not found')
     return {"repo_id": repo_id, "repo": repo.get("nameWithOwner") or full_name.strip()}
+
+def discover_organizations(session: requests.Session) -> List[Dict[str, str]]:
+    """List memberships visible to the token, failing rather than returning a partial list."""
+    organizations: Dict[str, Dict[str, str]] = {}
+    after: Optional[str] = None
+    seen_cursors: Set[str] = set()
+    while True:
+        resp = _graphql_with_backoff(session, GQL_LIST_ORGANIZATIONS, {"after": after})
+        errors = resp.get("errors") or []
+        if errors:
+            raise RuntimeError(
+                "Organization discovery failed: "
+                + "; ".join(e.get("message", str(e)) for e in errors)
+                + ". Check that your token can read organization memberships (read:org)."
+            )
+        connection = (((resp.get("data") or {}).get("viewer") or {}).get("organizations"))
+        if not isinstance(connection, dict):
+            raise RuntimeError("Organization discovery returned no membership list; check token access.")
+        for node in connection.get("nodes") or []:
+            if isinstance(node, dict) and node.get("login"):
+                login = node["login"]
+                organizations[login.lower()] = {"login": login, "name": node.get("name") or ""}
+        page = connection.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return sorted(organizations.values(), key=lambda org: org["login"].lower())
+        cursor = page.get("endCursor")
+        if not cursor or cursor in seen_cursors:
+            raise RuntimeError("Organization discovery returned incomplete pagination; try again.")
+        seen_cursors.add(cursor)
+        after = cursor
+
+
+def select_organizations(config_path: str, token: str) -> bool:
+    """Interactively update org project sources while preserving other config values."""
+    path = Path(config_path).resolve()
+    original = path.read_bytes()
+    raw = yaml.safe_load(original)
+    projects = raw.get("projects") or []
+    configured = {entry["org"].lower(): entry["org"] for entry in projects if "org" in entry}
+    visible = {org["login"].lower(): org for org in discover_organizations(_session(token))}
+    # Keep manually configured owners selectable even if memberships are hidden by the token.
+    choices = sorted(set(visible) | set(configured))
+    if not choices:
+        print("No organizations visible to this token. Check membership access (read:org).")
+        return False
+    print("Organizations visible to your GitHub token (* = currently configured):")
+    for index, key in enumerate(choices, 1):
+        org = visible.get(key)
+        login = org["login"] if org else configured[key]
+        detail = org["name"] if org else "configured; membership not visible to this token"
+        suffix = f" ({detail})" if detail else ""
+        marker = "*" if key in configured else " "
+        print(f"  {index}. [{marker}] {login}{suffix}")
+    print("Choose numbers separated by commas, 'all' for all listed, or 'none'.")
+    print("Enter keeps the current selection; q cancels. Personal projects are preserved.")
+    while True:
+        try:
+            answer = input("Organizations: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nOrganization selection cancelled; config unchanged.")
+            return False
+        if not answer or answer in {"q", "quit"}:
+            print("Config unchanged.")
+            return False
+        if answer == "all":
+            selected = set(choices)
+        elif answer == "none":
+            selected = set()
+        else:
+            try:
+                indexes = {int(part.strip()) for part in answer.split(",")}
+                if any(index < 1 or index > len(choices) for index in indexes):
+                    raise ValueError
+                selected = {choices[index - 1] for index in indexes}
+            except ValueError:
+                print(f"Enter numbers from 1 to {len(choices)}, 'all', 'none', or q.")
+                continue
+        break
+    updated = [entry for entry in projects if "org" not in entry or entry["org"].lower() in selected]
+    for key in choices:
+        if key in selected and key not in configured:
+            updated.append({"org": visible[key]["login"], "numbers": "all"})
+    if updated == projects:
+        print("Config unchanged.")
+        return False
+    raw["projects"] = updated
+    serialized = yaml.safe_dump(raw, sort_keys=False, allow_unicode=True).encode("utf-8")
+    # Write completely before replacing the config; preserve the original, including comments.
+    mode = path.stat().st_mode & 0o777
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+            temp_path = Path(handle.name)
+            handle.write(serialized)
+        temp_path.chmod(mode)
+        if path.read_bytes() != original:
+            raise RuntimeError("Config changed during organization selection; run the chooser again.")
+        backup = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.bak")
+        with backup.open("xb") as handle:
+            backup.chmod(mode)
+            handle.write(original)
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    print(f"Saved {len(selected)} selected organization(s) to {config_path}.")
+    print(f"Original config backup: {backup}")
+    print("Restart the viewer and press u to fetch tasks from the selected organizations.")
+    return True
+
 
 def discover_open_projects(session: requests.Session, owner_type: str, owner: str) -> List[Dict]:
     if owner_type == "org":
@@ -13448,6 +13569,8 @@ def main() -> None:
     ap.add_argument("--config", required=True, help="Path to YAML config")
     ap.add_argument("--db", default=os.path.expanduser("~/.gh_tasks.db"), help="Path to sqlite DB")
     ap.add_argument("--discover", action="store_true", help="List open Projects v2 for each owner and exit")
+    ap.add_argument("--select-organizations", "--select-orgs", action="store_true",
+                    help="Choose organizations from your GitHub memberships, save config, and exit")
     ap.add_argument("--no-ui", action="store_true", help="Run a non-interactive summary (for testing)")
     ap.add_argument("--log-level", default="ERROR", help="File log level (DEBUG, INFO, WARNING, ERROR)")
     # Report export options
@@ -13464,6 +13587,16 @@ def main() -> None:
     cfg = load_config(args.config)
     # Load token precedence: env var, .env TOKEN/GITHUB_TOKEN
     token = os.environ.get("GITHUB_TOKEN") or load_dotenv_token()
+
+    if args.select_organizations:
+        if not token:
+            ap.error("GITHUB_TOKEN is not set (needed for --select-organizations).")
+        try:
+            select_organizations(args.config, token)
+        except (OSError, RuntimeError, requests.RequestException) as exc:
+            print(f"Organization selection failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
 
     if args.discover:
         if not token:

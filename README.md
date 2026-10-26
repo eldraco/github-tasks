@@ -88,6 +88,24 @@ Notes
 To change the user in the config, just update the `user: ...` value and restart the app.
 
 
+### Choose organizations from your account
+
+The viewer fetches only the owners listed under `projects`; membership in another organization does not automatically add its tasks. To choose organizations without manually editing YAML, run:
+
+```sh
+python gh_task_viewer.py --config config_gh_task.yml --select-organizations
+```
+
+The chooser lists memberships visible to your `GITHUB_TOKEN` and marks currently configured organizations. Enter a comma-separated selection such as `1,3`, `all` for every listed organization, or `none` to stop fetching organization projects. Enter keeps your current selection; `q` cancels. `--select-orgs` is an alias.
+
+Newly selected organizations use `numbers: all` (all accessible open Projects v2). Existing project-number restrictions, personal project entries, and other config settings are preserved. You can still edit `numbers: [1, 4]` to track particular projects within an organization. Saving rewrites YAML formatting and creates a `.bak` copy of the original config, including comments.
+
+Restart the viewer with the same config and press `u` to fetch. Selection controls future fetches; previously cached tasks and timer history remain available. Only tasks in GitHub Projects v2 are fetched, subject to the usual assignee filters; this does not import every repository issue.
+
+The chooser uses the token's account, which may differ from the `user` assignee filter. Membership discovery follows GitHub's [User organizations connection](https://docs.github.com/en/graphql/reference/users#user). Your token must be able to read memberships (`read:org` for classic tokens) and access the selected organizations' projects. Configured organizations whose memberships are not visible remain in the chooser so they can be kept or removed.
+
+
+
 ## Usage
 
 Spin it up whenever you need instant clarity on what's next.
